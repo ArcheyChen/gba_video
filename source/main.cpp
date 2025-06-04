@@ -28,7 +28,7 @@ void init_table(){
     }
 }
 
-inline u16 yuv_to_rgb555(u8 y   ,s16 d_r
+IWRAM_CODE inline u16 yuv_to_rgb555(u8 y   ,s16 d_r
                                 ,s16 d_g
                                 ,s16 d_b)
 {
@@ -51,8 +51,7 @@ inline u16 yuv_to_rgb555(u8 y   ,s16 d_r
     //        ((b) << 10);  // RGB555
     u32 result = lookup_table[y + d_r];//32位计算好像更快，省去了截断
     result |= (lookup_table[y + d_g] << 5);
-    result |= (lookup_table[y + d_b] << 10);
-    return result; // RGB555
+    return result | (lookup_table[y + d_b] << 10);
 }
 
 
