@@ -12,6 +12,35 @@ WIDTH, HEIGHT = 240, 160
 Y_COEFF  = np.array([0.28571429,  0.57142857,  0.14285714])
 CB_COEFF = np.array([-0.14285714, -0.28571429,  0.42857143])
 CR_COEFF = np.array([ 0.35714286, -0.28571429, -0.07142857])
+
+def pack_yuv420(frame_bgr: np.ndarray) -> np.ndarray:
+    """
+    BGR (240×160×3) → YUV420 block packing:
+      [Y00 Y01 Y10 Y11 Cb Cr]  (2×2 像素共 6 Byte)
+    """
+    B = frame_bgr[:, :, 0].astype(np.float32)
+    G = frame_bgr[:, :, 1].astype(np.float32)
+    R = frame_bgr[:, :, 2].astype(np.float32)
+
+    Y  = (R*Y_COEFF[0]  + G*Y_COEFF[1]  + B*Y_COEFF[2]).round()
+    Cb = (R*CB_COEFF[0] + G*CB_COEFF[1] + B*CB_COEFF[2]).round() + 128.0
+    Cr = (R*CR_COEFF[0] + G*CR_COEFF[1] + B*CR_COEFF[2]).round() + 128.0
+
+    Y  = np.clip(Y,  0, 255).astype(np.uint8)
+    Cb = np.clip(Cb, 0, 255).astype(np.uint8)
+    Cr = np.clip(Cr, 0, 255).astype(np.uint8)
+
+    blocks = []
+    for y in range(0, HEIGHT, 2):          # 行步距 2
+        for x in range(0, WIDTH, 2):       # 列步距 2
+            blocks.extend((
+                Y [y,   x],   Y [y,   x+1],
+                Y [y+1, x],   Y [y+1, x+1],
+                Cb[y,   x],   Cr[y,   x]   # 取块左上像素色差
+            ))
+    return np.frombuffer(bytes(blocks), dtype=np.uint8)
+
+
 def pack_yuv411(frame_bgr: np.ndarray) -> np.ndarray:
     """
     输入: 240×160×3 uint8 (BGR)
@@ -98,7 +127,8 @@ def main():
             break
         if idx % every == 0:
             frm = cv2.resize(frm, (WIDTH, HEIGHT), cv2.INTER_AREA)
-            frames.append(pack_yuv411(frm))
+            # frames.append(pack_yuv411(frm))
+            frames.append(pack_yuv420(frm))
         idx += 1
     cap.release()
 

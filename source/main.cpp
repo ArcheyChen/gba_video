@@ -32,7 +32,7 @@ static inline u16 yuv_to_rgb555(int y, int d_r,int d_g,int d_b)
 }
 
 // 每帧解码
-IWRAM_CODE void decode_frame(const unsigned char* src, u16* dst)
+IWRAM_CODE void decode_frame_yuv411(const unsigned char* src, u16* dst)
 {
     for (int yrow = 0; yrow < SCREEN_HEIGHT; ++yrow)
     {
@@ -55,6 +55,34 @@ IWRAM_CODE void decode_frame(const unsigned char* src, u16* dst)
             *dst++ = yuv_to_rgb555(Y1, d_r, d_g, d_b);
             *dst++ = yuv_to_rgb555(Y2, d_r, d_g, d_b);
             *dst++ = yuv_to_rgb555(Y3, d_r, d_g, d_b);
+        }
+    }
+}
+
+IWRAM_CODE void decode_frame(const unsigned char* src, u16* dst)
+{
+    for (int y = 0; y < SCREEN_HEIGHT; y += 2)          // 每次处理 2 行
+    {
+        u16* row0 = dst + y * SCREEN_WIDTH;             // 当前行指针
+        u16* row1 = row0 + SCREEN_WIDTH;                // 下一行指针
+
+        for (int x = 0; x < SCREEN_WIDTH; x += 2)       // 2×2 块
+        {
+            int Y00 = *src++;
+            int Y01 = *src++;
+            int Y10 = *src++;
+            int Y11 = *src++;
+            int Cb  = static_cast<int>(*src++) - 128;
+            int Cr  = static_cast<int>(*src++) - 128;
+
+            int d_r = (Cr << 1); // Cr * 2;
+            int d_g = -(Cb >> 1) - Cr; // -Cb/2 - Cr;
+            int d_b = (Cb << 1); // Cb * 2;
+            // 写入 4 像素
+            *row0++ = yuv_to_rgb555(Y00, d_r, d_g, d_b);
+            *row0++ = yuv_to_rgb555(Y01, d_r, d_g, d_b);
+            *row1++ = yuv_to_rgb555(Y10, d_r, d_g, d_b);
+            *row1++ = yuv_to_rgb555(Y11, d_r, d_g, d_b);
         }
     }
 }
