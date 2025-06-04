@@ -13,20 +13,42 @@ constexpr int PIXELS_PER_FRAME = SCREEN_WIDTH * SCREEN_HEIGHT;
 
 // EWRAM 单缓冲
 EWRAM_BSS u16 ewramBuffer[PIXELS_PER_FRAME];
+IWRAM_DATA static u8 clip_table_raw[768];
+u8* lookup_table = clip_table_raw + 256; // 256个偏移量
+void init_table(){
+    for(int i=-256;i<768-256;i++){
+        if(i<=0)
+            lookup_table[i] = 0; // 小于等于0的值都裁剪为0
+        else if(i>=255)
+            lookup_table[i] = 255; // 大于等于255的值都裁剪为255
+        else
+            lookup_table[i] = static_cast<u8>(i); // 其他值直接赋值
+    }
+}
 
-// 近似整数 YUV→RGB (Y:0-255, Cb/Cr:-128..127) → 5-bit packed
 inline u16 yuv_to_rgb555(u8 y   ,s16 d_r
                                 ,s16 d_g
                                 ,s16 d_b)
 {
+    // 近似整数 YUV → RGB
+    // s16 d_r = Cr << 1;           // 2*Cr
+    // s16 d_g = -(Cb >> 1) - Cr;   // -Cb/2 - Cr
+    // s16 d_b = Cb << 1;           // 2*Cb
+    // Y取值范围 0-255
+    // Cb/Cr取值范围 -128..127
+    // dx的所有运算，绝对值不会超过两倍的128，即不会超过256
+    // 那么这三个结果的范围是: -256..511，总共 768 个整数
     s16 r = y + d_r;                // Y + d_r
     s16 g = y + d_g;                // Y + d_g
     s16 b = y + d_b;                // Y + d_b
 
     // // // 裁剪至 0-255
-    if (r < 0) r = 0; else if (r > 255) r = 255;
-    if (g < 0) g = 0; else if (g > 255) g = 255;
-    if (b < 0) b = 0; else if (b > 255) b = 255;
+    // r = (r < 0) ? 0 : ((r > 255) ? 255 : r);
+    // g = (g < 0) ? 0 : ((g > 255) ? 255 : g);
+    // b = (b < 0) ? 0 : ((b > 255) ? 255 : b);
+    r = lookup_table[r];
+    g = lookup_table[g]; 
+    b = lookup_table[b];
 
 
     return  (r >> 3)          |
@@ -101,6 +123,7 @@ int main()
 
     int frame = 0;
     const unsigned char *vdata_ptr = movie;
+    init_table();
     while (1)
     {
         // const unsigned char* src = movie + frame * stride;
