@@ -9,21 +9,40 @@ import argparse, cv2, numpy as np, pathlib, textwrap
 
 WIDTH, HEIGHT = 240, 160
 
+Y_COEFF  = np.array([0.28571429,  0.57142857,  0.14285714])
+CB_COEFF = np.array([-0.14285714, -0.28571429,  0.42857143])
+CR_COEFF = np.array([ 0.35714286, -0.28571429, -0.07142857])
 def pack_yuv411(frame_bgr: np.ndarray) -> np.ndarray:
-    """BGR → YCrCb → 打包成 [Y0 Y1 Y2 Y3 Cb Cr]×(240/4)×160"""
-    ycrcb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2YCrCb)
-    Y, Cr, Cb = cv2.split(ycrcb)          # OpenCV 顺序 Y Cr Cb
-    # flatten 行优先
+    """
+    输入: 240×160×3 uint8 (BGR)
+    输出: (57 600) uint8, layout = [Y0 Y1 Y2 Y3 Cb Cr]×(240/4)×160
+    """
+    # OpenCV 默认是 BGR => 先变成 float32 的 R/G/B，方便矩阵乘
+    B = frame_bgr[:, :, 0].astype(np.float32)
+    G = frame_bgr[:, :, 1].astype(np.float32)
+    R = frame_bgr[:, :, 2].astype(np.float32)
+
+    # 每个像素单独算 Y/Cb/Cr
+    Y  = (R * Y_COEFF[0]  + G * Y_COEFF[1]  + B * Y_COEFF[2]).round()
+    Cb = (R * CB_COEFF[0] + G * CB_COEFF[1] + B * CB_COEFF[2]).round() + 128.0
+    Cr = (R * CR_COEFF[0] + G * CR_COEFF[1] + B * CR_COEFF[2]).round() + 128.0
+
+    # 裁剪到合法区间并转回 uint8
+    Y  = np.clip(Y,  0, 255).astype(np.uint8)
+    Cb = np.clip(Cb, 0, 255).astype(np.uint8)
+    Cr = np.clip(Cr, 0, 255).astype(np.uint8)
+
+    # ↓↓↓ 打包成 4:1:1 ↓↓↓
     packed_rows = []
     for row in range(HEIGHT):
-        yrow = Y[row]
-        cbrow = Cb[row]
-        crrow = Cr[row]
+        y_row  = Y [row]
+        cb_row = Cb[row]
+        cr_row = Cr[row]
         line = []
         for x in range(0, WIDTH, 4):
-            line.extend((
-                yrow[x], yrow[x+1], yrow[x+2], yrow[x+3],
-                cbrow[x], crrow[x]      # 取第一像素的 Cb/Cr 即可
+            line.extend((                        # 6 Byte / 4 像素
+                y_row[x], y_row[x+1], y_row[x+2], y_row[x+3],
+                cb_row[x], cr_row[x]             # 取块首像素的 Cb / Cr
             ))
         packed_rows.append(line)
     return np.array(packed_rows, dtype=np.uint8).flatten()
