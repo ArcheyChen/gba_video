@@ -12,69 +12,37 @@ WIDTH, HEIGHT = 240, 160
 Y_COEFF  = np.array([0.28571429,  0.57142857,  0.14285714])
 CB_COEFF = np.array([-0.14285714, -0.28571429,  0.42857143])
 CR_COEFF = np.array([ 0.35714286, -0.28571429, -0.07142857])
+BLOCK_W, BLOCK_H = 4, 4
+BYTES_PER_BLOCK  = 18                                   # 16Y + Cb + Cr
 
-def pack_yuv420(frame_bgr: np.ndarray) -> np.ndarray:
+def pack_yuv9(frame_bgr: np.ndarray) -> np.ndarray:
     """
-    BGR (240×160×3) → YUV420 block packing:
-      [Y00 Y01 Y10 Y11 Cb Cr]  (2×2 像素共 6 Byte)
+    把 240×160×3 BGR → YUV9：每 4×4 像素 18 Byte
+    布局按行优先：Y00..Y03 Y10..Y13 Y20..Y23 Y30..Y33 Cb Cr
     """
     B = frame_bgr[:, :, 0].astype(np.float32)
     G = frame_bgr[:, :, 1].astype(np.float32)
     R = frame_bgr[:, :, 2].astype(np.float32)
 
     Y  = (R*Y_COEFF[0]  + G*Y_COEFF[1]  + B*Y_COEFF[2]).round()
-    Cb = (R*CB_COEFF[0] + G*CB_COEFF[1] + B*CB_COEFF[2]).round() + 128.0
-    Cr = (R*CR_COEFF[0] + G*CR_COEFF[1] + B*CR_COEFF[2]).round() + 128.0
+    Cb = (R*CB_COEFF[0] + G*CB_COEFF[1] + B*CB_COEFF[2]).round()
+    Cr = (R*CR_COEFF[0] + G*CR_COEFF[1] + B*CR_COEFF[2]).round()
 
     Y  = np.clip(Y,  0, 255).astype(np.uint8)
-    Cb = np.clip(Cb, 0, 255).astype(np.uint8)
-    Cr = np.clip(Cr, 0, 255).astype(np.uint8)
+    # Cb = np.clip(Cb, -128,127).astype(np.uint8)
+    # Cr = np.clip(Cr, -128,127).astype(np.uint8)
 
-    blocks = []
-    for y in range(0, HEIGHT, 2):          # 行步距 2
-        for x in range(0, WIDTH, 2):       # 列步距 2
-            blocks.extend((
-                Y [y,   x],   Y [y,   x+1],
-                Y [y+1, x],   Y [y+1, x+1],
-                Cb[y,   x],   Cr[y,   x]   # 取块左上像素色差
-            ))
-    return np.frombuffer(bytes(blocks), dtype=np.uint8)
-
-
-def pack_yuv411(frame_bgr: np.ndarray) -> np.ndarray:
-    """
-    输入: 240×160×3 uint8 (BGR)
-    输出: (57 600) uint8, layout = [Y0 Y1 Y2 Y3 Cb Cr]×(240/4)×160
-    """
-    # OpenCV 默认是 BGR => 先变成 float32 的 R/G/B，方便矩阵乘
-    B = frame_bgr[:, :, 0].astype(np.float32)
-    G = frame_bgr[:, :, 1].astype(np.float32)
-    R = frame_bgr[:, :, 2].astype(np.float32)
-
-    # 每个像素单独算 Y/Cb/Cr
-    Y  = (R * Y_COEFF[0]  + G * Y_COEFF[1]  + B * Y_COEFF[2]).round()
-    Cb = (R * CB_COEFF[0] + G * CB_COEFF[1] + B * CB_COEFF[2]).round() + 128.0
-    Cr = (R * CR_COEFF[0] + G * CR_COEFF[1] + B * CR_COEFF[2]).round() + 128.0
-
-    # 裁剪到合法区间并转回 uint8
-    Y  = np.clip(Y,  0, 255).astype(np.uint8)
-    Cb = np.clip(Cb, 0, 255).astype(np.uint8)
-    Cr = np.clip(Cr, 0, 255).astype(np.uint8)
-
-    # ↓↓↓ 打包成 4:1:1 ↓↓↓
-    packed_rows = []
-    for row in range(HEIGHT):
-        y_row  = Y [row]
-        cb_row = Cb[row]
-        cr_row = Cr[row]
-        line = []
-        for x in range(0, WIDTH, 4):
-            line.extend((                        # 6 Byte / 4 像素
-                y_row[x], y_row[x+1], y_row[x+2], y_row[x+3],
-                cb_row[x], cr_row[x]             # 取块首像素的 Cb / Cr
-            ))
-        packed_rows.append(line)
-    return np.array(packed_rows, dtype=np.uint8).flatten()
+    blocks = bytearray()
+    for y in range(0, HEIGHT, BLOCK_H):
+        for x in range(0, WIDTH, BLOCK_W):
+            # 16 Y：四行各 4 像素
+            blocks.extend(Y [y:y+4, x:x+4].flatten())
+            # # 1 Cb / 1 Cr：取块左上像素即可
+            # blocks.append(Cb[y, x])
+            # blocks.append(Cr[y, x])
+            blocks.append(Cb[y:y+4, x:x+4].mean().round().astype(np.uint8))
+            blocks.append(Cr[y:y+4, x:x+4].mean().round().astype(np.uint8))
+    return np.frombuffer(blocks, dtype=np.uint8)
 
 def write_header(path_h: pathlib.Path, frame_cnt: int, bytes_per_frame: int):
     guard = "VIDEO_DATA_H"
@@ -128,7 +96,7 @@ def main():
         if idx % every == 0:
             frm = cv2.resize(frm, (WIDTH, HEIGHT), cv2.INTER_AREA)
             # frames.append(pack_yuv411(frm))
-            frames.append(pack_yuv420(frm))
+            frames.append(pack_yuv9(frm))
         idx += 1
     cap.release()
 

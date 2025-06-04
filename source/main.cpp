@@ -35,35 +35,51 @@ inline u16 yuv_to_rgb555(u8 y   ,s16 d_r
 }
 
 
-IWRAM_CODE void decode_frame(const unsigned char* src, u16* dst)
+IWRAM_CODE void decode_frame(const u8* src, u16* dst)
 {
-
-    u16* row0 = dst;             // 当前行指针
-    u16* row1 = dst + SCREEN_WIDTH;                // 下一行指针
-    for (int y = 0; y < SCREEN_HEIGHT; y += 2
-                                        ,row0 += SCREEN_WIDTH*2
-                                        ,row1 += SCREEN_WIDTH*2)
+    for (int y = 0; y < SCREEN_HEIGHT; y += 4)
     {
+        // 当前 4 行首指针
+        u16* row0 = dst + y * SCREEN_WIDTH;
+        u16* row1 = row0 + SCREEN_WIDTH;
+        u16* row2 = row1 + SCREEN_WIDTH;
+        u16* row3 = row2 + SCREEN_WIDTH;
 
-        for (int x = 0; x < SCREEN_WIDTH; x += 2)       // 2×2 块
+        for (int x = 0; x < SCREEN_WIDTH; x += 4)
         {
-            u8 Y00 = src[0];  // Y00
-            u8 Y01 = src[1];  // Y01
-            u8 Y10 = src[2];  // Y10
-            u8 Y11 = src[3];  // Y11
-            s8 Cb  = (s8)(src[4]); // Cb
-            s8 Cr  = (s8)(src[5]); // Cr
+            // 取 16×Y
+            u8  Y00 = src[ 0]; u8 Y01 = src[ 1]; u8 Y02 = src[ 2]; u8 Y03 = src[ 3];
+            u8  Y10 = src[ 4]; u8 Y11 = src[ 5]; u8 Y12 = src[ 6]; u8 Y13 = src[ 7];
+            u8  Y20 = src[ 8]; u8 Y21 = src[ 9]; u8 Y22 = src[10]; u8 Y23 = src[11];
+            u8  Y30 = src[12]; u8 Y31 = src[13]; u8 Y32 = src[14]; u8 Y33 = src[15];
+            s8  Cb  = static_cast<s8>(src[16]);
+            s8  Cr  = static_cast<s8>(src[17]);
+            src += 18;
 
-            s16 d_r = (Cr << 1); // Cr * 2;
-            s16 d_g = -(Cb >> 1) - Cr; // -Cb/2 - Cr;
-            s16 d_b = (Cb << 1); // Cb * 2;
-            // 写入 4 像素
-            row0[x]     = yuv_to_rgb555(Y00, d_r, d_g, d_b);
-            row0[x + 1] = yuv_to_rgb555(Y01, d_r, d_g, d_b);
-            row1[x]     = yuv_to_rgb555(Y10, d_r, d_g, d_b);
-            row1[x + 1] = yuv_to_rgb555(Y11, d_r, d_g, d_b);
+            s16 d_r = Cr << 1;           // 2*Cr
+            s16 d_g = -(Cb >> 1) - Cr;   // -Cb/2 - Cr
+            s16 d_b = Cb << 1;           // 2*Cb
 
-            src += 6; // 移动到下一个 2x2 块
+            // 写 4×4 像素
+            row0[x]   = yuv_to_rgb555(Y00, d_r, d_g, d_b);
+            row0[x+1] = yuv_to_rgb555(Y01, d_r, d_g, d_b);
+            row0[x+2] = yuv_to_rgb555(Y02, d_r, d_g, d_b);
+            row0[x+3] = yuv_to_rgb555(Y03, d_r, d_g, d_b);
+
+            row1[x]   = yuv_to_rgb555(Y10, d_r, d_g, d_b);
+            row1[x+1] = yuv_to_rgb555(Y11, d_r, d_g, d_b);
+            row1[x+2] = yuv_to_rgb555(Y12, d_r, d_g, d_b);
+            row1[x+3] = yuv_to_rgb555(Y13, d_r, d_g, d_b);
+
+            row2[x]   = yuv_to_rgb555(Y20, d_r, d_g, d_b);
+            row2[x+1] = yuv_to_rgb555(Y21, d_r, d_g, d_b);
+            row2[x+2] = yuv_to_rgb555(Y22, d_r, d_g, d_b);
+            row2[x+3] = yuv_to_rgb555(Y23, d_r, d_g, d_b);
+
+            row3[x]   = yuv_to_rgb555(Y30, d_r, d_g, d_b);
+            row3[x+1] = yuv_to_rgb555(Y31, d_r, d_g, d_b);
+            row3[x+2] = yuv_to_rgb555(Y32, d_r, d_g, d_b);
+            row3[x+3] = yuv_to_rgb555(Y33, d_r, d_g, d_b);
         }
     }
 }
@@ -95,7 +111,7 @@ int main()
         DMA3COPY(ewramBuffer, VRAM, PIXELS_PER_FRAME | DMA16);
 
         frame++;
-        if(frame == 0 >= frames_total) // 循环播放
+        if(frame >= frames_total) // 循环播放
         {
             frame = 0; // 重置帧计数
             vdata_ptr = movie; // 重置指针
