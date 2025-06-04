@@ -37,10 +37,13 @@ inline u16 yuv_to_rgb555(u8 y   ,s16 d_r
 
 IWRAM_CODE void decode_frame(const unsigned char* src, u16* dst)
 {
-    for (int y = 0; y < SCREEN_HEIGHT; y += 2)          // 每次处理 2 行
+
+    u16* row0 = dst;             // 当前行指针
+    u16* row1 = dst + SCREEN_WIDTH;                // 下一行指针
+    for (int y = 0; y < SCREEN_HEIGHT; y += 2
+                                        ,row0 += SCREEN_WIDTH*2
+                                        ,row1 += SCREEN_WIDTH*2)
     {
-        u16* row0 = dst + y * SCREEN_WIDTH;             // 当前行指针
-        u16* row1 = row0 + SCREEN_WIDTH;                // 下一行指针
 
         for (int x = 0; x < SCREEN_WIDTH; x += 2)       // 2×2 块
         {
@@ -55,10 +58,10 @@ IWRAM_CODE void decode_frame(const unsigned char* src, u16* dst)
             s16 d_g = -(Cb >> 1) - Cr; // -Cb/2 - Cr;
             s16 d_b = (Cb << 1); // Cb * 2;
             // 写入 4 像素
-            *row0++ = yuv_to_rgb555(Y00, d_r, d_g, d_b);
-            *row0++ = yuv_to_rgb555(Y01, d_r, d_g, d_b);
-            *row1++ = yuv_to_rgb555(Y10, d_r, d_g, d_b);
-            *row1++ = yuv_to_rgb555(Y11, d_r, d_g, d_b);
+            row0[x]     = yuv_to_rgb555(Y00, d_r, d_g, d_b);
+            row0[x + 1] = yuv_to_rgb555(Y01, d_r, d_g, d_b);
+            row1[x]     = yuv_to_rgb555(Y10, d_r, d_g, d_b);
+            row1[x + 1] = yuv_to_rgb555(Y11, d_r, d_g, d_b);
 
             src += 6; // 移动到下一个 2x2 块
         }
@@ -84,16 +87,17 @@ int main()
     const unsigned char *vdata_ptr = movie;
     while (1)
     {
-        const unsigned char* src = movie + frame * stride;
+        // const unsigned char* src = movie + frame * stride;
 
-        decode_frame(src, ewramBuffer);
+        decode_frame(vdata_ptr, ewramBuffer);
 
         VBlankIntrWait();
         DMA3COPY(ewramBuffer, VRAM, PIXELS_PER_FRAME | DMA16);
 
-        frame = (frame + 1) % frames_total;
-        if(frame == 0)
+        frame++;
+        if(frame == 0 >= frames_total) // 循环播放
         {
+            frame = 0; // 重置帧计数
             vdata_ptr = movie; // 重置指针
         }
         else
