@@ -17,12 +17,14 @@ IWRAM_DATA static u8 clip_table_raw[768];
 u8* lookup_table = clip_table_raw + 256; //预先添加偏移，这样查表的时候，遇到负数也直接查
 void init_table(){
     for(int i=-256;i<768-256;i++){
+        u8 raw_val;
         if(i<=0)
-            lookup_table[i] = 0; // 小于等于0的值都裁剪为0
+            raw_val = 0; // 小于等于0的值都裁剪为0
         else if(i>=255)
-            lookup_table[i] = 255; // 大于等于255的值都裁剪为255
+            raw_val = 255; // 大于等于255的值都裁剪为255
         else
-            lookup_table[i] = static_cast<u8>(i); // 其他值直接赋值
+            raw_val = static_cast<u8>(i); // 其他值直接赋值
+        lookup_table[i] = raw_val>>3; // 填充查找表
     }
 }
 
@@ -31,32 +33,26 @@ inline u16 yuv_to_rgb555(u8 y   ,s16 d_r
                                 ,s16 d_b)
 {
     // 近似整数 YUV → RGB
-    // s16 d_r = Cr << 1;           // 2*Cr
-    // s16 d_g = -(Cb >> 1) - Cr;   // -Cb/2 - Cr
-    // s16 d_b = Cb << 1;           // 2*Cb
+    // R = Y + (Cr << 1)
+    // G = Y - (Cb >> 1) - Cr  
+    // B = Y + (Cb << 1)
     // Y取值范围 0-255
     // Cb/Cr取值范围 -128..127
-    // dx的所有运算，绝对值不会超过两倍的128，即不会超过256
-    // 那么这三个结果的范围是: -256..511，总共 768 个整数
-    // s16 r = y + d_r;                // Y + d_r
-    // s16 g = y + d_g;                // Y + d_g
-    // s16 b = y + d_b;                // Y + d_b
+    // 右边的所有运算，绝对值不会超过两倍的128，即不会超过256
+    // 那么这三个结果的范围是: -256..511，总共 768 个整数，直接查表
 
-    // // // 裁剪至 0-255
-    // r = (r < 0) ? 0 : ((r > 255) ? 255 : r);
-    // g = (g < 0) ? 0 : ((g > 255) ? 255 : g);
-    // b = (b < 0) ? 0 : ((b > 255) ? 255 : b);
-    // r = lookup_table[r];
-    // g = lookup_table[g]; 
-    // b = lookup_table[b];
-    u8 r = lookup_table[y + d_r]; 
-    u8 g = lookup_table[y + d_g]; 
-    u8 b = lookup_table[y + d_b];
+    // u8 r = lookup_table[y + d_r]; 
+    // u8 g = lookup_table[y + d_g]; 
+    // u8 b = lookup_table[y + d_b];
 
 
-    return  (r >> 3)          |
-           ((g >> 3) << 5)    |
-           ((b >> 3) << 10);  // RGB555
+    // return  (r)          |
+    //        ((g) << 5)    |
+    //        ((b) << 10);  // RGB555
+    u32 result = lookup_table[y + d_r];//32位计算好像更快，省去了截断
+    result |= (lookup_table[y + d_g] << 5);
+    result |= (lookup_table[y + d_b] << 10);
+    return result; // RGB555
 }
 
 
