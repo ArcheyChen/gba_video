@@ -14,7 +14,7 @@ constexpr int PIXELS_PER_FRAME = SCREEN_WIDTH * SCREEN_HEIGHT;
 // EWRAM 单缓冲
 EWRAM_BSS u16 ewramBuffer[PIXELS_PER_FRAME];
 IWRAM_DATA static u8 clip_table_raw[768];
-u8* lookup_table = clip_table_raw + 256; // 256个偏移量
+u8* lookup_table = clip_table_raw + 256; //预先添加偏移，这样查表的时候，遇到负数也直接查
 void init_table(){
     for(int i=-256;i<768-256;i++){
         if(i<=0)
@@ -38,17 +38,20 @@ inline u16 yuv_to_rgb555(u8 y   ,s16 d_r
     // Cb/Cr取值范围 -128..127
     // dx的所有运算，绝对值不会超过两倍的128，即不会超过256
     // 那么这三个结果的范围是: -256..511，总共 768 个整数
-    s16 r = y + d_r;                // Y + d_r
-    s16 g = y + d_g;                // Y + d_g
-    s16 b = y + d_b;                // Y + d_b
+    // s16 r = y + d_r;                // Y + d_r
+    // s16 g = y + d_g;                // Y + d_g
+    // s16 b = y + d_b;                // Y + d_b
 
     // // // 裁剪至 0-255
     // r = (r < 0) ? 0 : ((r > 255) ? 255 : r);
     // g = (g < 0) ? 0 : ((g > 255) ? 255 : g);
     // b = (b < 0) ? 0 : ((b > 255) ? 255 : b);
-    r = lookup_table[r];
-    g = lookup_table[g]; 
-    b = lookup_table[b];
+    // r = lookup_table[r];
+    // g = lookup_table[g]; 
+    // b = lookup_table[b];
+    u8 r = lookup_table[y + d_r]; 
+    u8 g = lookup_table[y + d_g]; 
+    u8 b = lookup_table[y + d_b];
 
 
     return  (r >> 3)          |
