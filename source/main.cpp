@@ -9,6 +9,7 @@
 #include <cstring>
 
 #include "video_data.h"
+#include <tuple>
 
 constexpr int PIXELS_PER_FRAME = SCREEN_WIDTH * SCREEN_HEIGHT;
 
@@ -41,28 +42,32 @@ IWRAM_CODE inline u16 yuv_to_rgb555(u8 y, s16 d_r, s16 d_g, s16 d_b)
     return result | (lookup_table[y + d_b] << 10);
 }
 
+struct YUV_Struct{
+    u8 y[4][4];
+    s8 Cb,Cr;
+    auto get_delta(){
+        s16 d_r = Cr << 1;           // 2*Cr
+        s16 d_g = -(Cb >> 1) - Cr;   // -Cb/2 - Cr
+        s16 d_b = Cb << 1;           // 2*Cb
+        return std::make_tuple(d_r,d_g,d_b);
+    }
+} __attribute__((packed));
+
+
 // 解码单个4x4块到指定位置
 IWRAM_CODE inline void decode_block(const u8* src, u16* dst)
 {
-    s8  Cb = static_cast<s8>(src[16]);
-    s8  Cr = static_cast<s8>(src[17]);
-    
-    s16 d_r = Cr << 1;           // 2*Cr
-    s16 d_g = -(Cb >> 1) - Cr;   // -Cb/2 - Cr
-    s16 d_b = Cb << 1;           // 2*Cb
-    
-    // 计算块在帧缓冲中的起始位置
-    // u16* dst = dst_base + (block_y * 4 * SCREEN_WIDTH) + (block_x * 4);
+    YUV_Struct *yuv_data = (YUV_Struct*)src;
+    auto [d_r,d_g,d_b] = yuv_data->get_delta();
     
     // 解码4x4像素
+    u16* dst_row = dst;
     for(int row = 0; row < 4; row++) {
-        u16* dst_row = dst + row * SCREEN_WIDTH;
-        const u8* y_row = src + row * 4;
-        
-        dst_row[0] = yuv_to_rgb555(y_row[0], d_r, d_g, d_b);
-        dst_row[1] = yuv_to_rgb555(y_row[1], d_r, d_g, d_b);
-        dst_row[2] = yuv_to_rgb555(y_row[2], d_r, d_g, d_b);
-        dst_row[3] = yuv_to_rgb555(y_row[3], d_r, d_g, d_b);
+        dst_row[0] = yuv_to_rgb555(yuv_data->y[row][0], d_r, d_g, d_b);
+        dst_row[1] = yuv_to_rgb555(yuv_data->y[row][1], d_r, d_g, d_b);
+        dst_row[2] = yuv_to_rgb555(yuv_data->y[row][2], d_r, d_g, d_b);
+        dst_row[3] = yuv_to_rgb555(yuv_data->y[row][3], d_r, d_g, d_b);
+        dst_row += SCREEN_WIDTH;
     }
 }
 
@@ -77,24 +82,15 @@ void init_block_idx_to_offset(){
 
 IWRAM_CODE void decode_i_frame(const u8* src, u16* dst)
 {
-    // 跳过帧类型标记
-    src++;
-    
     // 解码所有块
-    int block_idx=0;
-    for (int by = 0; by < BLOCKS_PER_COL; by++) {
-        for (int bx = 0; bx < BLOCKS_PER_ROW; bx++,block_idx++) {
-            decode_block(src, dst+block_idx_to_offset[block_idx]);
-            src += BYTES_PER_BLOCK;
-        }
+    for (int block_idx = 0; block_idx < TOTAL_BLOCKS; block_idx++) {
+        decode_block(src, dst+block_idx_to_offset[block_idx]);
+        src += BYTES_PER_BLOCK;
     }
 }
 
 IWRAM_CODE void decode_p_frame(const u8* src, u16* dst)
 {
-    // 跳过帧类型标记
-    src++;
-    
     // 读取需要更新的块数（小端序）
     u16 blocks_to_update = src[0] | (src[1] << 8);
     src += 2;
@@ -114,7 +110,7 @@ IWRAM_CODE void decode_p_frame(const u8* src, u16* dst)
 IWRAM_CODE void decode_frame(const u8* src, u16* dst)
 {
     // 检查帧类型
-    u8 frame_type = src[0];
+    u8 frame_type = *src++;
     
     if (frame_type == FRAME_TYPE_I) {
         decode_i_frame(src, dst);
