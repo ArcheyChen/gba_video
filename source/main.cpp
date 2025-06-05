@@ -42,7 +42,7 @@ IWRAM_CODE inline u16 yuv_to_rgb555(u8 y, s16 d_r, s16 d_g, s16 d_b)
 }
 
 // 解码单个4x4块到指定位置
-IWRAM_CODE inline void decode_block(const u8* src, u16* dst_base, int block_x, int block_y)
+IWRAM_CODE inline void decode_block(const u8* src, u16* dst)
 {
     s8  Cb = static_cast<s8>(src[16]);
     s8  Cr = static_cast<s8>(src[17]);
@@ -52,7 +52,7 @@ IWRAM_CODE inline void decode_block(const u8* src, u16* dst_base, int block_x, i
     s16 d_b = Cb << 1;           // 2*Cb
     
     // 计算块在帧缓冲中的起始位置
-    u16* dst = dst_base + (block_y * 4 * SCREEN_WIDTH) + (block_x * 4);
+    // u16* dst = dst_base + (block_y * 4 * SCREEN_WIDTH) + (block_x * 4);
     
     // 解码4x4像素
     for(int row = 0; row < 4; row++) {
@@ -66,15 +66,25 @@ IWRAM_CODE inline void decode_block(const u8* src, u16* dst_base, int block_x, i
     }
 }
 
+IWRAM_DATA u16 block_idx_to_offset[TOTAL_BLOCKS];
+void init_block_idx_to_offset(){
+    for(int i=0;i<TOTAL_BLOCKS;i++){
+        u16 bx = i % BLOCKS_PER_ROW;
+        u16 by = i / BLOCKS_PER_ROW;
+        block_idx_to_offset[i] =  (by * 4 * SCREEN_WIDTH) + (bx * 4);
+    }
+}
+
 IWRAM_CODE void decode_i_frame(const u8* src, u16* dst)
 {
     // 跳过帧类型标记
     src++;
     
     // 解码所有块
+    int block_idx=0;
     for (int by = 0; by < BLOCKS_PER_COL; by++) {
-        for (int bx = 0; bx < BLOCKS_PER_ROW; bx++) {
-            decode_block(src, dst, bx, by);
+        for (int bx = 0; bx < BLOCKS_PER_ROW; bx++,block_idx++) {
+            decode_block(src, dst+block_idx_to_offset[block_idx]);
             src += BYTES_PER_BLOCK;
         }
     }
@@ -89,38 +99,17 @@ IWRAM_CODE void decode_p_frame(const u8* src, u16* dst)
     u16 blocks_to_update = src[0] | (src[1] << 8);
     src += 2;
     
-    // 防止越界
-    if (blocks_to_update > TOTAL_BLOCKS) {
-        blocks_to_update = TOTAL_BLOCKS;
-    }
-    
     // 处理每个需要更新的块
     for (u16 i = 0; i < blocks_to_update; i++) {
         // 读取块索引（小端序）
         u16 block_idx = src[0] | (src[1] << 8);
         src += 2;
         
-        // 防止越界
-        if (block_idx >= TOTAL_BLOCKS) {
-            src += BYTES_PER_BLOCK;
-            continue;
-        }
-        
-        // 计算块坐标
-        int bx = block_idx % BLOCKS_PER_ROW;
-        int by = block_idx / BLOCKS_PER_ROW;
-        
-        // 解码这个块
-        decode_block(src, dst, bx, by);
+        decode_block(src, dst + block_idx_to_offset[block_idx]);
         src += BYTES_PER_BLOCK;
     }
 }
 
-// 添加调试用的帧计数器（可选）
-#ifdef DEBUG
-EWRAM_DATA int debug_i_frames = 0;
-EWRAM_DATA int debug_p_frames = 0;
-#endif
 
 IWRAM_CODE void decode_frame(const u8* src, u16* dst)
 {
@@ -128,14 +117,8 @@ IWRAM_CODE void decode_frame(const u8* src, u16* dst)
     u8 frame_type = src[0];
     
     if (frame_type == FRAME_TYPE_I) {
-        #ifdef DEBUG
-        debug_i_frames++;
-        #endif
         decode_i_frame(src, dst);
     } else if (frame_type == FRAME_TYPE_P) {
-        #ifdef DEBUG
-        debug_p_frames++;
-        #endif
         decode_p_frame(src, dst);
     }
 }
@@ -152,10 +135,11 @@ int main()
     irqEnable(IRQ_VBLANK);
 
     init_table();
+    init_block_idx_to_offset();
     
     // 清空缓冲区
     memset(ewramBuffer, 0, PIXELS_PER_FRAME * sizeof(u16));
-    VBlankIntrWait();
+    // VBlankIntrWait();
     DMA3COPY(ewramBuffer, VRAM, PIXELS_PER_FRAME | DMA16);
 
     int frame = 0;
@@ -169,7 +153,7 @@ int main()
         decode_frame(frame_data, ewramBuffer);
 
         // 等待垂直同步并复制到VRAM
-        VBlankIntrWait();
+        // VBlankIntrWait();
         DMA3COPY(ewramBuffer, VRAM, PIXELS_PER_FRAME | DMA16);
 
         frame++;

@@ -264,7 +264,7 @@ def main():
     # 统计信息
     original_size = len(frames) * (40 * 40 * 18)
     compressed_size = len(all_data)
-    compression_ratio = original_size / compressed_size
+    compression_ratio = compressed_size / original_size
     
     print(f"\n✅ 编码完成：")
     print(f"   总帧数: {len(frames)}")
