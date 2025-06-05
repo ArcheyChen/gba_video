@@ -1,11 +1,12 @@
-// gba_video_player.cpp  v2
-// Mode 3 单缓冲 + YUV411 → RGB555 整数近似解码
+// gba_video_player.cpp  v3
+// Mode 3 单缓冲 + YUV9 → RGB555 + 帧间差分解码
 
 #include <gba_systemcalls.h>
 #include <gba_video.h>
 #include <gba_dma.h>
 #include <gba_interrupt.h>
 #include <gba_input.h>
+#include <cstring>
 
 #include "video_data.h"
 
@@ -15,6 +16,7 @@ constexpr int PIXELS_PER_FRAME = SCREEN_WIDTH * SCREEN_HEIGHT;
 EWRAM_BSS u16 ewramBuffer[PIXELS_PER_FRAME];
 IWRAM_DATA static u8 clip_table_raw[768];
 u8* lookup_table = clip_table_raw + 256; //预先添加偏移，这样查表的时候，遇到负数也直接查
+
 void init_table(){
     for(int i=-256;i<768-256;i++){
         u8 raw_val;
@@ -28,75 +30,113 @@ void init_table(){
     }
 }
 
-IWRAM_CODE inline u16 yuv_to_rgb555(u8 y   ,s16 d_r
-                                ,s16 d_g
-                                ,s16 d_b)
+IWRAM_CODE inline u16 yuv_to_rgb555(u8 y, s16 d_r, s16 d_g, s16 d_b)
 {
     // 近似整数 YUV → RGB
     // R = Y + (Cr << 1)
     // G = Y - (Cb >> 1) - Cr  
     // B = Y + (Cb << 1)
-    // Y取值范围 0-255
-    // Cb/Cr取值范围 -128..127
-    // 右边的所有运算，绝对值不会超过两倍的128，即不会超过256
-    // 那么这三个结果的范围是: -256..511，总共 768 个整数，直接查表
-
-    u32 result = lookup_table[y + d_r];//32位计算好像更快，省去了截断
+    u32 result = lookup_table[y + d_r];
     result |= (lookup_table[y + d_g] << 5);
     return result | (lookup_table[y + d_b] << 10);
 }
 
+// 解码单个4x4块到指定位置
+IWRAM_CODE inline void decode_block(const u8* src, u16* dst_base, int block_x, int block_y)
+{
+    s8  Cb = static_cast<s8>(src[16]);
+    s8  Cr = static_cast<s8>(src[17]);
+    
+    s16 d_r = Cr << 1;           // 2*Cr
+    s16 d_g = -(Cb >> 1) - Cr;   // -Cb/2 - Cr
+    s16 d_b = Cb << 1;           // 2*Cb
+    
+    // 计算块在帧缓冲中的起始位置
+    u16* dst = dst_base + (block_y * 4 * SCREEN_WIDTH) + (block_x * 4);
+    
+    // 解码4x4像素
+    for(int row = 0; row < 4; row++) {
+        u16* dst_row = dst + row * SCREEN_WIDTH;
+        const u8* y_row = src + row * 4;
+        
+        dst_row[0] = yuv_to_rgb555(y_row[0], d_r, d_g, d_b);
+        dst_row[1] = yuv_to_rgb555(y_row[1], d_r, d_g, d_b);
+        dst_row[2] = yuv_to_rgb555(y_row[2], d_r, d_g, d_b);
+        dst_row[3] = yuv_to_rgb555(y_row[3], d_r, d_g, d_b);
+    }
+}
+
+IWRAM_CODE void decode_i_frame(const u8* src, u16* dst)
+{
+    // 跳过帧类型标记
+    src++;
+    
+    // 解码所有块
+    for (int by = 0; by < BLOCKS_PER_COL; by++) {
+        for (int bx = 0; bx < BLOCKS_PER_ROW; bx++) {
+            decode_block(src, dst, bx, by);
+            src += BYTES_PER_BLOCK;
+        }
+    }
+}
+
+IWRAM_CODE void decode_p_frame(const u8* src, u16* dst)
+{
+    // 跳过帧类型标记
+    src++;
+    
+    // 读取需要更新的块数（小端序）
+    u16 blocks_to_update = src[0] | (src[1] << 8);
+    src += 2;
+    
+    // 防止越界
+    if (blocks_to_update > TOTAL_BLOCKS) {
+        blocks_to_update = TOTAL_BLOCKS;
+    }
+    
+    // 处理每个需要更新的块
+    for (u16 i = 0; i < blocks_to_update; i++) {
+        // 读取块索引（小端序）
+        u16 block_idx = src[0] | (src[1] << 8);
+        src += 2;
+        
+        // 防止越界
+        if (block_idx >= TOTAL_BLOCKS) {
+            src += BYTES_PER_BLOCK;
+            continue;
+        }
+        
+        // 计算块坐标
+        int bx = block_idx % BLOCKS_PER_ROW;
+        int by = block_idx / BLOCKS_PER_ROW;
+        
+        // 解码这个块
+        decode_block(src, dst, bx, by);
+        src += BYTES_PER_BLOCK;
+    }
+}
+
+// 添加调试用的帧计数器（可选）
+#ifdef DEBUG
+EWRAM_DATA int debug_i_frames = 0;
+EWRAM_DATA int debug_p_frames = 0;
+#endif
 
 IWRAM_CODE void decode_frame(const u8* src, u16* dst)
 {
-    u16* row0 = dst;
-    for (int y = 0; y < SCREEN_HEIGHT; y += 4,row0+= SCREEN_WIDTH * 4)
-    {
-        // 当前 4 行首指针
-        // u16* row1 = row0 + SCREEN_WIDTH;
-        // u16* row2 = row1 + SCREEN_WIDTH;
-        // u16* row3 = row2 + SCREEN_WIDTH;
-
-        for (int x = 0; x < SCREEN_WIDTH; x += 4)
-        {
-            // 取 16×Y
-            // u8  Y00 = src[ 0]; u8 Y01 = src[ 1]; u8 Y02 = src[ 2]; u8 Y03 = src[ 3];
-            // u8  Y10 = src[ 4]; u8 Y11 = src[ 5]; u8 Y12 = src[ 6]; u8 Y13 = src[ 7];
-            // u8  Y20 = src[ 8]; u8 Y21 = src[ 9]; u8 Y22 = src[10]; u8 Y23 = src[11];
-            // u8  Y30 = src[12]; u8 Y31 = src[13]; u8 Y32 = src[14]; u8 Y33 = src[15];
-            s8  Cb  = static_cast<s8>(src[16]);
-            s8  Cr  = static_cast<s8>(src[17]);
-
-            s16 d_r = Cr << 1;           // 2*Cr
-            s16 d_g = -(Cb >> 1) - Cr;   // -Cb/2 - Cr
-            s16 d_b = Cb << 1;           // 2*Cb
-
-            // 写 4×4 像素
-            auto row = row0;
-            row[x]   = yuv_to_rgb555(src[0], d_r, d_g, d_b);
-            row[x+1] = yuv_to_rgb555(src[1], d_r, d_g, d_b);
-            row[x+2] = yuv_to_rgb555(src[2], d_r, d_g, d_b);
-            row[x+3] = yuv_to_rgb555(src[3], d_r, d_g, d_b);
-
-            row += SCREEN_WIDTH;
-            row[x]   = yuv_to_rgb555(src[4], d_r, d_g, d_b);
-            row[x+1] = yuv_to_rgb555(src[5], d_r, d_g, d_b);
-            row[x+2] = yuv_to_rgb555(src[6], d_r, d_g, d_b);
-            row[x+3] = yuv_to_rgb555(src[7], d_r, d_g, d_b);
-
-            row += SCREEN_WIDTH;
-            row[x]   = yuv_to_rgb555(src[8], d_r, d_g, d_b);
-            row[x+1] = yuv_to_rgb555(src[9], d_r, d_g, d_b);
-            row[x+2] = yuv_to_rgb555(src[10], d_r, d_g, d_b);
-            row[x+3] = yuv_to_rgb555(src[11], d_r, d_g, d_b);
-
-            row += SCREEN_WIDTH;
-            row[x]   = yuv_to_rgb555(src[12], d_r, d_g, d_b);
-            row[x+1] = yuv_to_rgb555(src[13], d_r, d_g, d_b);
-            row[x+2] = yuv_to_rgb555(src[14], d_r, d_g, d_b);
-            row[x+3] = yuv_to_rgb555(src[15], d_r, d_g, d_b);
-            src += 18;
-        }
+    // 检查帧类型
+    u8 frame_type = src[0];
+    
+    if (frame_type == FRAME_TYPE_I) {
+        #ifdef DEBUG
+        debug_i_frames++;
+        #endif
+        decode_i_frame(src, dst);
+    } else if (frame_type == FRAME_TYPE_P) {
+        #ifdef DEBUG
+        debug_p_frames++;
+        #endif
+        decode_p_frame(src, dst);
     }
 }
 
@@ -111,33 +151,48 @@ int main()
     irqSet(IRQ_VBLANK, isr_vbl);
     irqEnable(IRQ_VBLANK);
 
-    const unsigned char* movie = video_data;
-    const int frames_total = VIDEO_FRAME_COUNT;
-    const int stride       = VIDEO_BYTES_PER_FRAME;
+    init_table();
+    
+    // 清空缓冲区
+    memset(ewramBuffer, 0, PIXELS_PER_FRAME * sizeof(u16));
+    VBlankIntrWait();
+    DMA3COPY(ewramBuffer, VRAM, PIXELS_PER_FRAME | DMA16);
 
     int frame = 0;
-    const unsigned char *vdata_ptr = movie;
-    init_table();
+    
     while (1)
     {
-        // const unsigned char* src = movie + frame * stride;
+        // 使用偏移表获取当前帧的数据位置
+        const unsigned char* frame_data = video_data + frame_offsets[frame];
+        
+        // 解码当前帧（I帧或P帧）
+        decode_frame(frame_data, ewramBuffer);
 
-        decode_frame(vdata_ptr, ewramBuffer);
-
+        // 等待垂直同步并复制到VRAM
         VBlankIntrWait();
         DMA3COPY(ewramBuffer, VRAM, PIXELS_PER_FRAME | DMA16);
 
         frame++;
-        if(frame >= frames_total) // 循环播放
-        {
-            frame = 0; // 重置帧计数
-            vdata_ptr = movie; // 重置指针
-        }
-        else
-        {
-            vdata_ptr += stride; // 移动到下一帧
+        if(frame >= VIDEO_FRAME_COUNT) {
+            frame = 0; // 循环播放
         }
 
-        // 想加暂停 / 退出可自行检测按键
+        // 按键检测（可选）
+        scanKeys();
+        u16 keys = keysDown();
+        
+        if (keys & KEY_START) {
+            // 暂停功能
+            while (!(keysDown() & KEY_START)) {
+                scanKeys();
+                VBlankIntrWait();
+            }
+        }
+        
+        if (keys & KEY_A) {
+            // 快进：跳过5帧
+            frame += 5;
+            if (frame >= VIDEO_FRAME_COUNT) frame = 0;
+        }
     }
 }
