@@ -25,9 +25,14 @@ struct YUV_Struct{
 } __attribute__((packed));
 
 // 每个条带的码表存储（在EWRAM中）
-IWRAM_DATA YUV_Struct strip_codebooks[VIDEO_STRIP_COUNT][CODEBOOK_SIZE];
+// IWRAM_DATA YUV_Struct strip_codebooks_raw[VIDEO_STRIP_COUNT][CODEBOOK_SIZE];
+IWRAM_DATA u8 strip_codebooks_raw[VIDEO_STRIP_COUNT][CODEBOOK_SIZE*sizeof(YUV_Struct)+32]__attribute__((aligned(32)));
+IWRAM_DATA YUV_Struct *strip_codebooks[VIDEO_STRIP_COUNT];
 
 void init_table(){
+    for(int i = 0; i < VIDEO_STRIP_COUNT; i++) {
+        strip_codebooks[i] = (YUV_Struct*)strip_codebooks_raw[i];
+    }
     for(int i=-128;i<512-128;i++){
         u8 raw_val;
         if(i<=0)
@@ -125,9 +130,27 @@ IWRAM_CODE void decode_strip_i_frame(int strip_idx, const u8* src, u16* dst)
     u16 codebook_size = src[0] | (src[1] << 8);
     src += 2;
     
-    // 读取码表数据
-    memcpy(strip_codebooks[strip_idx], src, codebook_size * BYTES_PER_BLOCK);
-    src += codebook_size * BYTES_PER_BLOCK;
+    u8* copy_raw_ptr = strip_codebooks_raw[strip_idx] + 32; // 跳过对齐填充的32字节
+    strip_codebooks[strip_idx] = (YUV_Struct*)copy_raw_ptr; // 设置条带的码表指针
+    int remain_copy = codebook_size * BYTES_PER_BLOCK;
+    
+    if(((u32)src) & 1){// 确保src地址对齐
+        // 如果src地址不是偶数，则需要调整
+
+        copy_raw_ptr[-1] = *src++; // 先拷贝一个字节
+        strip_codebooks[strip_idx] = (YUV_Struct*)(copy_raw_ptr - 1); // 更新条带的码表指针
+        remain_copy -= 1; // 调整后少拷贝一个字节
+    }
+
+    int remain_copy_align = (remain_copy>>1)<<1;
+    DMA3COPY(src, copy_raw_ptr, (remain_copy>>1)/*2B为单位，因此除2*/ | DMA16); // 使用DMA拷贝码表数据,不会改变指针地址和remain_copy
+
+    if(remain_copy & 1) {
+        // 如果还有一个字节未拷贝，手动拷贝
+        copy_raw_ptr[remain_copy-1] = src[remain_copy-1];
+    }
+
+    src += remain_copy;
     
     // 解码条带内所有块（使用量化索引）
     for (int block_idx = 0; block_idx < strip_info[strip_idx].total_blocks; block_idx++) {
