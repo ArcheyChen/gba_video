@@ -32,7 +32,7 @@ MUSIC		:=
 #---------------------------------------------------------------------------------
 ARCH	:=	
 
-CFLAGS	:=	-g -Wall -O3\
+CFLAGS	:=	-g -Wall -gdwarf-4 -O3\
 		-mcpu=arm7tdmi -mtune=arm7tdmi\
 		$(ARCH)
 

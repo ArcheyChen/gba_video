@@ -122,6 +122,50 @@ IWRAM_CODE inline void decode_block(const YUV_Struct &yuv_data, u16* dst)
         yuv_data.y[1], d_r, d_g, d_b);
 }
 
+IWRAM_CODE static inline
+void dma_copy_aligned(void* dst_void, const void* src_void, int bytes)
+{
+    u8*       dst = static_cast<u8*>(dst_void);
+    const u8* src = static_cast<const u8*>(src_void);
+
+    // --------- A. 字节对齐到 4 ----------
+    while (bytes && (((uintptr_t)dst | (uintptr_t)src) & 3)) {
+        *dst++ = *src++;
+        --bytes;
+    }
+
+    // --------- B. 尽量用 DMA32 ----------
+    if (bytes >= 4 &&
+        (((uintptr_t)dst & 3) == 0) &&
+        (((uintptr_t)src & 3) == 0))
+    {
+        int words = bytes >> 2;            // 以 32 bit 为单位
+        DMA3COPY(src, dst, words | DMA32); // 你的 DMA3COPY 宏
+        int bulk = words << 2;
+        dst   += bulk;
+        src   += bulk;
+        bytes -= bulk;
+    }
+
+    // --------- C. 剩余偶数字节用 DMA16 ----------
+    if (bytes >= 2 &&
+        (((uintptr_t)dst & 1) == 0) &&
+        (((uintptr_t)src & 1) == 0))
+    {
+        int hwords = bytes >> 1;           // 以 16 bit 为单位
+        DMA3COPY(src, dst, hwords | DMA16);
+        int bulk = hwords << 1;
+        dst   += bulk;
+        src   += bulk;
+        bytes -= bulk;
+    }
+
+    // --------- D. 零散尾字节 ----------
+    while (bytes--) {
+        *dst++ = *src++;
+    }
+}
+
 IWRAM_CODE void decode_strip_i_frame(int strip_idx, const u8* src, u16* dst)
 {
     u16 strip_base_offset = strip_info[strip_idx].buffer_offset;
@@ -136,27 +180,35 @@ IWRAM_CODE void decode_strip_i_frame(int strip_idx, const u8* src, u16* dst)
     
     if(((u32)src) & 1){// 确保src地址对齐
         // 如果src地址不是偶数，则需要调整
-
-        copy_raw_ptr[-1] = *src++; // 先拷贝一个字节
-        strip_codebooks[strip_idx] = (YUV_Struct*)(copy_raw_ptr - 1); // 更新条带的码表指针
+        u8 data = *src++;
+        copy_raw_ptr[-1] = copy_raw_ptr[-3] = data;
+        // strip_codebooks[strip_idx] = (YUV_Struct*)(copy_raw_ptr - 1); // 更新条带的码表指针
+        strip_codebooks[strip_idx] = (YUV_Struct*)((u32)strip_codebooks[strip_idx] - 1); // 更新条带的码表指针
         remain_copy -= 1; // 调整后少拷贝一个字节
     }
-
-    int remain_copy_align = (remain_copy>>1)<<1;
-    DMA3COPY(src, copy_raw_ptr, (remain_copy>>1)/*2B为单位，因此除2*/ | DMA16); // 使用DMA拷贝码表数据,不会改变指针地址和remain_copy
-
-    if(remain_copy & 1) {
-        // 如果还有一个字节未拷贝，手动拷贝
-        copy_raw_ptr[remain_copy-1] = src[remain_copy-1];
+    if(((u32)src) & 2){
+        copy_raw_ptr[-2] = *src++;
+        copy_raw_ptr[-1] = *src++;
+        strip_codebooks[strip_idx] = (YUV_Struct*)((u32)strip_codebooks[strip_idx] - 2);
+        remain_copy -= 2; // 调整后少拷贝两个字节
     }
 
-    src += remain_copy;
-    
+    DMA3COPY(src, copy_raw_ptr, (remain_copy>>2)/*2B为单位，因此除2*/ | DMA32); // 使用DMA拷贝码表数据,不会改变指针地址和remain_copy
+    int tail = remain_copy & 3; // 计算剩余的字节数
+    int body = remain_copy - tail; // 计算剩余的字节数（除去尾部的1-3字节）
+    src += body; // 更新src指针位置
+    copy_raw_ptr += body; // 更新码表指针位置
+    while(tail--) {
+        *copy_raw_ptr++ = *src++; // 拷贝剩余的1-3字节
+    }
+
+    auto &strip = strip_info[strip_idx];
+    auto &code_book = strip_codebooks[strip_idx];
     // 解码条带内所有块（使用量化索引）
-    for (int block_idx = 0; block_idx < strip_info[strip_idx].total_blocks; block_idx++) {
-        u8 quant_idx = *src++;
+    for (int block_idx = 0; block_idx < strip.total_blocks; block_idx++) {
+        u8 quant_idx = src[block_idx];
         // 从码表中获取块数据并解码
-        decode_block(strip_codebooks[strip_idx][quant_idx], 
+        decode_block(code_book[quant_idx], 
                     dst + strip_base_offset + block_relative_offsets[block_idx]);
     }
 }
