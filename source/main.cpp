@@ -25,7 +25,7 @@ struct YUV_Struct{
 } __attribute__((packed));
 
 // 每个条带的码表存储（在EWRAM中）
-IWRAM_DATA u8 strip_codebooks[VIDEO_STRIP_COUNT][CODEBOOK_SIZE][BYTES_PER_BLOCK];
+IWRAM_DATA YUV_Struct strip_codebooks[VIDEO_STRIP_COUNT][CODEBOOK_SIZE];
 
 void init_table(){
     for(int i=-128;i<512-128;i++){
@@ -40,27 +40,20 @@ void init_table(){
     }
 }
 
-IWRAM_CODE inline u16 yuv_to_rgb555(u8 y, s8 d_r, s8 d_g, s8 d_b)
-{
-    // 使用预计算的查找表进行转换    
-    u32 result = clip_lookup_table[y + d_r];
-    result |= (clip_lookup_table[y + d_g] << 5);
-    return result | (clip_lookup_table[y + d_b] << 10);
-}
-
-IWRAM_CODE inline u32 yuv_to_rgb555_2pix(u8 y0, u8 y1, s8 d_r, s8 d_g, s8 d_b)
+IWRAM_CODE inline u32 yuv_to_rgb555_2pix(const u8 y[2], s8 d_r, s8 d_g, s8 d_b)
 {
     // 使用预计算的查找表进行转换
-    u32 result = clip_lookup_table[y0 + d_r];
-    result |= (clip_lookup_table[y0 + d_g] << 5);
-    result |= (clip_lookup_table[y0 + d_b] << 10);
+    u32 result = clip_lookup_table[y[0] + d_r];
+    result |= (clip_lookup_table[y[0] + d_g] << 5);
+    result |= (clip_lookup_table[y[0] + d_b] << 10);
     
-    result |= (clip_lookup_table[y1 + d_r] << 16);
-    result |= (clip_lookup_table[y1 + d_g] << 21);
-    result |= (clip_lookup_table[y1 + d_b] << 26);
+    result |= (clip_lookup_table[y[1] + d_r] << 16);
+    result |= (clip_lookup_table[y[1] + d_g] << 21);
+    result |= (clip_lookup_table[y[1] + d_b] << 26);
     
     return result;
 }
+
 // 条带信息结构
 struct StripInfo {
     u16 start_y;       // 条带起始Y坐标
@@ -109,19 +102,19 @@ void init_strip_info(){
 }
 
 // 解码单个4x4块到指定位置
-IWRAM_CODE inline void decode_block(const u8* src, u16* dst)
+IWRAM_CODE inline void decode_block(const YUV_Struct &yuv_data, u16* dst)
 {
-    YUV_Struct *yuv_data = (YUV_Struct*)src;
-    s8 d_r = yuv_data->d_r;
-    s8 d_g = yuv_data->d_g;
-    s8 d_b = yuv_data->d_b;
+
+    const s8 &d_r = yuv_data.d_r;
+    const s8 &d_g = yuv_data.d_g;
+    const s8 &d_b = yuv_data.d_b;
 
     // 解码2x2像素
     u32* dst_row = (u32*)dst;
     *dst_row = yuv_to_rgb555_2pix(
-        yuv_data->y[0][0], yuv_data->y[0][1], d_r, d_g, d_b);
+        yuv_data.y[0], d_r, d_g, d_b);
     *(dst_row + SCREEN_WIDTH/2) = yuv_to_rgb555_2pix(
-        yuv_data->y[1][0], yuv_data->y[1][1], d_r, d_g, d_b);
+        yuv_data.y[1], d_r, d_g, d_b);
 }
 
 IWRAM_CODE void decode_strip_i_frame(int strip_idx, const u8* src, u16* dst)
