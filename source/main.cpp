@@ -1,5 +1,5 @@
-// gba_video_player.cpp  v4
-// Mode 3 单缓冲 + YUV9 → RGB555 + 条带帧间差分解码
+// gba_video_player.cpp  v5
+// Mode 3 单缓冲 + YUV9 → RGB555 + 条带帧间差分解码 + 向量量化
 
 #include <gba_systemcalls.h>
 #include <gba_video.h>
@@ -17,6 +17,9 @@ constexpr int PIXELS_PER_FRAME = SCREEN_WIDTH * SCREEN_HEIGHT;
 EWRAM_BSS u16 ewramBuffer[PIXELS_PER_FRAME];
 IWRAM_DATA static u8 clip_table_raw[768];
 u8* lookup_table = clip_table_raw + 256; //预先添加偏移，这样查表的时候，遇到负数也直接查
+
+// 每个条带的码表存储（在EWRAM中）
+EWRAM_BSS u8 strip_codebooks[VIDEO_STRIP_COUNT][CODEBOOK_SIZE][BYTES_PER_BLOCK];
 
 void init_table(){
     for(int i=-256;i<768-256;i++){
@@ -124,10 +127,20 @@ IWRAM_CODE void decode_strip_i_frame(int strip_idx, const u8* src, u16* dst)
 {
     u16 strip_base_offset = strip_info[strip_idx].buffer_offset;
     
-    // 解码条带内所有块
+    // 读取码表大小（应该是CODEBOOK_SIZE）
+    u16 codebook_size = src[0] | (src[1] << 8);
+    src += 2;
+    
+    // 读取码表数据
+    memcpy(strip_codebooks[strip_idx], src, codebook_size * BYTES_PER_BLOCK);
+    src += codebook_size * BYTES_PER_BLOCK;
+    
+    // 解码条带内所有块（使用量化索引）
     for (int block_idx = 0; block_idx < strip_info[strip_idx].total_blocks; block_idx++) {
-        decode_block(src, dst + strip_base_offset + block_relative_offsets[block_idx]);
-        src += BYTES_PER_BLOCK;
+        u8 quant_idx = *src++;
+        // 从码表中获取块数据并解码
+        decode_block(strip_codebooks[strip_idx][quant_idx], 
+                    dst + strip_base_offset + block_relative_offsets[block_idx]);
     }
 }
 
@@ -145,11 +158,15 @@ IWRAM_CODE void decode_strip_p_frame(int strip_idx, const u8* src, u16* dst)
         u16 block_idx = src[0] | (src[1] << 8);
         src += 2;
         
+        // 读取量化索引
+        u8 quant_idx = *src++;
+        
         // 确保块索引在有效范围内
         if (block_idx < strip_info[strip_idx].total_blocks) {
-            decode_block(src, dst + strip_base_offset + block_relative_offsets[block_idx]);
+            // 从码表中获取块数据并解码
+            decode_block(strip_codebooks[strip_idx][quant_idx], 
+                        dst + strip_base_offset + block_relative_offsets[block_idx]);
         }
-        src += BYTES_PER_BLOCK;
     }
 }
 

@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 """
-gba_encode.py  v4  ——  把视频/图片序列转成 GBA Mode3 YUV9 数据（支持条带帧间差分）
+gba_encode.py  v5  ——  把视频/图片序列转成 GBA Mode3 YUV9 数据（支持条带帧间差分 + 向量量化）
 输出 video_data.c / video_data.h
 默认 5 s @ 30 fps，可用 --duration / --fps 修改
-支持条带处理，每个条带独立进行I/P帧编码
+支持条带处理，每个条带独立进行I/P帧编码 + 码表压缩
 """
 
 import argparse, cv2, numpy as np, pathlib, textwrap
 import struct
 import concurrent.futures
+from sklearn.cluster import MiniBatchKMeans
+from scipy.spatial.distance import cdist
 
 WIDTH, HEIGHT = 240, 160
 DEFAULT_STRIP_COUNT = 4
+CODEBOOK_SIZE = 256  # 码表大小
 
 Y_COEFF  = np.array([0.28571429,  0.57142857,  0.14285714])
 CB_COEFF = np.array([-0.14285714, -0.28571429,  0.42857143])
@@ -161,6 +164,193 @@ def encode_strip_i_frame(blocks: np.ndarray) -> bytes:
         data.extend(blocks.flatten().tobytes())
     return bytes(data)
 
+def generate_codebook(blocks_data: np.ndarray, codebook_size: int = CODEBOOK_SIZE) -> np.ndarray:
+    """
+    使用K-Means聚类生成码表
+    blocks_data: shape (N, 6) 的块数据数组
+    返回: shape (codebook_size, 6) 的码表
+    """
+    if len(blocks_data) == 0:
+        return np.zeros((codebook_size, BYTES_PER_BLOCK), dtype=np.uint8)
+    
+    # 如果数据量太少，直接填充
+    if len(blocks_data) < codebook_size:
+        codebook = np.zeros((codebook_size, BYTES_PER_BLOCK), dtype=np.uint8)
+        codebook[:len(blocks_data)] = blocks_data
+        # 用最后一个块填充剩余位置
+        if len(blocks_data) > 0:
+            for i in range(len(blocks_data), codebook_size):
+                codebook[i] = blocks_data[-1]
+        return codebook
+    
+    # 使用MiniBatchKMeans加速聚类
+    kmeans = MiniBatchKMeans(
+        n_clusters=codebook_size, 
+        random_state=42, 
+        batch_size=min(1000, len(blocks_data)),
+        max_iter=100,
+        n_init=3
+    )
+    kmeans.fit(blocks_data.astype(np.float32))
+    
+    # 将聚类中心转换回uint8
+    codebook = np.clip(kmeans.cluster_centers_.round(), 0, 255).astype(np.uint8)
+    
+    return codebook
+
+def quantize_blocks(blocks_data: np.ndarray, codebook: np.ndarray) -> np.ndarray:
+    """
+    使用码表对块进行量化
+    返回每个块对应的码表索引
+    """
+    if len(blocks_data) == 0:
+        return np.array([], dtype=np.uint8)
+    
+    # 计算每个块与码表中所有条目的距离
+    distances = cdist(blocks_data.astype(np.float32), codebook.astype(np.float32), metric='euclidean')
+    
+    # 找到最近的码表索引
+    indices = np.argmin(distances, axis=1).astype(np.uint8)
+    
+    return indices
+
+def encode_strip_i_frame_vq(blocks: np.ndarray, codebook: np.ndarray) -> bytes:
+    """编码条带I帧（带向量量化）"""
+    data = bytearray()
+    data.append(FRAME_TYPE_I)
+    
+    if blocks.size > 0:
+        # 展平块数据并量化
+        blocks_flat = blocks.reshape(-1, BYTES_PER_BLOCK)
+        indices = quantize_blocks(blocks_flat, codebook)
+        
+        # 存储码表大小和码表数据
+        data.extend(struct.pack('<H', CODEBOOK_SIZE))
+        data.extend(codebook.flatten().tobytes())
+        
+        # 存储量化索引
+        data.extend(indices.tobytes())
+    
+    return bytes(data)
+
+def encode_strip_differential_vq(current_blocks: np.ndarray, prev_blocks: np.ndarray, 
+                                codebook: np.ndarray, diff_threshold: float, 
+                                force_i_threshold: float = 0.7) -> tuple:
+    """
+    差分编码当前条带（使用向量量化）
+    返回: (编码数据, 是否为I帧)
+    """
+    if prev_blocks is None or current_blocks.shape != prev_blocks.shape:
+        return encode_strip_i_frame_vq(current_blocks, codebook), True
+    
+    blocks_h, blocks_w = current_blocks.shape[:2]
+    total_blocks = blocks_h * blocks_w
+    
+    if total_blocks == 0:
+        return b'', True
+    
+    # 计算每个块的差异
+    block_diffs = np.zeros((blocks_h, blocks_w))
+    for by in range(blocks_h):
+        for bx in range(blocks_w):
+            block_diffs[by, bx] = calculate_block_diff(
+                current_blocks[by, bx], prev_blocks[by, bx]
+            )
+    
+    # 统计需要更新的块数
+    blocks_to_update = (block_diffs > diff_threshold).sum()
+    update_ratio = blocks_to_update / total_blocks
+    
+    # 如果需要更新的块太多，则使用I帧
+    if update_ratio > force_i_threshold:
+        return encode_strip_i_frame_vq(current_blocks, codebook), True
+    
+    # 否则编码为P帧
+    data = bytearray()
+    data.append(FRAME_TYPE_P)
+    
+    # 存储需要更新的块数（2字节）
+    data.extend(struct.pack('<H', blocks_to_update))
+    
+    # 收集需要更新的块数据并量化
+    if blocks_to_update > 0:
+        updated_blocks = []
+        updated_indices = []
+        
+        block_idx = 0
+        for by in range(blocks_h):
+            for bx in range(blocks_w):
+                if block_diffs[by, bx] > diff_threshold:
+                    updated_blocks.append(current_blocks[by, bx])
+                    updated_indices.append(block_idx)
+                block_idx += 1
+        
+        # 量化更新的块
+        updated_blocks = np.array(updated_blocks)
+        quantized_indices = quantize_blocks(updated_blocks, codebook)
+        
+        # 存储块索引和量化索引
+        for i, (block_idx, quant_idx) in enumerate(zip(updated_indices, quantized_indices)):
+            data.extend(struct.pack('<H', block_idx))  # 块索引
+            data.append(quant_idx)  # 量化索引
+    
+    return bytes(data), False
+
+def process_strip_parallel(args):
+    """并行处理单个条带的编码任务"""
+    (strip_blocks, prev_strip_blocks, strip_codebook, frame_idx, 
+     i_frame_interval, diff_threshold, force_i_threshold, is_first_frame) = args
+    
+    # 决定是否强制I帧
+    force_i_frame = (frame_idx % i_frame_interval == 0) or is_first_frame
+    
+    if force_i_frame or prev_strip_blocks is None:
+        # 编码为I帧
+        strip_data = encode_strip_i_frame_vq(strip_blocks, strip_codebook)
+        is_i_frame = True
+    else:
+        # 尝试差分编码
+        strip_data, is_i_frame = encode_strip_differential_vq(
+            strip_blocks, prev_strip_blocks, strip_codebook,
+            diff_threshold, force_i_threshold
+        )
+    
+    return strip_data, is_i_frame
+
+def generate_strip_codebooks(frames: list, strip_count: int, sample_frames: int = 10) -> list:
+    """为每个条带生成码表"""
+    print("正在生成条带码表...")
+    
+    codebooks = []
+    
+    # 对每个条带收集样本数据
+    for strip_idx in range(strip_count):
+        print(f"  生成条带 {strip_idx} 的码表...")
+        
+        # 收集该条带在多帧中的块数据
+        strip_blocks_samples = []
+        
+        # 采样部分帧来生成码表
+        sample_indices = np.linspace(0, len(frames)-1, min(sample_frames, len(frames)), dtype=int)
+        
+        for frame_idx in sample_indices:
+            strip_blocks = frames[frame_idx][strip_idx]
+            if strip_blocks.size > 0:
+                blocks_flat = strip_blocks.reshape(-1, BYTES_PER_BLOCK)
+                strip_blocks_samples.append(blocks_flat)
+        
+        # 合并所有样本
+        if strip_blocks_samples:
+            all_blocks = np.vstack(strip_blocks_samples)
+            codebook = generate_codebook(all_blocks, CODEBOOK_SIZE)
+        else:
+            codebook = np.zeros((CODEBOOK_SIZE, BYTES_PER_BLOCK), dtype=np.uint8)
+        
+        codebooks.append(codebook)
+        print(f"    条带 {strip_idx} 码表生成完成，使用了 {len(all_blocks) if strip_blocks_samples else 0} 个块样本")
+    
+    return codebooks
+
 def write_header(path_h: pathlib.Path, frame_cnt: int, total_bytes: int, strip_count: int, strip_heights: list):
     guard = "VIDEO_DATA_H"
     strip_heights_str = ', '.join(map(str, strip_heights))
@@ -175,6 +365,7 @@ def write_header(path_h: pathlib.Path, frame_cnt: int, total_bytes: int, strip_c
             #define VIDEO_HEIGHT        {HEIGHT}
             #define VIDEO_TOTAL_BYTES   {total_bytes}
             #define VIDEO_STRIP_COUNT   {strip_count}
+            #define CODEBOOK_SIZE       {CODEBOOK_SIZE}
             
             // 帧类型定义
             #define FRAME_TYPE_I        0x00
@@ -219,7 +410,7 @@ def write_source(path_c: pathlib.Path, data: bytes, frame_offsets: list, strip_h
         f.write("};\n")
 
 def main():
-    pa = argparse.ArgumentParser(description="Encode to GBA YUV9 with strip-based inter-frame compression")
+    pa = argparse.ArgumentParser(description="Encode to GBA YUV9 with strip-based inter-frame compression and vector quantization")
     pa.add_argument("input")
     pa.add_argument("--duration", type=float, default=5.0)
     pa.add_argument("--fps", type=int, default=30)
@@ -232,6 +423,10 @@ def main():
                    help="差异阈值，超过此值的块将被更新（默认2.0，Y通道平均差值）")
     pa.add_argument("--force-i-threshold", type=float, default=0.7,
                    help="当需要更新的块比例超过此值时，强制生成I帧（默认0.7）")
+    pa.add_argument("--codebook-samples", type=int, default=20,
+                   help="用于生成码表的采样帧数（默认20）")
+    pa.add_argument("--threads", type=int, default=None,
+                   help="并行处理线程数（默认为CPU核心数）")
     args = pa.parse_args()
 
     cap = cv2.VideoCapture(args.input)
@@ -248,7 +443,8 @@ def main():
 
     frames = []
     idx = 0
-    with concurrent.futures.ThreadPoolExecutor() as executor:
+    print("正在提取帧...")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.threads) as executor:
         while idx < grab_max:
             ret, frm = cap.read()
             if not ret:
@@ -271,13 +467,22 @@ def main():
                     i = future_to_idx[future]
                     frame_strips[i] = future.result()
                 frames.append(frame_strips)
+                
+                if len(frames) % 30 == 0:
+                    print(f"  已提取 {len(frames)} 帧")
             idx += 1
     cap.release()
 
     if not frames:
         raise SystemExit("❌ 没有任何帧被采样")
 
+    print(f"总共提取了 {len(frames)} 帧")
+
+    # 生成每个条带的码表
+    strip_codebooks = generate_strip_codebooks(frames, args.strip_count, args.codebook_samples)
+
     # 编码所有帧
+    print("正在编码帧...")
     encoded_frames = []
     frame_offsets = []
     current_offset = 0
@@ -285,61 +490,57 @@ def main():
     i_frame_count = [0] * args.strip_count
     p_frame_count = [0] * args.strip_count
     
-    for frame_idx, current_strips in enumerate(frames):
-        frame_offsets.append(current_offset)
-        
-        # 决定是否强制I帧
-        force_i_frame = (frame_idx % args.i_frame_interval == 0) or (frame_idx == 0)
-        
-        frame_data = bytearray()
-        
-        # 编码每个条带
-        for strip_idx, current_strip in enumerate(current_strips):
-            if force_i_frame or prev_strips[strip_idx] is None:
-                # 编码为I帧
-                strip_data = encode_strip_i_frame(current_strip)
-                is_i_frame = True
-                i_frame_count[strip_idx] += 1
-            else:
-                # 尝试差分编码
-                strip_data, is_i_frame = encode_strip_differential(
-                    current_strip, prev_strips[strip_idx], 
-                    args.diff_threshold, args.force_i_threshold
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.threads) as executor:
+        for frame_idx, current_strips in enumerate(frames):
+            frame_offsets.append(current_offset)
+            
+            # 准备并行编码任务
+            tasks = []
+            for strip_idx, current_strip in enumerate(current_strips):
+                task_args = (
+                    current_strip, prev_strips[strip_idx], strip_codebooks[strip_idx],
+                    frame_idx, args.i_frame_interval, args.diff_threshold, 
+                    args.force_i_threshold, frame_idx == 0
                 )
+                tasks.append(task_args)
+            
+            # 并行编码所有条带
+            future_to_strip = {
+                executor.submit(process_strip_parallel, task): strip_idx
+                for strip_idx, task in enumerate(tasks)
+            }
+            
+            frame_data = bytearray()
+            strip_results = [None] * args.strip_count
+            
+            # 收集结果
+            for future in concurrent.futures.as_completed(future_to_strip):
+                strip_idx = future_to_strip[future]
+                strip_data, is_i_frame = future.result()
+                strip_results[strip_idx] = (strip_data, is_i_frame)
+                
                 if is_i_frame:
                     i_frame_count[strip_idx] += 1
                 else:
                     p_frame_count[strip_idx] += 1
             
-            # 存储条带长度（2字节）+ 条带数据
-            frame_data.extend(struct.pack('<H', len(strip_data)))
-            frame_data.extend(strip_data)
+            # 按顺序组装帧数据
+            for strip_idx, (strip_data, _) in enumerate(strip_results):
+                # 存储条带长度（2字节）+ 条带数据
+                frame_data.extend(struct.pack('<H', len(strip_data)))
+                frame_data.extend(strip_data)
+                
+                # 更新参考条带
+                prev_strips[strip_idx] = current_strips[strip_idx].copy() if current_strips[strip_idx].size > 0 else None
             
-            # 更新参考条带
-            prev_strips[strip_idx] = current_strip.copy() if current_strip.size > 0 else None
-        
-        encoded_frames.append(bytes(frame_data))
-        current_offset += len(frame_data)
-        
-        # 打印编码信息
-        strip_types = []
-        for strip_idx in range(args.strip_count):
-            if frame_idx == 0 or force_i_frame:
-                strip_types.append("I")
-            else:
-                # 这里需要根据实际编码结果来判断，简化处理
-                strip_types.append("?")
-        
-        print(f"帧 {frame_idx:4d}: 条带[{'/'.join(strip_types)}], {len(frame_data):6d} bytes")
+            encoded_frames.append(bytes(frame_data))
+            current_offset += len(frame_data)
+            
+            if frame_idx % 30 == 0 or frame_idx == len(frames) - 1:
+                print(f"  已编码 {frame_idx + 1}/{len(frames)} 帧")
     
     # 合并所有数据
     all_data = b''.join(encoded_frames)
-    
-    # 验证帧偏移
-    print(f"\n帧偏移验证:")
-    print(f"   前5帧偏移: {frame_offsets[:5]}")
-    print(f"   最后一帧偏移: {frame_offsets[-1]}")
-    print(f"   总数据大小: {len(all_data)}")
     
     # 写入文件
     write_header(pathlib.Path(args.out).with_suffix(".h"), len(frames), len(all_data), 
@@ -360,6 +561,7 @@ def main():
     print(f"   总帧数: {len(frames)}")
     print(f"   条带数: {args.strip_count}")
     print(f"   条带高度: {strip_heights}")
+    print(f"   码表大小: {CODEBOOK_SIZE}")
     
     for strip_idx in range(args.strip_count):
         print(f"   条带{strip_idx}: I帧{i_frame_count[strip_idx]}, P帧{p_frame_count[strip_idx]}")
