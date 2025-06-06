@@ -60,14 +60,37 @@ struct StripInfo {
     u16 blocks_per_row; // 每行块数
     u16 blocks_per_col; // 每列块数
     u16 total_blocks;   // 总块数
+    u16 buffer_offset; // 条带在缓冲区中的起始偏移
 };
 
 IWRAM_DATA StripInfo strip_info[VIDEO_STRIP_COUNT];
-IWRAM_DATA u16 strip_block_offsets[VIDEO_STRIP_COUNT][1600]; // 假设最大40*40=1600块每条带
+// 通用的块相对偏移表，所有条带共用
+IWRAM_DATA u16 block_relative_offsets[240/4*80/4]; // 假设最小条带数为2，即每个条带4x4块数为240/4*80
 
 void init_strip_info(){
     u16 current_y = 0;
     
+    // 首先计算最大的条带块数，用于初始化通用偏移表
+    u16 max_blocks_per_row = VIDEO_WIDTH / BLOCK_WIDTH;
+    u16 max_blocks_per_col = 0;
+    
+    for(int strip_idx = 0; strip_idx < VIDEO_STRIP_COUNT; strip_idx++){
+        u16 strip_blocks_per_col = strip_heights[strip_idx] / BLOCK_HEIGHT;
+        if(strip_blocks_per_col > max_blocks_per_col) {
+            max_blocks_per_col = strip_blocks_per_col;
+        }
+    }
+    
+    // 初始化通用的块相对偏移表
+    for(int block_idx = 0; block_idx < max_blocks_per_row * max_blocks_per_col; block_idx++){
+        u16 bx = block_idx % max_blocks_per_row;
+        u16 by = block_idx / max_blocks_per_row;
+        
+        // 计算相对于条带起始位置的偏移
+        block_relative_offsets[block_idx] = (by * BLOCK_HEIGHT * SCREEN_WIDTH) + (bx * BLOCK_WIDTH);
+    }
+    
+    // 初始化各条带信息
     for(int strip_idx = 0; strip_idx < VIDEO_STRIP_COUNT; strip_idx++){
         strip_info[strip_idx].start_y = current_y;
         strip_info[strip_idx].height = strip_heights[strip_idx];
@@ -75,17 +98,8 @@ void init_strip_info(){
         strip_info[strip_idx].blocks_per_col = strip_heights[strip_idx] / BLOCK_HEIGHT;
         strip_info[strip_idx].total_blocks = strip_info[strip_idx].blocks_per_row * strip_info[strip_idx].blocks_per_col;
         
-        // 预计算每个条带内块的偏移
-        for(int block_idx = 0; block_idx < strip_info[strip_idx].total_blocks; block_idx++){
-            u16 bx = block_idx % strip_info[strip_idx].blocks_per_row;
-            u16 by = block_idx / strip_info[strip_idx].blocks_per_row;
-            
-            // 计算在整个屏幕中的绝对位置
-            u16 abs_y = current_y + (by * BLOCK_HEIGHT);
-            u16 abs_x = bx * BLOCK_WIDTH;
-            
-            strip_block_offsets[strip_idx][block_idx] = (abs_y * SCREEN_WIDTH) + abs_x;
-        }
+        // 计算条带在缓冲区中的起始偏移
+        strip_info[strip_idx].buffer_offset = current_y * SCREEN_WIDTH;
         
         current_y += strip_heights[strip_idx];
     }
@@ -110,15 +124,19 @@ IWRAM_CODE inline void decode_block(const u8* src, u16* dst)
 
 IWRAM_CODE void decode_strip_i_frame(int strip_idx, const u8* src, u16* dst)
 {
+    u16 strip_base_offset = strip_info[strip_idx].buffer_offset;
+    
     // 解码条带内所有块
     for (int block_idx = 0; block_idx < strip_info[strip_idx].total_blocks; block_idx++) {
-        decode_block(src, dst + strip_block_offsets[strip_idx][block_idx]);
+        decode_block(src, dst + strip_base_offset + block_relative_offsets[block_idx]);
         src += BYTES_PER_BLOCK;
     }
 }
 
 IWRAM_CODE void decode_strip_p_frame(int strip_idx, const u8* src, u16* dst)
 {
+    u16 strip_base_offset = strip_info[strip_idx].buffer_offset;
+    
     // 读取需要更新的块数（小端序）
     u16 blocks_to_update = src[0] | (src[1] << 8);
     src += 2;
@@ -131,7 +149,7 @@ IWRAM_CODE void decode_strip_p_frame(int strip_idx, const u8* src, u16* dst)
         
         // 确保块索引在有效范围内
         if (block_idx < strip_info[strip_idx].total_blocks) {
-            decode_block(src, dst + strip_block_offsets[strip_idx][block_idx]);
+            decode_block(src, dst + strip_base_offset + block_relative_offsets[block_idx]);
         }
         src += BYTES_PER_BLOCK;
     }
