@@ -1,5 +1,5 @@
-// gba_video_player.cpp  v3
-// Mode 3 单缓冲 + YUV9 → RGB555 + 帧间差分解码
+// gba_video_player.cpp  v4
+// Mode 3 单缓冲 + YUV9 → RGB555 + 条带帧间差分解码
 
 #include <gba_systemcalls.h>
 #include <gba_video.h>
@@ -53,6 +53,43 @@ struct YUV_Struct{
     }
 } __attribute__((packed));
 
+// 条带信息结构
+struct StripInfo {
+    u16 start_y;       // 条带起始Y坐标
+    u16 height;        // 条带高度
+    u16 blocks_per_row; // 每行块数
+    u16 blocks_per_col; // 每列块数
+    u16 total_blocks;   // 总块数
+};
+
+IWRAM_DATA StripInfo strip_info[VIDEO_STRIP_COUNT];
+IWRAM_DATA u16 strip_block_offsets[VIDEO_STRIP_COUNT][1600]; // 假设最大40*40=1600块每条带
+
+void init_strip_info(){
+    u16 current_y = 0;
+    
+    for(int strip_idx = 0; strip_idx < VIDEO_STRIP_COUNT; strip_idx++){
+        strip_info[strip_idx].start_y = current_y;
+        strip_info[strip_idx].height = strip_heights[strip_idx];
+        strip_info[strip_idx].blocks_per_row = VIDEO_WIDTH / BLOCK_WIDTH;
+        strip_info[strip_idx].blocks_per_col = strip_heights[strip_idx] / BLOCK_HEIGHT;
+        strip_info[strip_idx].total_blocks = strip_info[strip_idx].blocks_per_row * strip_info[strip_idx].blocks_per_col;
+        
+        // 预计算每个条带内块的偏移
+        for(int block_idx = 0; block_idx < strip_info[strip_idx].total_blocks; block_idx++){
+            u16 bx = block_idx % strip_info[strip_idx].blocks_per_row;
+            u16 by = block_idx / strip_info[strip_idx].blocks_per_row;
+            
+            // 计算在整个屏幕中的绝对位置
+            u16 abs_y = current_y + (by * BLOCK_HEIGHT);
+            u16 abs_x = bx * BLOCK_WIDTH;
+            
+            strip_block_offsets[strip_idx][block_idx] = (abs_y * SCREEN_WIDTH) + abs_x;
+        }
+        
+        current_y += strip_heights[strip_idx];
+    }
+}
 
 // 解码单个4x4块到指定位置
 IWRAM_CODE inline void decode_block(const u8* src, u16* dst)
@@ -71,25 +108,16 @@ IWRAM_CODE inline void decode_block(const u8* src, u16* dst)
     }
 }
 
-IWRAM_DATA u16 block_idx_to_offset[TOTAL_BLOCKS];
-void init_block_idx_to_offset(){
-    for(int i=0;i<TOTAL_BLOCKS;i++){
-        u16 bx = i % BLOCKS_PER_ROW;
-        u16 by = i / BLOCKS_PER_ROW;
-        block_idx_to_offset[i] =  (by * 4 * SCREEN_WIDTH) + (bx * 4);
-    }
-}
-
-IWRAM_CODE void decode_i_frame(const u8* src, u16* dst)
+IWRAM_CODE void decode_strip_i_frame(int strip_idx, const u8* src, u16* dst)
 {
-    // 解码所有块
-    for (int block_idx = 0; block_idx < TOTAL_BLOCKS; block_idx++) {
-        decode_block(src, dst+block_idx_to_offset[block_idx]);
+    // 解码条带内所有块
+    for (int block_idx = 0; block_idx < strip_info[strip_idx].total_blocks; block_idx++) {
+        decode_block(src, dst + strip_block_offsets[strip_idx][block_idx]);
         src += BYTES_PER_BLOCK;
     }
 }
 
-IWRAM_CODE void decode_p_frame(const u8* src, u16* dst)
+IWRAM_CODE void decode_strip_p_frame(int strip_idx, const u8* src, u16* dst)
 {
     // 读取需要更新的块数（小端序）
     u16 blocks_to_update = src[0] | (src[1] << 8);
@@ -101,21 +129,43 @@ IWRAM_CODE void decode_p_frame(const u8* src, u16* dst)
         u16 block_idx = src[0] | (src[1] << 8);
         src += 2;
         
-        decode_block(src, dst + block_idx_to_offset[block_idx]);
+        // 确保块索引在有效范围内
+        if (block_idx < strip_info[strip_idx].total_blocks) {
+            decode_block(src, dst + strip_block_offsets[strip_idx][block_idx]);
+        }
         src += BYTES_PER_BLOCK;
     }
 }
 
-
-IWRAM_CODE void decode_frame(const u8* src, u16* dst)
+IWRAM_CODE void decode_strip(int strip_idx, const u8* src, u16 strip_data_size, u16* dst)
 {
+    if (strip_data_size == 0) return;
+    
     // 检查帧类型
     u8 frame_type = *src++;
     
     if (frame_type == FRAME_TYPE_I) {
-        decode_i_frame(src, dst);
+        decode_strip_i_frame(strip_idx, src, dst);
     } else if (frame_type == FRAME_TYPE_P) {
-        decode_p_frame(src, dst);
+        decode_strip_p_frame(strip_idx, src, dst);
+    }
+}
+
+IWRAM_CODE void decode_frame(const u8* frame_data, u16* dst)
+{
+    const u8* src = frame_data;
+    
+    // 解码每个条带
+    for (int strip_idx = 0; strip_idx < VIDEO_STRIP_COUNT; strip_idx++) {
+        // 读取条带数据长度（小端序）
+        u16 strip_data_size = src[0] | (src[1] << 8);
+        src += 2;
+        
+        // 解码当前条带
+        decode_strip(strip_idx, src, strip_data_size, dst);
+        
+        // 移动到下一个条带
+        src += strip_data_size;
     }
 }
 
@@ -131,7 +181,7 @@ int main()
     irqEnable(IRQ_VBLANK);
 
     init_table();
-    init_block_idx_to_offset();
+    init_strip_info();
     
     // 清空缓冲区
     memset(ewramBuffer, 0, PIXELS_PER_FRAME * sizeof(u16));
@@ -145,7 +195,7 @@ int main()
         // 使用偏移表获取当前帧的数据位置
         const unsigned char* frame_data = video_data + frame_offsets[frame];
         
-        // 解码当前帧（I帧或P帧）
+        // 解码当前帧（按条带处理I帧或P帧）
         decode_frame(frame_data, ewramBuffer);
 
         // 等待垂直同步并复制到VRAM
@@ -158,21 +208,21 @@ int main()
         }
 
         // 按键检测（可选）
-        scanKeys();
-        u16 keys = keysDown();
+        // scanKeys();
+        // u16 keys = keysDown();
         
-        if (keys & KEY_START) {
-            // 暂停功能
-            while (!(keysDown() & KEY_START)) {
-                scanKeys();
-                VBlankIntrWait();
-            }
-        }
+        // if (keys & KEY_START) {
+        //     // 暂停功能
+        //     while (!(keysDown() & KEY_START)) {
+        //         scanKeys();
+        //         VBlankIntrWait();
+        //     }
+        // }
         
-        if (keys & KEY_A) {
-            // 快进：跳过5帧
-            frame += 5;
-            if (frame >= VIDEO_FRAME_COUNT) frame = 0;
-        }
+        // if (keys & KEY_A) {
+        //     // 快进：跳过5帧
+        //     frame += 5;
+        //     if (frame >= VIDEO_FRAME_COUNT) frame = 0;
+        // }
     }
 }
