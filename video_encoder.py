@@ -164,39 +164,64 @@ def encode_strip_i_frame(blocks: np.ndarray) -> bytes:
         data.extend(blocks.flatten().tobytes())
     return bytes(data)
 
-def generate_codebook(blocks_data: np.ndarray, codebook_size: int = CODEBOOK_SIZE) -> np.ndarray:
+def generate_codebook(blocks_data: np.ndarray, codebook_size: int = CODEBOOK_SIZE, max_iter: int = 100) -> tuple:
     """
     使用K-Means聚类生成码表
     blocks_data: shape (N, 6) 的块数据数组
-    返回: shape (codebook_size, 6) 的码表
+    返回: (codebook, effective_size) - 码表和有效码字数量
     """
     if len(blocks_data) == 0:
-        return np.zeros((codebook_size, BYTES_PER_BLOCK), dtype=np.uint8)
+        return np.zeros((codebook_size, BYTES_PER_BLOCK), dtype=np.uint8), 0
     
-    # 如果数据量太少，直接填充
-    if len(blocks_data) < codebook_size:
+    # 确保blocks_data是2D数组 (N, 6)
+    if blocks_data.ndim > 2:
+        blocks_data = blocks_data.reshape(-1, BYTES_PER_BLOCK)
+    
+    # 去重，统计实际不同的块数量
+    # 将每个6字节块转换为一个字符串来进行去重
+    blocks_as_tuples = [tuple(block) for block in blocks_data]
+    unique_tuples = list(set(blocks_as_tuples))
+    unique_blocks = np.array(unique_tuples, dtype=np.uint8)
+    
+    effective_size = min(len(unique_blocks), codebook_size)
+    
+    print(f"    原始块数: {len(blocks_data)}, 唯一块数: {len(unique_blocks)}, 有效码字数: {effective_size}")
+    
+    # 如果唯一块数小于等于码表大小，直接使用
+    if len(unique_blocks) <= codebook_size:
         codebook = np.zeros((codebook_size, BYTES_PER_BLOCK), dtype=np.uint8)
-        codebook[:len(blocks_data)] = blocks_data
-        # 用最后一个块填充剩余位置
-        if len(blocks_data) > 0:
-            for i in range(len(blocks_data), codebook_size):
-                codebook[i] = blocks_data[-1]
-        return codebook
+        codebook[:len(unique_blocks)] = unique_blocks
+        # 用最后一个块填充剩余位置，避免未初始化数据
+        if len(unique_blocks) > 0:
+            for i in range(len(unique_blocks), codebook_size):
+                codebook[i] = unique_blocks[-1]
+        return codebook, effective_size
     
-    # 使用MiniBatchKMeans加速聚类
+    # 使用MiniBatchKMeans进行聚类
     kmeans = MiniBatchKMeans(
         n_clusters=codebook_size, 
         random_state=42, 
         batch_size=min(1000, len(blocks_data)),
-        max_iter=100,
+        max_iter=max_iter,
         n_init=3
     )
     kmeans.fit(blocks_data.astype(np.float32))
     
-    # 将聚类中心转换回uint8
+    # 将聚类中心转换回uint8，确保在有效范围内
     codebook = np.clip(kmeans.cluster_centers_.round(), 0, 255).astype(np.uint8)
     
-    return codebook
+    # 验证Cb/Cr在有效范围内 (-128到127，以uint8存储)
+    for i in range(codebook_size):
+        # Cb (索引4) 和 Cr (索引5) 需要特殊处理
+        cb_val = codebook[i, 4].view(np.int8)
+        cr_val = codebook[i, 5].view(np.int8)
+        if cb_val < -128 or cb_val > 127 or cr_val < -128 or cr_val > 127:
+            print(f"    警告: 码字{i} Cb/Cr值超出范围: Cb={cb_val}, Cr={cr_val}")
+            # 裁剪到有效范围
+            codebook[i, 4] = np.clip(cb_val, -128, 127).astype(np.int8).view(np.uint8)
+            codebook[i, 5] = np.clip(cr_val, -128, 127).astype(np.int8).view(np.uint8)
+    
+    return codebook, codebook_size
 
 def quantize_blocks(blocks_data: np.ndarray, codebook: np.ndarray) -> np.ndarray:
     """
@@ -211,6 +236,12 @@ def quantize_blocks(blocks_data: np.ndarray, codebook: np.ndarray) -> np.ndarray
     
     # 找到最近的码表索引
     indices = np.argmin(distances, axis=1).astype(np.uint8)
+    
+    # 验证索引范围
+    max_idx = indices.max() if len(indices) > 0 else 0
+    if max_idx >= CODEBOOK_SIZE:
+        print(f"警告: 量化索引超出范围: 最大索引={max_idx}, 码表大小={CODEBOOK_SIZE}")
+        indices = np.clip(indices, 0, CODEBOOK_SIZE - 1)
     
     return indices
 
@@ -317,39 +348,97 @@ def process_strip_parallel(args):
     
     return strip_data, is_i_frame
 
-def generate_strip_codebooks(frames: list, strip_count: int, sample_frames: int = 10) -> list:
-    """为每个条带生成码表"""
-    print("正在生成条带码表...")
+def generate_gop_codebooks(frames: list, strip_count: int, i_frame_interval: int, 
+                          kmeans_max_iter: int = 100) -> dict:
+    """为每个GOP（Group of Pictures）的每个条带生成码表"""
+    print("正在为每个GOP生成条带码表...")
     
-    codebooks = []
+    gop_codebooks = {}  # {gop_start_frame: [strip_codebooks]}
     
-    # 对每个条带收集样本数据
-    for strip_idx in range(strip_count):
-        print(f"  生成条带 {strip_idx} 的码表...")
-        
-        # 收集该条带在多帧中的块数据
-        strip_blocks_samples = []
-        
-        # 采样部分帧来生成码表
-        sample_indices = np.linspace(0, len(frames)-1, min(sample_frames, len(frames)), dtype=int)
-        
-        for frame_idx in sample_indices:
-            strip_blocks = frames[frame_idx][strip_idx]
-            if strip_blocks.size > 0:
-                blocks_flat = strip_blocks.reshape(-1, BYTES_PER_BLOCK)
-                strip_blocks_samples.append(blocks_flat)
-        
-        # 合并所有样本
-        if strip_blocks_samples:
-            all_blocks = np.vstack(strip_blocks_samples)
-            codebook = generate_codebook(all_blocks, CODEBOOK_SIZE)
+    # 确定所有I帧的位置
+    i_frame_positions = []
+    for frame_idx in range(len(frames)):
+        if frame_idx % i_frame_interval == 0:
+            i_frame_positions.append(frame_idx)
+    
+    # 为每个GOP生成码表
+    for gop_idx, gop_start in enumerate(i_frame_positions):
+        # 确定GOP的结束位置
+        if gop_idx + 1 < len(i_frame_positions):
+            gop_end = i_frame_positions[gop_idx + 1]
         else:
-            codebook = np.zeros((CODEBOOK_SIZE, BYTES_PER_BLOCK), dtype=np.uint8)
+            gop_end = len(frames)
         
-        codebooks.append(codebook)
-        print(f"    条带 {strip_idx} 码表生成完成，使用了 {len(all_blocks) if strip_blocks_samples else 0} 个块样本")
+        print(f"  处理GOP {gop_idx}: 帧 {gop_start} 到 {gop_end-1}")
+        
+        gop_codebooks[gop_start] = []
+        
+        # 为GOP中的每个条带生成码表
+        for strip_idx in range(strip_count):
+            print(f"    生成条带 {strip_idx} 的码表...")
+            
+            # 收集该GOP中该条带的所有块数据
+            strip_blocks_samples = []
+            
+            for frame_idx in range(gop_start, gop_end):
+                strip_blocks = frames[frame_idx][strip_idx]
+                if strip_blocks.size > 0:
+                    blocks_flat = strip_blocks.reshape(-1, BYTES_PER_BLOCK)
+                    strip_blocks_samples.append(blocks_flat)
+            
+            # 合并所有样本
+            if strip_blocks_samples:
+                all_blocks = np.vstack(strip_blocks_samples)
+                codebook, effective_size = generate_codebook(all_blocks, CODEBOOK_SIZE, kmeans_max_iter)
+                total_samples = len(all_blocks)
+            else:
+                codebook = np.zeros((CODEBOOK_SIZE, BYTES_PER_BLOCK), dtype=np.uint8)
+                effective_size = 0
+                total_samples = 0
+            
+            gop_codebooks[gop_start].append({
+                'codebook': codebook,
+                'total_samples': total_samples,
+                'effective_size': effective_size,
+                'utilization': effective_size / CODEBOOK_SIZE if CODEBOOK_SIZE > 0 else 0
+            })
+            
+            print(f"      GOP{gop_idx} 条带{strip_idx}: 样本数{total_samples}, 有效码字{effective_size}, 利用率{effective_size/CODEBOOK_SIZE*100:.1f}%")
     
-    return codebooks
+    return gop_codebooks
+
+def get_current_codebooks(frame_idx: int, gop_codebooks: dict, i_frame_interval: int) -> list:
+    """获取当前帧应该使用的码表"""
+    # 找到当前帧所属的GOP起始位置
+    gop_start = (frame_idx // i_frame_interval) * i_frame_interval
+    
+    if gop_start in gop_codebooks:
+        return [strip_data['codebook'] for strip_data in gop_codebooks[gop_start]]
+    else:
+        # 如果找不到，使用第一个GOP的码表
+        first_gop = min(gop_codebooks.keys())
+        return [strip_data['codebook'] for strip_data in gop_codebooks[first_gop]]
+
+def process_strip_parallel_with_gop(args):
+    """并行处理单个条带的编码任务（使用GOP码表）"""
+    (strip_blocks, prev_strip_blocks, strip_codebook, frame_idx, 
+     i_frame_interval, diff_threshold, force_i_threshold, is_first_frame) = args
+    
+    # 决定是否强制I帧
+    force_i_frame = (frame_idx % i_frame_interval == 0) or is_first_frame
+    
+    if force_i_frame or prev_strip_blocks is None:
+        # 编码为I帧
+        strip_data = encode_strip_i_frame_vq(strip_blocks, strip_codebook)
+        is_i_frame = True
+    else:
+        # 尝试差分编码
+        strip_data, is_i_frame = encode_strip_differential_vq(
+            strip_blocks, prev_strip_blocks, strip_codebook,
+            diff_threshold, force_i_threshold
+        )
+    
+    return strip_data, is_i_frame
 
 def write_header(path_h: pathlib.Path, frame_cnt: int, total_bytes: int, strip_count: int, strip_heights: list):
     guard = "VIDEO_DATA_H"
@@ -423,8 +512,8 @@ def main():
                    help="差异阈值，超过此值的块将被更新（默认2.0，Y通道平均差值）")
     pa.add_argument("--force-i-threshold", type=float, default=0.7,
                    help="当需要更新的块比例超过此值时，强制生成I帧（默认0.7）")
-    pa.add_argument("--codebook-samples", type=int, default=20,
-                   help="用于生成码表的采样帧数（默认20）")
+    pa.add_argument("--kmeans-max-iter", type=int, default=200,
+                   help="K-Means聚类最大迭代次数（默认200）")
     pa.add_argument("--threads", type=int, default=None,
                    help="并行处理线程数（默认为CPU核心数）")
     args = pa.parse_args()
@@ -478,8 +567,8 @@ def main():
 
     print(f"总共提取了 {len(frames)} 帧")
 
-    # 生成每个条带的码表
-    strip_codebooks = generate_strip_codebooks(frames, args.strip_count, args.codebook_samples)
+    # 为每个GOP生成码表
+    gop_codebooks = generate_gop_codebooks(frames, args.strip_count, args.i_frame_interval, args.kmeans_max_iter)
 
     # 编码所有帧
     print("正在编码帧...")
@@ -490,15 +579,23 @@ def main():
     i_frame_count = [0] * args.strip_count
     p_frame_count = [0] * args.strip_count
     
+    # 计算总的码表统计
+    all_codebook_stats = []
+    for gop_start, gop_data in gop_codebooks.items():
+        all_codebook_stats.extend(gop_data)
+    
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.threads) as executor:
         for frame_idx, current_strips in enumerate(frames):
             frame_offsets.append(current_offset)
+            
+            # 获取当前帧应该使用的码表
+            current_codebooks = get_current_codebooks(frame_idx, gop_codebooks, args.i_frame_interval)
             
             # 准备并行编码任务
             tasks = []
             for strip_idx, current_strip in enumerate(current_strips):
                 task_args = (
-                    current_strip, prev_strips[strip_idx], strip_codebooks[strip_idx],
+                    current_strip, prev_strips[strip_idx], current_codebooks[strip_idx],
                     frame_idx, args.i_frame_interval, args.diff_threshold, 
                     args.force_i_threshold, frame_idx == 0
                 )
@@ -506,7 +603,7 @@ def main():
             
             # 并行编码所有条带
             future_to_strip = {
-                executor.submit(process_strip_parallel, task): strip_idx
+                executor.submit(process_strip_parallel_with_gop, task): strip_idx
                 for strip_idx, task in enumerate(tasks)
             }
             
@@ -557,11 +654,19 @@ def main():
     compressed_size = len(all_data)
     compression_ratio = compressed_size / original_size if original_size > 0 else 1.0
     
+    # 计算平均码表利用率
+    avg_utilization = np.mean([stat['utilization'] for stat in all_codebook_stats]) * 100
+    avg_effective_size = np.mean([stat['effective_size'] for stat in all_codebook_stats])
+    
     print(f"\n✅ 编码完成：")
     print(f"   总帧数: {len(frames)}")
     print(f"   条带数: {args.strip_count}")
     print(f"   条带高度: {strip_heights}")
     print(f"   码表大小: {CODEBOOK_SIZE}")
+    print(f"   GOP数量: {len(gop_codebooks)}")
+    print(f"   平均有效码字数: {avg_effective_size:.1f}")
+    print(f"   平均码表利用率: {avg_utilization:.1f}%")
+    print(f"   K-Means迭代次数: {args.kmeans_max_iter}")
     
     for strip_idx in range(args.strip_count):
         print(f"   条带{strip_idx}: I帧{i_frame_count[strip_idx]}, P帧{p_frame_count[strip_idx]}")
