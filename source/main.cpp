@@ -1,4 +1,4 @@
-// gba_video_player.cpp  v5
+// gba_video_player.cpp  v6
 // Mode 3 单缓冲 + YUV9 → RGB555 + 条带帧间差分解码 + 向量量化
 
 #include <gba_systemcalls.h>
@@ -15,14 +15,20 @@ constexpr int PIXELS_PER_FRAME = SCREEN_WIDTH * SCREEN_HEIGHT;
 
 // EWRAM 单缓冲
 EWRAM_BSS u16 ewramBuffer[PIXELS_PER_FRAME];
-IWRAM_DATA static u8 clip_table_raw[768];
-u8* lookup_table = clip_table_raw + 256; //预先添加偏移，这样查表的时候，遇到负数也直接查
+IWRAM_DATA static u8 clip_table_raw[512];//u8+s8最大范围是在[512]大小内的
+u8* clip_lookup_table = clip_table_raw + 128; //s8最小值是-128，预先添加偏移，这样查表的时候，遇到负数也直接查
+struct YUV_Struct{
+    u8 y[2][2];
+    s8 d_r;    // 预计算的 Cr
+    s8 d_g;    // 预计算的 (-(Cb>>1)-Cr)>>1
+    s8 d_b;    // 预计算的 Cb
+} __attribute__((packed));
 
 // 每个条带的码表存储（在EWRAM中）
-EWRAM_BSS u8 strip_codebooks[VIDEO_STRIP_COUNT][CODEBOOK_SIZE][BYTES_PER_BLOCK];
+IWRAM_DATA u8 strip_codebooks[VIDEO_STRIP_COUNT][CODEBOOK_SIZE][BYTES_PER_BLOCK];
 
 void init_table(){
-    for(int i=-256;i<768-256;i++){
+    for(int i=-128;i<512-128;i++){
         u8 raw_val;
         if(i<=0)
             raw_val = 0; // 小于等于0的值都裁剪为0
@@ -30,36 +36,18 @@ void init_table(){
             raw_val = 255; // 大于等于255的值都裁剪为255
         else
             raw_val = static_cast<u8>(i); // 其他值直接赋值
-        lookup_table[i] = raw_val>>3; // 填充查找表
+        clip_lookup_table[i] = raw_val>>2; // 填充查找表，改为>>2因为码表值已预先>>1
     }
 }
 
-IWRAM_CODE inline u16 yuv_to_rgb555(u8 y, s16 d_r, s16 d_g, s16 d_b)
+IWRAM_CODE inline u16 yuv_to_rgb555(u8 y, s8 d_r, s8 d_g, s8 d_b)
 {
-    // 近似整数 YUV → RGB
-    // R = Y + (Cr << 1)
-    // G = Y - (Cb >> 1) - Cr  
-    // B = Y + (Cb << 1)
-    u32 result = lookup_table[y + d_r];
-    result |= (lookup_table[y + d_g] << 5);
-    return result | (lookup_table[y + d_b] << 10);
+    // 使用预计算的查找表进行转换    
+    u32 result = clip_lookup_table[y + d_r];
+    result |= (clip_lookup_table[y + d_g] << 5);
+    return result | (clip_lookup_table[y + d_b] << 10);
 }
 
-// YUV420 2x2采样
-#define BLOCK_WIDTH 2
-#define BLOCK_HEIGHT 2
-#define BYTES_PER_BLOCK 6
-
-struct YUV_Struct{
-    u8 y[2][2];
-    s8 Cb,Cr;
-    auto get_delta(){
-        s16 d_r = Cr << 1;           // 2*Cr
-        s16 d_g = -(Cb >> 1) - Cr;   // -Cb/2 - Cr
-        s16 d_b = Cb << 1;           // 2*Cb
-        return std::make_tuple(d_r,d_g,d_b);
-    }
-} __attribute__((packed));
 
 // 条带信息结构
 struct StripInfo {
@@ -112,7 +100,9 @@ void init_strip_info(){
 IWRAM_CODE inline void decode_block(const u8* src, u16* dst)
 {
     YUV_Struct *yuv_data = (YUV_Struct*)src;
-    auto [d_r,d_g,d_b] = yuv_data->get_delta();
+    s8 d_r = yuv_data->d_r;
+    s8 d_g = yuv_data->d_g;
+    s8 d_b = yuv_data->d_b;
 
     // 解码2x2像素
     u16* dst_row = dst;
