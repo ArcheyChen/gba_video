@@ -8,6 +8,7 @@ gba_encode.py  v4  ——  把视频/图片序列转成 GBA Mode3 YUV9 数据（
 
 import argparse, cv2, numpy as np, pathlib, textwrap
 import struct
+import concurrent.futures
 
 WIDTH, HEIGHT = 240, 160
 DEFAULT_STRIP_COUNT = 4
@@ -15,8 +16,8 @@ DEFAULT_STRIP_COUNT = 4
 Y_COEFF  = np.array([0.28571429,  0.57142857,  0.14285714])
 CB_COEFF = np.array([-0.14285714, -0.28571429,  0.42857143])
 CR_COEFF = np.array([ 0.35714286, -0.28571429, -0.07142857])
-BLOCK_W, BLOCK_H = 4, 4
-BYTES_PER_BLOCK  = 18                                   # 16Y + Cb + Cr
+BLOCK_W, BLOCK_H = 2, 2
+BYTES_PER_BLOCK  = 6  # 4Y + Cb + Cr
 
 # 帧类型标识
 FRAME_TYPE_I = 0x00  # I帧（关键帧）
@@ -54,15 +55,13 @@ def calculate_strip_heights(height: int, strip_count: int) -> list:
     
     return strip_heights
 
-def pack_yuv9_strip(frame_bgr: np.ndarray, strip_y: int, strip_height: int) -> np.ndarray:
+def pack_yuv420_strip(frame_bgr: np.ndarray, strip_y: int, strip_height: int) -> np.ndarray:
     """
-    把指定条带的 240×strip_height×3 BGR → YUV9：每 4×4 像素 18 Byte
-    布局按行优先：Y00..Y03 Y10..Y13 Y20..Y23 Y30..Y33 Cb Cr
-    返回形状为 (strip_blocks_h, blocks_w, 18) 的数组，每个元素是一个4x4块
+    向量化实现，把指定条带的 240×strip_height×3 BGR → YUV420：每 2×2 像素 6 Byte
+    布局按行优先：Y00 Y01 Y10 Y11 Cb Cr
+    返回形状为 (strip_blocks_h, blocks_w, 6) 的数组，每个元素是一个2x2块
     """
-    # 提取当前条带
     strip_bgr = frame_bgr[strip_y:strip_y + strip_height, :, :]
-    
     B = strip_bgr[:, :, 0].astype(np.float32)
     G = strip_bgr[:, :, 1].astype(np.float32)
     R = strip_bgr[:, :, 2].astype(np.float32)
@@ -72,30 +71,35 @@ def pack_yuv9_strip(frame_bgr: np.ndarray, strip_y: int, strip_height: int) -> n
     Cr = (R*CR_COEFF[0] + G*CR_COEFF[1] + B*CR_COEFF[2]).round()
 
     Y  = np.clip(Y,  0, 255).astype(np.uint8)
-    
-    # 重组为块数组
-    blocks_h = strip_height // BLOCK_H
-    blocks_w = WIDTH // BLOCK_W
+    Cb = np.clip(Cb, -128, 127).astype(np.int16)
+    Cr = np.clip(Cr, -128, 127).astype(np.int16)#一定要是int16，不能是int8，否则平均的时候可能溢出，不要中心化，否则C++部分代码还需要反中心化
+
+    h, w = strip_bgr.shape[:2]
+    blocks_h = h // BLOCK_H
+    blocks_w = w // BLOCK_W
+
+    # reshape为块结构: (blocks_h, 2, blocks_w, 2)
+    Y_blocks  = Y.reshape(blocks_h, BLOCK_H, blocks_w, BLOCK_W)
+    Cb_blocks = Cb.reshape(blocks_h, BLOCK_H, blocks_w, BLOCK_W)
+    Cr_blocks = Cr.reshape(blocks_h, BLOCK_H, blocks_w, BLOCK_W)
+
+    # 4Y
+    y_flat = Y_blocks.transpose(0,2,1,3).reshape(blocks_h, blocks_w, 4)
+    # Cb/Cr平均后缩放回uint8
+    cb_mean = np.clip(Cb_blocks.mean(axis=(1,3)).round(), -128, 127).astype(np.int8)
+    cr_mean = np.clip(Cr_blocks.mean(axis=(1,3)).round(), -128, 127).astype(np.int8)
+
+    # 合并
     block_array = np.zeros((blocks_h, blocks_w, BYTES_PER_BLOCK), dtype=np.uint8)
-    
-    for by in range(blocks_h):
-        for bx in range(blocks_w):
-            y = by * BLOCK_H
-            x = bx * BLOCK_W
-            # 确保不超出条带边界
-            if y + BLOCK_H <= strip_height:
-                # 16 Y值
-                block_array[by, bx, :16] = Y[y:y+4, x:x+4].flatten()
-                # Cb和Cr的平均值
-                block_array[by, bx, 16] = Cb[y:y+4, x:x+4].mean().round().astype(np.uint8)
-                block_array[by, bx, 17] = Cr[y:y+4, x:x+4].mean().round().astype(np.uint8)
-    
+    block_array[..., 0:4] = y_flat
+    block_array[..., 4] = cb_mean.view(np.uint8)
+    block_array[..., 5] = cr_mean.view(np.uint8)
     return block_array
 
 def calculate_block_diff(block1: np.ndarray, block2: np.ndarray) -> float:
     """计算两个块的差异度（使用Y通道的平均绝对差值）"""
-    # 只比较Y通道（前16个字节）
-    y_diff = np.abs(block1[:16].astype(np.int16) - block2[:16].astype(np.int16))
+    # 只比较Y通道（前4个字节）
+    y_diff = np.abs(block1[:4].astype(np.int16) - block2[:4].astype(np.int16))
     return y_diff.mean()  # 使用平均差值，更敏感
 
 def encode_strip_differential(current_blocks: np.ndarray, prev_blocks: np.ndarray, 
@@ -177,9 +181,9 @@ def write_header(path_h: pathlib.Path, frame_cnt: int, total_bytes: int, strip_c
             #define FRAME_TYPE_P        0x01
             
             // 块参数
-            #define BLOCK_WIDTH         4
-            #define BLOCK_HEIGHT        4
-            #define BYTES_PER_BLOCK     18
+            #define BLOCK_WIDTH         2
+            #define BLOCK_HEIGHT        2
+            #define BYTES_PER_BLOCK     6
 
             // 条带高度数组
             extern const unsigned char strip_heights[VIDEO_STRIP_COUNT];
@@ -244,23 +248,30 @@ def main():
 
     frames = []
     idx = 0
-    while idx < grab_max:
-        ret, frm = cap.read()
-        if not ret:
-            break
-        if idx % every == 0:
-            frm = cv2.resize(frm, (WIDTH, HEIGHT), cv2.INTER_AREA)
-            
-            # 将帧分割成条带
-            frame_strips = []
-            strip_y = 0
-            for strip_height in strip_heights:
-                strip_blocks = pack_yuv9_strip(frm, strip_y, strip_height)
-                frame_strips.append(strip_blocks)
-                strip_y += strip_height
-            
-            frames.append(frame_strips)
-        idx += 1
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        while idx < grab_max:
+            ret, frm = cap.read()
+            if not ret:
+                break
+            if idx % every == 0:
+                frm = cv2.resize(frm, (WIDTH, HEIGHT), cv2.INTER_AREA)
+                # 多线程处理每个条带
+                strip_y_list = []
+                y = 0
+                for strip_height in strip_heights:
+                    strip_y_list.append((frm, y, strip_height))
+                    y += strip_height
+                # 提交任务
+                future_to_idx = {
+                    executor.submit(pack_yuv420_strip, *args): i
+                    for i, args in enumerate(strip_y_list)
+                }
+                frame_strips = [None] * len(strip_y_list)
+                for future in concurrent.futures.as_completed(future_to_idx):
+                    i = future_to_idx[future]
+                    frame_strips[i] = future.result()
+                frames.append(frame_strips)
+            idx += 1
     cap.release()
 
     if not frames:

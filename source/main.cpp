@@ -42,8 +42,13 @@ IWRAM_CODE inline u16 yuv_to_rgb555(u8 y, s16 d_r, s16 d_g, s16 d_b)
     return result | (lookup_table[y + d_b] << 10);
 }
 
+// YUV420 2x2采样
+#define BLOCK_WIDTH 2
+#define BLOCK_HEIGHT 2
+#define BYTES_PER_BLOCK 6
+
 struct YUV_Struct{
-    u8 y[4][4];
+    u8 y[2][2];
     s8 Cb,Cr;
     auto get_delta(){
         s16 d_r = Cr << 1;           // 2*Cr
@@ -65,31 +70,29 @@ struct StripInfo {
 
 IWRAM_DATA StripInfo strip_info[VIDEO_STRIP_COUNT];
 // 通用的块相对偏移表，所有条带共用
-IWRAM_DATA u16 block_relative_offsets[240/4*80/4]; // 假设最小条带数为2，即每个条带4x4块数为240/4*80
+IWRAM_DATA u16 block_relative_offsets[240/2*80/2]; // 2x2块数
 
 void init_strip_info(){
     u16 current_y = 0;
-    
+
     // 首先计算最大的条带块数，用于初始化通用偏移表
     u16 max_blocks_per_row = VIDEO_WIDTH / BLOCK_WIDTH;
     u16 max_blocks_per_col = 0;
-    
+
     for(int strip_idx = 0; strip_idx < VIDEO_STRIP_COUNT; strip_idx++){
         u16 strip_blocks_per_col = strip_heights[strip_idx] / BLOCK_HEIGHT;
         if(strip_blocks_per_col > max_blocks_per_col) {
             max_blocks_per_col = strip_blocks_per_col;
         }
     }
-    
+
     // 初始化通用的块相对偏移表
     for(int block_idx = 0; block_idx < max_blocks_per_row * max_blocks_per_col; block_idx++){
         u16 bx = block_idx % max_blocks_per_row;
         u16 by = block_idx / max_blocks_per_row;
-        
-        // 计算相对于条带起始位置的偏移
         block_relative_offsets[block_idx] = (by * BLOCK_HEIGHT * SCREEN_WIDTH) + (bx * BLOCK_WIDTH);
     }
-    
+
     // 初始化各条带信息
     for(int strip_idx = 0; strip_idx < VIDEO_STRIP_COUNT; strip_idx++){
         strip_info[strip_idx].start_y = current_y;
@@ -97,10 +100,7 @@ void init_strip_info(){
         strip_info[strip_idx].blocks_per_row = VIDEO_WIDTH / BLOCK_WIDTH;
         strip_info[strip_idx].blocks_per_col = strip_heights[strip_idx] / BLOCK_HEIGHT;
         strip_info[strip_idx].total_blocks = strip_info[strip_idx].blocks_per_row * strip_info[strip_idx].blocks_per_col;
-        
-        // 计算条带在缓冲区中的起始偏移
         strip_info[strip_idx].buffer_offset = current_y * SCREEN_WIDTH;
-        
         current_y += strip_heights[strip_idx];
     }
 }
@@ -110,14 +110,12 @@ IWRAM_CODE inline void decode_block(const u8* src, u16* dst)
 {
     YUV_Struct *yuv_data = (YUV_Struct*)src;
     auto [d_r,d_g,d_b] = yuv_data->get_delta();
-    
-    // 解码4x4像素
+
+    // 解码2x2像素
     u16* dst_row = dst;
-    for(int row = 0; row < 4; row++) {
+    for(int row = 0; row < 2; row++) {
         dst_row[0] = yuv_to_rgb555(yuv_data->y[row][0], d_r, d_g, d_b);
         dst_row[1] = yuv_to_rgb555(yuv_data->y[row][1], d_r, d_g, d_b);
-        dst_row[2] = yuv_to_rgb555(yuv_data->y[row][2], d_r, d_g, d_b);
-        dst_row[3] = yuv_to_rgb555(yuv_data->y[row][3], d_r, d_g, d_b);
         dst_row += SCREEN_WIDTH;
     }
 }
