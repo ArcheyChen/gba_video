@@ -26,7 +26,7 @@ struct YUV_Struct{
 
 // 每个条带的码表存储（在EWRAM中）
 // IWRAM_DATA YUV_Struct strip_codebooks_raw[VIDEO_STRIP_COUNT][CODEBOOK_SIZE];
-IWRAM_DATA u8 strip_codebooks_raw[VIDEO_STRIP_COUNT][CODEBOOK_SIZE*sizeof(YUV_Struct)+32]__attribute__((aligned(32)));
+IWRAM_DATA u8 strip_codebooks_raw[VIDEO_STRIP_COUNT][CODEBOOK_SIZE*sizeof(YUV_Struct)+4]__attribute__((aligned(32)));
 IWRAM_DATA YUV_Struct *strip_codebooks[VIDEO_STRIP_COUNT];
 
 void init_table(){
@@ -48,13 +48,15 @@ void init_table(){
 IWRAM_CODE inline u32 yuv_to_rgb555_2pix(const u8 y[2], s8 d_r, s8 d_g, s8 d_b)
 {
     // 使用预计算的查找表进行转换
-    u32 result = clip_lookup_table[y[0] + d_r];
-    result |= (clip_lookup_table[y[0] + d_g] << 5);
-    result |= (clip_lookup_table[y[0] + d_b] << 10);
-    
-    result |= (clip_lookup_table[y[1] + d_r] << 16);
-    result |= (clip_lookup_table[y[1] + d_g] << 21);
-    result |= (clip_lookup_table[y[1] + d_b] << 26);
+    u8 _y = y[0];
+    u32 result = clip_lookup_table[_y + d_r];
+    result |= (clip_lookup_table[_y + d_g] << 5);
+    result |= (clip_lookup_table[_y + d_b] << 10);
+
+    _y = y[1];
+    result |= (clip_lookup_table[_y + d_r] << 16);
+    result |= (clip_lookup_table[_y + d_g] << 21);
+    result |= (clip_lookup_table[_y + d_b] << 26);
     
     return result;
 }
@@ -131,7 +133,7 @@ IWRAM_CODE void decode_strip_i_frame(int strip_idx, const u8* src, u16* dst)
     u16 codebook_size = src[0] | (src[1] << 8);
     src += 2;
     
-    u8* copy_raw_ptr = strip_codebooks_raw[strip_idx] + 32; // 跳过对齐填充的32字节
+    u8* copy_raw_ptr = strip_codebooks_raw[strip_idx] + 4; // 跳过对齐填充的4字节
     strip_codebooks[strip_idx] = (YUV_Struct*)copy_raw_ptr; // 设置条带的码表指针
     int remain_copy = codebook_size * BYTES_PER_BLOCK;
     
@@ -187,12 +189,9 @@ IWRAM_CODE void decode_strip_p_frame(int strip_idx, const u8* src, u16* dst)
         // 读取量化索引
         u8 quant_idx = *src++;
         
-        // 确保块索引在有效范围内
-        if (block_idx < strip_info[strip_idx].total_blocks) {
-            // 从码表中获取块数据并解码
-            decode_block(strip_codebooks[strip_idx][quant_idx], 
-                        dst + strip_base_offset + block_relative_offsets[block_idx]);
-        }
+        // 从码表中获取块数据并解码
+        decode_block(strip_codebooks[strip_idx][quant_idx], 
+                    dst + strip_base_offset + block_relative_offsets[block_idx]);
     }
 }
 
