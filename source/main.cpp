@@ -122,49 +122,6 @@ IWRAM_CODE inline void decode_block(const YUV_Struct &yuv_data, u16* dst)
         yuv_data.y[1], d_r, d_g, d_b);
 }
 
-IWRAM_CODE static inline
-void dma_copy_aligned(void* dst_void, const void* src_void, int bytes)
-{
-    u8*       dst = static_cast<u8*>(dst_void);
-    const u8* src = static_cast<const u8*>(src_void);
-
-    // --------- A. 字节对齐到 4 ----------
-    while (bytes && (((uintptr_t)dst | (uintptr_t)src) & 3)) {
-        *dst++ = *src++;
-        --bytes;
-    }
-
-    // --------- B. 尽量用 DMA32 ----------
-    if (bytes >= 4 &&
-        (((uintptr_t)dst & 3) == 0) &&
-        (((uintptr_t)src & 3) == 0))
-    {
-        int words = bytes >> 2;            // 以 32 bit 为单位
-        DMA3COPY(src, dst, words | DMA32); // 你的 DMA3COPY 宏
-        int bulk = words << 2;
-        dst   += bulk;
-        src   += bulk;
-        bytes -= bulk;
-    }
-
-    // --------- C. 剩余偶数字节用 DMA16 ----------
-    if (bytes >= 2 &&
-        (((uintptr_t)dst & 1) == 0) &&
-        (((uintptr_t)src & 1) == 0))
-    {
-        int hwords = bytes >> 1;           // 以 16 bit 为单位
-        DMA3COPY(src, dst, hwords | DMA16);
-        int bulk = hwords << 1;
-        dst   += bulk;
-        src   += bulk;
-        bytes -= bulk;
-    }
-
-    // --------- D. 零散尾字节 ----------
-    while (bytes--) {
-        *dst++ = *src++;
-    }
-}
 
 IWRAM_CODE void decode_strip_i_frame(int strip_idx, const u8* src, u16* dst)
 {
