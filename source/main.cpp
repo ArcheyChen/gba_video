@@ -176,22 +176,54 @@ IWRAM_CODE void decode_strip_p_frame(int strip_idx, const u8* src, u16* dst)
 {
     u16 strip_base_offset = strip_info[strip_idx].buffer_offset;
     
-    // 读取需要更新的块数（小端序）
-    u16 blocks_to_update = src[0] | (src[1] << 8);
+    // 读取需要更新的4x4大块数（小端序）
+    u16 big_blocks_to_update = src[0] | (src[1] << 8);
     src += 2;
     
-    // 处理每个需要更新的块
-    for (u16 i = 0; i < blocks_to_update; i++) {
-        // 读取块索引（小端序）
-        u16 block_idx = src[0] | (src[1] << 8);
+    // 处理每个需要更新的4x4大块
+    for (u16 i = 0; i < big_blocks_to_update; i++) {
+        // 读取4x4大块索引（小端序）
+        u16 big_block_idx = src[0] | (src[1] << 8);
         src += 2;
         
-        // 读取量化索引
-        u8 quant_idx = *src++;
+        // 读取4个2x2小块的量化索引
+        u8 quant_indices[4];
+        for (int j = 0; j < 4; j++) {
+            quant_indices[j] = *src++;
+        }
         
-        // 从码表中获取块数据并解码
-        decode_block(strip_codebooks[strip_idx][quant_idx], 
-                    dst + strip_base_offset + block_relative_offsets[block_idx]);
+        // 计算4x4大块在条带中的位置
+        u16 big_blocks_per_row = strip_info[strip_idx].blocks_per_row / 2;
+        u16 big_bx = big_block_idx % big_blocks_per_row;
+        u16 big_by = big_block_idx / big_blocks_per_row;
+        
+        // 解码4x4大块中的4个2x2小块
+        // 左上 (0,0)
+        u16 small_block_idx = (big_by * 2) * strip_info[strip_idx].blocks_per_row + (big_bx * 2);
+        decode_block(strip_codebooks[strip_idx][quant_indices[0]], 
+                    dst + strip_base_offset + block_relative_offsets[small_block_idx]);
+        
+        // 右上 (0,1)
+        if (big_bx * 2 + 1 < strip_info[strip_idx].blocks_per_row) {
+            small_block_idx = (big_by * 2) * strip_info[strip_idx].blocks_per_row + (big_bx * 2 + 1);
+            decode_block(strip_codebooks[strip_idx][quant_indices[1]], 
+                        dst + strip_base_offset + block_relative_offsets[small_block_idx]);
+        }
+        
+        // 左下 (1,0)
+        if (big_by * 2 + 1 < strip_info[strip_idx].blocks_per_col) {
+            small_block_idx = (big_by * 2 + 1) * strip_info[strip_idx].blocks_per_row + (big_bx * 2);
+            decode_block(strip_codebooks[strip_idx][quant_indices[2]], 
+                        dst + strip_base_offset + block_relative_offsets[small_block_idx]);
+        }
+        
+        // 右下 (1,1)
+        if (big_by * 2 + 1 < strip_info[strip_idx].blocks_per_col && 
+            big_bx * 2 + 1 < strip_info[strip_idx].blocks_per_row) {
+            small_block_idx = (big_by * 2 + 1) * strip_info[strip_idx].blocks_per_row + (big_bx * 2 + 1);
+            decode_block(strip_codebooks[strip_idx][quant_indices[3]], 
+                        dst + strip_base_offset + block_relative_offsets[small_block_idx]);
+        }
     }
 }
 

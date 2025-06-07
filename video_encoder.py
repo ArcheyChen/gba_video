@@ -276,7 +276,7 @@ def encode_strip_differential_vq(current_blocks: np.ndarray, prev_blocks: np.nda
                                 codebook: np.ndarray, diff_threshold: float, 
                                 force_i_threshold: float = 0.7) -> tuple:
     """
-    差分编码当前条带（使用向量量化）
+    差分编码当前条带（使用向量量化，按4x4大块组织）
     返回: (编码数据, 是否为I帧)
     """
     if prev_blocks is None or current_blocks.shape != prev_blocks.shape:
@@ -288,7 +288,7 @@ def encode_strip_differential_vq(current_blocks: np.ndarray, prev_blocks: np.nda
     if total_blocks == 0:
         return b'', True
     
-    # 计算每个块的差异
+    # 计算每个2x2块的差异
     block_diffs = np.zeros((blocks_h, blocks_w))
     for by in range(blocks_h):
         for bx in range(blocks_w):
@@ -296,9 +296,50 @@ def encode_strip_differential_vq(current_blocks: np.ndarray, prev_blocks: np.nda
                 current_blocks[by, bx], prev_blocks[by, bx]
             )
     
-    # 统计需要更新的块数
-    blocks_to_update = (block_diffs > diff_threshold).sum()
-    update_ratio = blocks_to_update / total_blocks
+    # 按4x4大块组织：每个大块包含4个2x2小块
+    # 4x4大块的尺寸
+    big_blocks_h = blocks_h // 2
+    big_blocks_w = blocks_w // 2
+    
+    # 收集需要更新的4x4大块
+    updated_big_blocks = []
+    
+    for big_by in range(big_blocks_h):
+        for big_bx in range(big_blocks_w):
+            # 检查当前4x4大块中的4个2x2小块是否有任何一个需要更新
+            needs_update = False
+            small_blocks_indices = []
+            quantized_indices = []
+            
+            # 4x4大块中的4个2x2小块位置
+            positions = [
+                (big_by * 2, big_bx * 2),      # 左上
+                (big_by * 2, big_bx * 2 + 1),  # 右上
+                (big_by * 2 + 1, big_bx * 2),  # 左下
+                (big_by * 2 + 1, big_bx * 2 + 1)  # 右下
+            ]
+            
+            for pos_idx, (by, bx) in enumerate(positions):
+                if by < blocks_h and bx < blocks_w:
+                    if block_diffs[by, bx] > diff_threshold:
+                        needs_update = True
+                    
+                    # 不管是否需要更新，都要量化当前块（因为要按4x4大块记录）
+                    current_block = current_blocks[by, bx]
+                    quantized_idx = quantize_blocks(np.array([current_block]), codebook)[0]
+                    quantized_indices.append(quantized_idx)
+                else:
+                    # 如果超出边界，使用0索引
+                    quantized_indices.append(0)
+            
+            # 如果4x4大块中有任何小块需要更新，则记录整个大块
+            if needs_update:
+                big_block_idx = big_by * big_blocks_w + big_bx
+                updated_big_blocks.append((big_block_idx, quantized_indices))
+    
+    # 计算更新比例（基于2x2小块数量）
+    total_updated_small_blocks = len(updated_big_blocks) * 4  # 每个大块包含4个小块
+    update_ratio = total_updated_small_blocks / total_blocks
     
     # 如果需要更新的块太多，则使用I帧
     if update_ratio > force_i_threshold:
@@ -308,30 +349,14 @@ def encode_strip_differential_vq(current_blocks: np.ndarray, prev_blocks: np.nda
     data = bytearray()
     data.append(FRAME_TYPE_P)
     
-    # 存储需要更新的块数（2字节）
-    data.extend(struct.pack('<H', blocks_to_update))
+    # 存储需要更新的4x4大块数（2字节）
+    data.extend(struct.pack('<H', len(updated_big_blocks)))
     
-    # 收集需要更新的块数据并量化
-    if blocks_to_update > 0:
-        updated_blocks = []
-        updated_indices = []
-        
-        block_idx = 0
-        for by in range(blocks_h):
-            for bx in range(blocks_w):
-                if block_diffs[by, bx] > diff_threshold:
-                    updated_blocks.append(current_blocks[by, bx])
-                    updated_indices.append(block_idx)
-                block_idx += 1
-        
-        # 量化更新的块
-        updated_blocks = np.array(updated_blocks)
-        quantized_indices = quantize_blocks(updated_blocks, codebook)
-        
-        # 存储块索引和量化索引
-        for i, (block_idx, quant_idx) in enumerate(zip(updated_indices, quantized_indices)):
-            data.extend(struct.pack('<H', block_idx))  # 块索引
-            data.append(quant_idx)  # 量化索引
+    # 存储每个4x4大块的数据
+    for big_block_idx, quantized_indices in updated_big_blocks:
+        data.extend(struct.pack('<H', big_block_idx))  # 4x4大块索引
+        for quant_idx in quantized_indices:  # 4个2x2小块的量化索引
+            data.append(quant_idx)
     
     return bytes(data), False
 
@@ -383,7 +408,7 @@ def generate_gop_codebooks(frames: list, strip_count: int, i_frame_interval: int
         
         # 为GOP中的每个条带生成码表
         for strip_idx in range(strip_count):
-            print(f"    生成条带 {strip_idx} 的码表...")
+            # print(f"    生成条带 {strip_idx} 的码表...")
             
             # 收集该GOP中该条带的所有块数据
             strip_blocks_samples = []
@@ -411,7 +436,7 @@ def generate_gop_codebooks(frames: list, strip_count: int, i_frame_interval: int
                 'utilization': effective_size / CODEBOOK_SIZE if CODEBOOK_SIZE > 0 else 0
             })
             
-            print(f"      GOP{gop_idx} 条带{strip_idx}: 样本数{total_samples}, 有效码字{effective_size}, 利用率{effective_size/CODEBOOK_SIZE*100:.1f}%")
+            # print(f"      GOP{gop_idx} 条带{strip_idx}: 样本数{total_samples}, 有效码字{effective_size}, 利用率{effective_size/CODEBOOK_SIZE*100:.1f}%")
     
     return gop_codebooks
 
