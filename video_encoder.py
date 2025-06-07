@@ -233,17 +233,23 @@ def generate_codebook(blocks_data: np.ndarray, codebook_size: int = CODEBOOK_SIZ
 
 def quantize_blocks(blocks_data: np.ndarray, codebook: np.ndarray) -> np.ndarray:
     """
-    使用码表对块进行量化
+    使用码表对块进行量化（优化版本）
     返回每个块对应的码表索引
     """
     if len(blocks_data) == 0:
         return np.array([], dtype=np.uint8)
     
-    # 计算每个块与码表中所有条目的距离
-    distances = cdist(blocks_data.astype(np.float32), codebook.astype(np.float32), metric='euclidean')
+    # 优化：使用向量化计算替代cdist
+    # 展开为 (N, 1, D) - (1, M, D) = (N, M, D)
+    blocks_expanded = blocks_data.astype(np.float32)[:, np.newaxis, :]  # (N, 1, D)
+    codebook_expanded = codebook.astype(np.float32)[np.newaxis, :, :]  # (1, M, D)
+    
+    # 计算平方差
+    diff = blocks_expanded - codebook_expanded  # (N, M, D)
+    squared_distances = np.sum(diff * diff, axis=2)  # (N, M)
     
     # 找到最近的码表索引
-    indices = np.argmin(distances, axis=1).astype(np.uint8)
+    indices = np.argmin(squared_distances, axis=1).astype(np.uint8)
     
     # 验证索引范围
     max_idx = indices.max() if len(indices) > 0 else 0
@@ -254,7 +260,7 @@ def quantize_blocks(blocks_data: np.ndarray, codebook: np.ndarray) -> np.ndarray
     return indices
 
 def encode_strip_i_frame_vq(blocks: np.ndarray, codebook: np.ndarray) -> bytes:
-    """编码条带I帧（带向量量化，按4x4大块组织）"""
+    """编码条带I帧（带向量量化，按4x4大块组织，批量优化）"""
     data = bytearray()
     data.append(FRAME_TYPE_I)
     
@@ -267,28 +273,40 @@ def encode_strip_i_frame_vq(blocks: np.ndarray, codebook: np.ndarray) -> bytes:
         data.extend(struct.pack('<H', CODEBOOK_SIZE))
         data.extend(codebook.flatten().tobytes())
         
+        # 批量量化：收集所有需要量化的块
+        all_blocks_to_quantize = []
+        block_positions = []
+        
         # 按4x4大块的顺序组织量化索引：12/34排布
         for big_by in range(big_blocks_h):
             for big_bx in range(big_blocks_w):
-                # 量化4x4大块内的4个2x2小块
-                quantized_indices = []
-                
+                # 收集4x4大块内的4个2x2小块
                 for sub_by in range(2):
                     for sub_bx in range(2):
                         by = big_by * 2 + sub_by
                         bx = big_bx * 2 + sub_bx
                         
                         if by < blocks_h and bx < blocks_w:
-                            current_block = blocks[by, bx]
-                            quantized_idx = quantize_blocks(np.array([current_block]), codebook)[0]
-                            quantized_indices.append(quantized_idx)
+                            all_blocks_to_quantize.append(blocks[by, bx])
+                            block_positions.append((big_by, big_bx, sub_by, sub_bx))
                         else:
-                            # 如果超出边界，使用0索引
-                            quantized_indices.append(0)
-                
-                # 按12/34顺序存储4个量化索引（省略大块Index）
-                for quant_idx in quantized_indices:
-                    data.append(quant_idx)
+                            # 如果超出边界，使用零块
+                            all_blocks_to_quantize.append(np.zeros(BYTES_PER_BLOCK, dtype=np.uint8))
+                            block_positions.append((big_by, big_bx, sub_by, sub_bx))
+        
+        # 批量量化所有块
+        if all_blocks_to_quantize:
+            all_blocks_array = np.array(all_blocks_to_quantize)
+            all_quantized_indices = quantize_blocks(all_blocks_array, codebook)
+            
+            # 重新组织为4x4大块格式
+            idx = 0
+            for big_by in range(big_blocks_h):
+                for big_bx in range(big_blocks_w):
+                    # 按12/34顺序存储4个量化索引
+                    for _ in range(4):
+                        data.append(all_quantized_indices[idx])
+                        idx += 1
     
     return bytes(data)
 
@@ -296,7 +314,7 @@ def encode_strip_differential_vq(current_blocks: np.ndarray, prev_blocks: np.nda
                                 codebook: np.ndarray, diff_threshold: float, 
                                 force_i_threshold: float = 0.7) -> tuple:
     """
-    差分编码当前条带（使用向量量化，按4x4大块组织）
+    差分编码当前条带（使用向量量化，按4x4大块组织，批量优化）
     返回: (编码数据, 是否为I帧)
     """
     if prev_blocks is None or current_blocks.shape != prev_blocks.shape:
@@ -308,28 +326,32 @@ def encode_strip_differential_vq(current_blocks: np.ndarray, prev_blocks: np.nda
     if total_blocks == 0:
         return b'', True
     
-    # 计算每个2x2块的差异
-    block_diffs = np.zeros((blocks_h, blocks_w))
-    for by in range(blocks_h):
-        for bx in range(blocks_w):
-            block_diffs[by, bx] = calculate_block_diff(
-                current_blocks[by, bx], prev_blocks[by, bx]
-            )
+    # 批量计算所有块的差异
+    current_flat = current_blocks.reshape(-1, BYTES_PER_BLOCK)
+    prev_flat = prev_blocks.reshape(-1, BYTES_PER_BLOCK)
+    
+    # 只比较Y通道（前4个字节）
+    y_current = current_flat[:, :4].astype(np.int16)
+    y_prev = prev_flat[:, :4].astype(np.int16)
+    y_diff = np.abs(y_current - y_prev)
+    block_diffs_flat = y_diff.mean(axis=1)  # 每个块的平均Y差值
+    
+    # 重塑回原来的形状
+    block_diffs = block_diffs_flat.reshape(blocks_h, blocks_w)
     
     # 按4x4大块组织：每个大块包含4个2x2小块
-    # 4x4大块的尺寸
     big_blocks_h = blocks_h // 2
     big_blocks_w = blocks_w // 2
     
     # 收集需要更新的4x4大块
     updated_big_blocks = []
+    blocks_to_quantize = []
+    quantize_positions = []
     
     for big_by in range(big_blocks_h):
         for big_bx in range(big_blocks_w):
             # 检查当前4x4大块中的4个2x2小块是否有任何一个需要更新
             needs_update = False
-            small_blocks_indices = []
-            quantized_indices = []
             
             # 4x4大块中的4个2x2小块位置
             positions = [
@@ -339,23 +361,31 @@ def encode_strip_differential_vq(current_blocks: np.ndarray, prev_blocks: np.nda
                 (big_by * 2 + 1, big_bx * 2 + 1)  # 右下
             ]
             
-            for pos_idx, (by, bx) in enumerate(positions):
+            for by, bx in positions:
                 if by < blocks_h and bx < blocks_w:
                     if block_diffs[by, bx] > diff_threshold:
                         needs_update = True
-                    
-                    # 不管是否需要更新，都要量化当前块（因为要按4x4大块记录）
-                    current_block = current_blocks[by, bx]
-                    quantized_idx = quantize_blocks(np.array([current_block]), codebook)[0]
-                    quantized_indices.append(quantized_idx)
-                else:
-                    # 如果超出边界，使用0索引
-                    quantized_indices.append(0)
+                        break
             
             # 如果4x4大块中有任何小块需要更新，则记录整个大块
             if needs_update:
                 big_block_idx = big_by * big_blocks_w + big_bx
-                updated_big_blocks.append((big_block_idx, quantized_indices))
+                
+                # 收集要量化的块
+                current_big_block_data = []
+                for by, bx in positions:
+                    if by < blocks_h and bx < blocks_w:
+                        current_big_block_data.append(current_blocks[by, bx])
+                        blocks_to_quantize.append(current_blocks[by, bx])
+                        quantize_positions.append((big_block_idx, len(current_big_block_data) - 1))
+                    else:
+                        # 如果超出边界，使用零块
+                        zero_block = np.zeros(BYTES_PER_BLOCK, dtype=np.uint8)
+                        current_big_block_data.append(zero_block)
+                        blocks_to_quantize.append(zero_block)
+                        quantize_positions.append((big_block_idx, len(current_big_block_data) - 1))
+                
+                updated_big_blocks.append((big_block_idx, current_big_block_data))
     
     # 计算更新比例（基于2x2小块数量）
     total_updated_small_blocks = len(updated_big_blocks) * 4  # 每个大块包含4个小块
@@ -365,6 +395,22 @@ def encode_strip_differential_vq(current_blocks: np.ndarray, prev_blocks: np.nda
     if update_ratio > force_i_threshold:
         return encode_strip_i_frame_vq(current_blocks, codebook), True
     
+    # 批量量化所有需要更新的块
+    quantized_indices_flat = []
+    if blocks_to_quantize:
+        blocks_array = np.array(blocks_to_quantize)
+        quantized_indices_flat = quantize_blocks(blocks_array, codebook)
+    
+    # 重新组织量化结果
+    big_block_quantized = {}
+    idx = 0
+    for big_block_idx, big_block_data in updated_big_blocks:
+        quantized_indices = []
+        for _ in range(4):  # 每个大块4个小块
+            quantized_indices.append(quantized_indices_flat[idx])
+            idx += 1
+        big_block_quantized[big_block_idx] = quantized_indices
+    
     # 否则编码为P帧
     data = bytearray()
     data.append(FRAME_TYPE_P)
@@ -373,9 +419,9 @@ def encode_strip_differential_vq(current_blocks: np.ndarray, prev_blocks: np.nda
     data.extend(struct.pack('<H', len(updated_big_blocks)))
     
     # 存储每个4x4大块的数据
-    for big_block_idx, quantized_indices in updated_big_blocks:
+    for big_block_idx, _ in updated_big_blocks:
         data.extend(struct.pack('<H', big_block_idx))  # 4x4大块索引
-        for quant_idx in quantized_indices:  # 4个2x2小块的量化索引
+        for quant_idx in big_block_quantized[big_block_idx]:  # 4个2x2小块的量化索引
             data.append(quant_idx)
     
     return bytes(data), False
@@ -401,9 +447,32 @@ def process_strip_parallel(args):
     
     return strip_data, is_i_frame
 
+def generate_codebook_parallel(args):
+    """并行生成单个条带的码表"""
+    gop_idx, strip_idx, strip_blocks_samples, kmeans_max_iter = args
+    
+    # 合并所有样本
+    if strip_blocks_samples:
+        all_blocks = np.vstack(strip_blocks_samples)
+        codebook, effective_size = generate_codebook(all_blocks, CODEBOOK_SIZE, kmeans_max_iter)
+        total_samples = len(all_blocks)
+    else:
+        codebook = np.zeros((CODEBOOK_SIZE, BYTES_PER_BLOCK), dtype=np.uint8)
+        effective_size = 0
+        total_samples = 0
+    
+    return {
+        'gop_idx': gop_idx,
+        'strip_idx': strip_idx,
+        'codebook': codebook,
+        'total_samples': total_samples,
+        'effective_size': effective_size,
+        'utilization': effective_size / CODEBOOK_SIZE if CODEBOOK_SIZE > 0 else 0
+    }
+
 def generate_gop_codebooks(frames: list, strip_count: int, i_frame_interval: int, 
-                          kmeans_max_iter: int = 100) -> dict:
-    """为每个GOP（Group of Pictures）的每个条带生成码表"""
+                          kmeans_max_iter: int = 100, max_workers: int = None) -> dict:
+    """为每个GOP（Group of Pictures）的每个条带生成码表（并行优化版本）"""
     print("正在为每个GOP生成条带码表...")
     
     gop_codebooks = {}  # {gop_start_frame: [strip_codebooks]}
@@ -414,7 +483,10 @@ def generate_gop_codebooks(frames: list, strip_count: int, i_frame_interval: int
         if frame_idx % i_frame_interval == 0:
             i_frame_positions.append(frame_idx)
     
-    # 为每个GOP生成码表
+    # 准备所有码表生成任务
+    codebook_tasks = []
+    gop_info = []  # 存储GOP信息用于后续组装
+    
     for gop_idx, gop_start in enumerate(i_frame_positions):
         # 确定GOP的结束位置
         if gop_idx + 1 < len(i_frame_positions):
@@ -422,14 +494,11 @@ def generate_gop_codebooks(frames: list, strip_count: int, i_frame_interval: int
         else:
             gop_end = len(frames)
         
-        print(f"  处理GOP {gop_idx}: 帧 {gop_start} 到 {gop_end-1}")
+        print(f"  准备GOP {gop_idx}: 帧 {gop_start} 到 {gop_end-1}")
+        gop_info.append((gop_start, gop_end))
         
-        gop_codebooks[gop_start] = []
-        
-        # 为GOP中的每个条带生成码表
+        # 为GOP中的每个条带准备任务
         for strip_idx in range(strip_count):
-            # print(f"    生成条带 {strip_idx} 的码表...")
-            
             # 收集该GOP中该条带的所有块数据
             strip_blocks_samples = []
             
@@ -439,24 +508,44 @@ def generate_gop_codebooks(frames: list, strip_count: int, i_frame_interval: int
                     blocks_flat = strip_blocks.reshape(-1, BYTES_PER_BLOCK)
                     strip_blocks_samples.append(blocks_flat)
             
-            # 合并所有样本
-            if strip_blocks_samples:
-                all_blocks = np.vstack(strip_blocks_samples)
-                codebook, effective_size = generate_codebook(all_blocks, CODEBOOK_SIZE, kmeans_max_iter)
-                total_samples = len(all_blocks)
-            else:
-                codebook = np.zeros((CODEBOOK_SIZE, BYTES_PER_BLOCK), dtype=np.uint8)
-                effective_size = 0
-                total_samples = 0
+            # 添加码表生成任务
+            task_args = (gop_idx, strip_idx, strip_blocks_samples, kmeans_max_iter)
+            codebook_tasks.append(task_args)
+    
+    # 并行生成所有码表
+    print(f"  并行生成 {len(codebook_tasks)} 个码表...")
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_task = {
+            executor.submit(generate_codebook_parallel, task): task
+            for task in codebook_tasks
+        }
+        
+        # 收集结果
+        codebook_results = {}
+        for future in concurrent.futures.as_completed(future_to_task):
+            result = future.result()
+            gop_idx = result['gop_idx']
+            strip_idx = result['strip_idx']
             
+            if gop_idx not in codebook_results:
+                codebook_results[gop_idx] = {}
+            codebook_results[gop_idx][strip_idx] = result
+    
+    # 组装最终结果
+    for gop_idx, (gop_start, gop_end) in enumerate(gop_info):
+        gop_codebooks[gop_start] = []
+        
+        for strip_idx in range(strip_count):
+            result = codebook_results[gop_idx][strip_idx]
             gop_codebooks[gop_start].append({
-                'codebook': codebook,
-                'total_samples': total_samples,
-                'effective_size': effective_size,
-                'utilization': effective_size / CODEBOOK_SIZE if CODEBOOK_SIZE > 0 else 0
+                'codebook': result['codebook'],
+                'total_samples': result['total_samples'],
+                'effective_size': result['effective_size'],
+                'utilization': result['utilization']
             })
             
-            # print(f"      GOP{gop_idx} 条带{strip_idx}: 样本数{total_samples}, 有效码字{effective_size}, 利用率{effective_size/CODEBOOK_SIZE*100:.1f}%")
+            # print(f"      GOP{gop_idx} 条带{strip_idx}: 样本数{result['total_samples']}, 有效码字{result['effective_size']}, 利用率{result['utilization']*100:.1f}%")
     
     return gop_codebooks
 
@@ -559,7 +648,7 @@ def main():
     pa.add_argument("--out", default="video_data")
     pa.add_argument("--strip-count", type=int, default=DEFAULT_STRIP_COUNT,
                    help=f"条带数量（默认{DEFAULT_STRIP_COUNT}）")
-    pa.add_argument("--i-frame-interval", type=int, default=30, 
+    pa.add_argument("--i-frame-interval", type=int, default=60, 
                    help="间隔多少帧插入一个I帧（默认30）")
     pa.add_argument("--diff-threshold", type=float, default=2.0,
                    help="差异阈值，超过此值的块将被更新（默认2.0，Y通道平均差值）")
@@ -621,7 +710,7 @@ def main():
     print(f"总共提取了 {len(frames)} 帧")
 
     # 为每个GOP生成码表
-    gop_codebooks = generate_gop_codebooks(frames, args.strip_count, args.i_frame_interval, args.kmeans_max_iter)
+    gop_codebooks = generate_gop_codebooks(frames, args.strip_count, args.i_frame_interval, args.kmeans_max_iter, args.threads)
 
     # 编码所有帧
     print("正在编码帧...")
