@@ -254,21 +254,41 @@ def quantize_blocks(blocks_data: np.ndarray, codebook: np.ndarray) -> np.ndarray
     return indices
 
 def encode_strip_i_frame_vq(blocks: np.ndarray, codebook: np.ndarray) -> bytes:
-    """编码条带I帧（带向量量化）"""
+    """编码条带I帧（带向量量化，按4x4大块组织）"""
     data = bytearray()
     data.append(FRAME_TYPE_I)
     
     if blocks.size > 0:
-        # 展平块数据并量化
-        blocks_flat = blocks.reshape(-1, BYTES_PER_BLOCK)
-        indices = quantize_blocks(blocks_flat, codebook)
+        blocks_h, blocks_w = blocks.shape[:2]
+        big_blocks_h = blocks_h // 2  # 4x4大块的行数
+        big_blocks_w = blocks_w // 2  # 4x4大块的列数
         
         # 存储码表大小和码表数据
         data.extend(struct.pack('<H', CODEBOOK_SIZE))
         data.extend(codebook.flatten().tobytes())
         
-        # 存储量化索引
-        data.extend(indices.tobytes())
+        # 按4x4大块的顺序组织量化索引：12/34排布
+        for big_by in range(big_blocks_h):
+            for big_bx in range(big_blocks_w):
+                # 量化4x4大块内的4个2x2小块
+                quantized_indices = []
+                
+                for sub_by in range(2):
+                    for sub_bx in range(2):
+                        by = big_by * 2 + sub_by
+                        bx = big_bx * 2 + sub_bx
+                        
+                        if by < blocks_h and bx < blocks_w:
+                            current_block = blocks[by, bx]
+                            quantized_idx = quantize_blocks(np.array([current_block]), codebook)[0]
+                            quantized_indices.append(quantized_idx)
+                        else:
+                            # 如果超出边界，使用0索引
+                            quantized_indices.append(0)
+                
+                # 按12/34顺序存储4个量化索引（省略大块Index）
+                for quant_idx in quantized_indices:
+                    data.append(quant_idx)
     
     return bytes(data)
 

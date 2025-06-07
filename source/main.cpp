@@ -72,28 +72,29 @@ struct StripInfo {
 };
 
 IWRAM_DATA StripInfo strip_info[VIDEO_STRIP_COUNT];
-// 通用的块相对偏移表，所有条带共用
-IWRAM_DATA u16 block_relative_offsets[240/2*80/2]; // 2x2块数
+// 通用的4x4大块相对偏移表，所有条带共用，记录左上角位置
+IWRAM_DATA u16 big_block_relative_offsets[240/4*80/4]; // 4x4大块数
 
 void init_strip_info(){
     u16 current_y = 0;
 
-    // 首先计算最大的条带块数，用于初始化通用偏移表
-    u16 max_blocks_per_row = VIDEO_WIDTH / BLOCK_WIDTH;
-    u16 max_blocks_per_col = 0;
+    // 首先计算最大的条带4x4大块数，用于初始化通用偏移表
+    u16 max_big_blocks_per_row = VIDEO_WIDTH / (BLOCK_WIDTH * 2);  // 4x4大块每行数量
+    u16 max_big_blocks_per_col = 0;
 
     for(int strip_idx = 0; strip_idx < VIDEO_STRIP_COUNT; strip_idx++){
-        u16 strip_blocks_per_col = strip_heights[strip_idx] / BLOCK_HEIGHT;
-        if(strip_blocks_per_col > max_blocks_per_col) {
-            max_blocks_per_col = strip_blocks_per_col;
+        u16 strip_big_blocks_per_col = strip_heights[strip_idx] / (BLOCK_HEIGHT * 2);  // 4x4大块每列数量
+        if(strip_big_blocks_per_col > max_big_blocks_per_col) {
+            max_big_blocks_per_col = strip_big_blocks_per_col;
         }
     }
 
-    // 初始化通用的块相对偏移表
-    for(int block_idx = 0; block_idx < max_blocks_per_row * max_blocks_per_col; block_idx++){
-        u16 bx = block_idx % max_blocks_per_row;
-        u16 by = block_idx / max_blocks_per_row;
-        block_relative_offsets[block_idx] = (by * BLOCK_HEIGHT * SCREEN_WIDTH) + (bx * BLOCK_WIDTH);
+    // 初始化通用的4x4大块相对偏移表（记录左上角位置）
+    for(int big_block_idx = 0; big_block_idx < max_big_blocks_per_row * max_big_blocks_per_col; big_block_idx++){
+        u16 big_bx = big_block_idx % max_big_blocks_per_row;
+        u16 big_by = big_block_idx / max_big_blocks_per_row;
+        // 4x4大块左上角的位置偏移
+        big_block_relative_offsets[big_block_idx] = (big_by * BLOCK_HEIGHT * 2 * SCREEN_WIDTH) + (big_bx * BLOCK_WIDTH * 2);
     }
 
     // 初始化各条带信息
@@ -122,6 +123,24 @@ IWRAM_CODE inline void decode_block(const YUV_Struct &yuv_data, u16* dst)
         yuv_data.y[0], d_r, d_g, d_b);
     *(dst_row + SCREEN_WIDTH/2) = yuv_to_rgb555_2pix(
         yuv_data.y[1], d_r, d_g, d_b);
+}
+
+
+// 通用的4x4大块解码函数
+IWRAM_CODE inline void decode_big_block(const YUV_Struct* codebook, const u8 quant_indices[4], u16* big_block_dst)
+{
+    // 解码4x4大块中的4个2x2小块，使用简单的加法偏移
+    // 左上 (0,0)
+    decode_block(codebook[quant_indices[0]], big_block_dst);
+    
+    // 右上 (0,1) - 向右偏移2像素
+    decode_block(codebook[quant_indices[1]], big_block_dst + 2);
+    
+    // 左下 (1,0) - 向下偏移2行
+    decode_block(codebook[quant_indices[2]], big_block_dst + SCREEN_WIDTH * 2);
+    
+    // 右下 (1,1) - 向右2像素，向下2行
+    decode_block(codebook[quant_indices[3]], big_block_dst + SCREEN_WIDTH * 2 + 2);
 }
 
 
@@ -163,12 +182,19 @@ IWRAM_CODE void decode_strip_i_frame(int strip_idx, const u8* src, u16* dst)
 
     auto &strip = strip_info[strip_idx];
     auto &code_book = strip_codebooks[strip_idx];
-    // 解码条带内所有块（使用量化索引）
-    for (int block_idx = 0; block_idx < strip.total_blocks; block_idx++) {
-        u8 quant_idx = src[block_idx];
-        // 从码表中获取块数据并解码
-        decode_block(code_book[quant_idx], 
-                    dst + strip_base_offset + block_relative_offsets[block_idx]);
+    
+    // 新格式：按4x4大块解码（12/34排布）
+    u16 tot_big_blocks = strip.total_blocks >> 2; // 每个条带的4x4大块总数
+    
+    // 解码条带内所有4x4大块
+    u16* strip_dst = dst + strip_base_offset;
+    for (int big_block_idx = 0; big_block_idx < tot_big_blocks; big_block_idx++) {
+        // 使用大块偏移表获取4x4大块左上角位置
+        u16* big_block_dst = strip_dst + big_block_relative_offsets[big_block_idx];
+        
+        // 解码4x4大块
+        decode_big_block(code_book, src, big_block_dst);
+        src+=4;
     }
 }
 
@@ -192,38 +218,11 @@ IWRAM_CODE void decode_strip_p_frame(int strip_idx, const u8* src, u16* dst)
             quant_indices[j] = *src++;
         }
         
-        // 计算4x4大块在条带中的位置
-        u16 big_blocks_per_row = strip_info[strip_idx].blocks_per_row / 2;
-        u16 big_bx = big_block_idx % big_blocks_per_row;
-        u16 big_by = big_block_idx / big_blocks_per_row;
+        // 使用优化的大块偏移表获取4x4大块左上角位置
+        u16* big_block_dst = dst + strip_base_offset + big_block_relative_offsets[big_block_idx];
         
-        // 解码4x4大块中的4个2x2小块
-        // 左上 (0,0)
-        u16 small_block_idx = (big_by * 2) * strip_info[strip_idx].blocks_per_row + (big_bx * 2);
-        decode_block(strip_codebooks[strip_idx][quant_indices[0]], 
-                    dst + strip_base_offset + block_relative_offsets[small_block_idx]);
-        
-        // 右上 (0,1)
-        if (big_bx * 2 + 1 < strip_info[strip_idx].blocks_per_row) {
-            small_block_idx = (big_by * 2) * strip_info[strip_idx].blocks_per_row + (big_bx * 2 + 1);
-            decode_block(strip_codebooks[strip_idx][quant_indices[1]], 
-                        dst + strip_base_offset + block_relative_offsets[small_block_idx]);
-        }
-        
-        // 左下 (1,0)
-        if (big_by * 2 + 1 < strip_info[strip_idx].blocks_per_col) {
-            small_block_idx = (big_by * 2 + 1) * strip_info[strip_idx].blocks_per_row + (big_bx * 2);
-            decode_block(strip_codebooks[strip_idx][quant_indices[2]], 
-                        dst + strip_base_offset + block_relative_offsets[small_block_idx]);
-        }
-        
-        // 右下 (1,1)
-        if (big_by * 2 + 1 < strip_info[strip_idx].blocks_per_col && 
-            big_bx * 2 + 1 < strip_info[strip_idx].blocks_per_row) {
-            small_block_idx = (big_by * 2 + 1) * strip_info[strip_idx].blocks_per_row + (big_bx * 2 + 1);
-            decode_block(strip_codebooks[strip_idx][quant_indices[3]], 
-                        dst + strip_base_offset + block_relative_offsets[small_block_idx]);
-        }
+        // 解码4x4大块
+        decode_big_block(strip_codebooks[strip_idx], quant_indices, big_block_dst);
     }
 }
 
