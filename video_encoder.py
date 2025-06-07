@@ -2,7 +2,7 @@
 """
 gba_encode.py  v5  ——  把视频/图片序列转成 GBA Mode3 YUV9 数据（支持条带帧间差分 + 向量量化）
 输出 video_data.c / video_data.h
-默认 5 s @ 30 fps，可用 --duration / --fps 修改
+默认 5 s @ 30 fps，可用 --duration / --fps 修改，或使用 --full-duration 编码整个视频
 支持条带处理，每个条带独立进行I/P帧编码 + 码表压缩
 """
 
@@ -690,7 +690,10 @@ def convert_codebook_from_clustering(codebook_float: np.ndarray) -> np.ndarray:
 def main():
     pa = argparse.ArgumentParser(description="Encode to GBA YUV9 with strip-based inter-frame compression and vector quantization")
     pa.add_argument("input")
-    pa.add_argument("--duration", type=float, default=5.0)
+    pa.add_argument("--duration", type=float, default=5.0,
+                   help="视频编码时长，单位秒（默认5.0）。与--full-duration互斥")
+    pa.add_argument("--full-duration", action="store_true",
+                   help="编码整个视频的完整时长，忽略--duration参数")
     pa.add_argument("--fps", type=int, default=30)
     pa.add_argument("--out", default="video_data")
     pa.add_argument("--strip-count", type=int, default=DEFAULT_STRIP_COUNT,
@@ -713,7 +716,17 @@ def main():
 
     src_fps = cap.get(cv2.CAP_PROP_FPS) or 30
     every = int(round(src_fps / args.fps))
-    grab_max = int(args.duration * src_fps)
+    
+    # 根据--full-duration参数决定是否编码整个视频
+    if args.full_duration:
+        # 获取视频总帧数
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        grab_max = total_frames
+        actual_duration = total_frames / src_fps
+        print(f"编码整个视频: {total_frames} 帧，时长 {actual_duration:.2f} 秒")
+    else:
+        grab_max = int(args.duration * src_fps)
+        print(f"编码时长: {args.duration} 秒 ({grab_max} 帧)")
 
     # 计算条带高度
     strip_heights = calculate_strip_heights(HEIGHT, args.strip_count)
