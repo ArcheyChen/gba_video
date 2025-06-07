@@ -217,7 +217,7 @@ def generate_codebook(blocks_data: np.ndarray, codebook_size: int = CODEBOOK_SIZ
                 codebook[i] = unique_blocks[-1]
         return codebook, effective_size
     
-    # 使用MiniBatchKMeans进行聚类
+    # 使用MiniBatchKMeans进行聚类，正确处理有符号数
     kmeans = MiniBatchKMeans(
         n_clusters=codebook_size, 
         random_state=42, 
@@ -225,21 +225,12 @@ def generate_codebook(blocks_data: np.ndarray, codebook_size: int = CODEBOOK_SIZ
         max_iter=max_iter,
         n_init=3
     )
-    kmeans.fit(blocks_data.astype(np.float32))
+    # 将块数据正确转换为聚类格式（处理有符号数）
+    blocks_for_clustering = convert_blocks_for_clustering(blocks_data)
+    kmeans.fit(blocks_for_clustering)
     
-    # 将聚类中心转换回uint8，确保在有效范围内
-    codebook = np.clip(kmeans.cluster_centers_.round(), 0, 255).astype(np.uint8)
-    
-    # 验证Cb/Cr在有效范围内 (-128到127，以uint8存储)
-    for i in range(codebook_size):
-        # Cb (索引4) 和 Cr (索引5) 需要特殊处理
-        cb_val = codebook[i, 4].view(np.int8)
-        cr_val = codebook[i, 5].view(np.int8)
-        if cb_val < -128 or cb_val > 127 or cr_val < -128 or cr_val > 127:
-            print(f"    警告: 码字{i} Cb/Cr值超出范围: Cb={cb_val}, Cr={cr_val}")
-            # 裁剪到有效范围
-            codebook[i, 4] = np.clip(cb_val, -128, 127).astype(np.int8).view(np.uint8)
-            codebook[i, 5] = np.clip(cr_val, -128, 127).astype(np.int8).view(np.uint8)
+    # 将聚类中心转换回正确的块格式
+    codebook = convert_codebook_from_clustering(kmeans.cluster_centers_)
     
     return codebook, codebook_size
 
@@ -251,10 +242,14 @@ def quantize_blocks(blocks_data: np.ndarray, codebook: np.ndarray) -> np.ndarray
     if len(blocks_data) == 0:
         return np.array([], dtype=np.uint8)
     
-    # 优化：使用向量化计算替代cdist
+    # 优化：使用向量化计算替代cdist，正确处理有符号数
+    # 将块数据和码表都转换为正确的聚类格式
+    blocks_for_clustering = convert_blocks_for_clustering(blocks_data)
+    codebook_for_clustering = convert_blocks_for_clustering(codebook)
+    
     # 展开为 (N, 1, D) - (1, M, D) = (N, M, D)
-    blocks_expanded = blocks_data.astype(np.float32)[:, np.newaxis, :]  # (N, 1, D)
-    codebook_expanded = codebook.astype(np.float32)[np.newaxis, :, :]  # (1, M, D)
+    blocks_expanded = blocks_for_clustering[:, np.newaxis, :]  # (N, 1, D)
+    codebook_expanded = codebook_for_clustering[np.newaxis, :, :]  # (1, M, D)
     
     # 计算平方差
     diff = blocks_expanded - codebook_expanded  # (N, M, D)
@@ -651,6 +646,46 @@ def write_source(path_c: pathlib.Path, data: bytes, frame_offsets: list, strip_h
             chunk = ', '.join(f"0x{v:02X}" for v in data[i:i+per_line])
             f.write("    " + chunk + ",\n")
         f.write("};\n")
+
+def convert_blocks_for_clustering(blocks_data: np.ndarray) -> np.ndarray:
+    """
+    将块数据转换为正确的聚类格式，处理有符号数问题
+    索引0-3是Y值(uint8)，索引4-6是d_r, d_g, d_b(int8)
+    """
+    if len(blocks_data) == 0:
+        return blocks_data.astype(np.float32)
+    
+    # 确保是2D数组
+    if blocks_data.ndim > 2:
+        blocks_data = blocks_data.reshape(-1, BYTES_PER_BLOCK)
+    
+    # 创建float32副本
+    blocks_float = blocks_data.astype(np.float32)
+    
+    # 将索引4-6的值从uint8转换为int8（有符号），再转为float32
+    # 这样-1会变成-1.0而不是255.0
+    for i in range(4, BYTES_PER_BLOCK):
+        blocks_float[:, i] = blocks_data[:, i].view(np.int8).astype(np.float32)
+    
+    return blocks_float
+
+def convert_codebook_from_clustering(codebook_float: np.ndarray) -> np.ndarray:
+    """
+    将聚类结果转换回正确的块格式
+    索引0-3是Y值(uint8)，索引4-6是d_r, d_g, d_b(int8)
+    """
+    codebook = np.zeros_like(codebook_float, dtype=np.uint8)
+    
+    # Y值（索引0-3）直接裁剪为uint8
+    codebook[:, 0:4] = np.clip(codebook_float[:, 0:4].round(), 0, 255).astype(np.uint8)
+    
+    # d_r, d_g, d_b（索引4-6）需要裁剪为int8范围，然后转为uint8存储
+    for i in range(4, BYTES_PER_BLOCK):
+        # 裁剪到int8范围[-128, 127]，然后用view转为uint8存储
+        clipped_values = np.clip(codebook_float[:, i].round(), -128, 127).astype(np.int8)
+        codebook[:, i] = clipped_values.view(np.uint8)
+    
+    return codebook
 
 def main():
     pa = argparse.ArgumentParser(description="Encode to GBA YUV9 with strip-based inter-frame compression and vector quantization")
