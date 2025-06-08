@@ -18,6 +18,12 @@ WIDTH, HEIGHT = 240, 160
 DEFAULT_STRIP_COUNT = 4
 DEFAULT_UNIFIED_CODEBOOK_SIZE = 256   # 统一码本大小
 EFFECTIVE_UNIFIED_CODEBOOK_SIZE = 255  # 有效码本大小（0xFF保留）
+BIG_BLOCK_CODEBOOK_SIZE = 256  # 大块索引码表大小
+EFFECTIVE_BIG_BLOCK_CODEBOOK_SIZE = 254  # 有效大块索引码表大小（0xFF, 0xFE保留）
+
+# 标记常量
+COLOR_BLOCK_MARKER = 0xFF
+COMPLEX_TEXTURE_MARKER = 0xFE
 
 Y_COEFF  = np.array([0.28571429,  0.57142857,  0.14285714])
 CB_COEFF = np.array([-0.14285714, -0.28571429,  0.42857143])
@@ -546,6 +552,515 @@ def generate_gop_unified_codebooks(frames: list, strip_count: int, i_frame_inter
     
     return gop_codebooks
 
+def generate_big_block_codebook(detail_big_blocks: list, unified_codebook: np.ndarray, 
+                               error_threshold: float = 10.0, 
+                               kmeans_max_iter: int = 100) -> tuple:
+    """生成纹理大块索引码表（使用直方图Top-K方法）"""
+    if not detail_big_blocks:
+        # 空的大块码表
+        big_block_codebook = np.zeros((BIG_BLOCK_CODEBOOK_SIZE, 4), dtype=np.uint8)
+        return big_block_codebook, []
+    
+    # Step 1: 收集所有4-tuple (a,b,c,d) 并统计频次
+    from collections import Counter
+    tuple_counter = Counter()
+    big_block_tuples = []
+    big_block_vectors = []  # 在YUV空间的向量表示
+    
+    for big_block_data in detail_big_blocks:
+        # 量化为统一码本索引
+        indices = quantize_blocks_unified(big_block_data, unified_codebook)
+        tuple_key = tuple(indices)
+        tuple_counter[tuple_key] += 1
+        big_block_tuples.append(indices)
+        
+        # Step 2: 投影到YUV连续空间（用于误差计算）
+        yuv_vector = []
+        for idx in indices:
+            block = unified_codebook[idx]
+            # 将7字节块转换为YUV连续值
+            y_values = block[:4].astype(np.float32) * 2  # 恢复Y值（之前>>1了）
+            d_r = block[4].view(np.int8).astype(np.float32)
+            d_g = block[5].view(np.int8).astype(np.float32)  
+            d_b = block[6].view(np.int8).astype(np.float32)
+            
+            # 重建Cb, Cr
+            cb = d_b
+            cr = d_r
+            # d_g = (-(cb>>1) - cr) >> 1，反推：
+            # cb_half = cb >> 1 = cb // 2
+            # cr_plus_cb_half = cr + cb_half
+            # d_g = -cr_plus_cb_half >> 1
+            # 所以：cr_plus_cb_half = -d_g << 1 = -d_g * 2
+            # 但这样反推可能有精度损失，我们直接用d_r, d_g, d_b作为色度分量
+            
+            # 构建12维向量：4个Y值 + 4个Cb值 + 4个Cr值
+            # 为简化，我们对每个2x2块用相同的Cb,Cr
+            block_vector = np.concatenate([
+                y_values,  # 4个Y值
+                np.full(4, cb, dtype=np.float32),  # 4个Cb值
+                np.full(4, cr, dtype=np.float32)   # 4个Cr值
+            ])
+            yuv_vector.extend(block_vector)
+        
+        big_block_vectors.append(np.array(yuv_vector))
+    
+    # Step 3: 选择Top-K个最频繁的4-tuple作为码字
+    most_common = tuple_counter.most_common(EFFECTIVE_BIG_BLOCK_CODEBOOK_SIZE)
+    
+    # 构建大块码表
+    big_block_codebook = np.zeros((BIG_BLOCK_CODEBOOK_SIZE, 4), dtype=np.uint8)
+    tuple_to_index = {}
+    
+    for i, (tuple_key, count) in enumerate(most_common):
+        big_block_codebook[i] = np.array(tuple_key)
+        tuple_to_index[tuple_key] = i
+    
+    # 填充剩余位置（虽然不会用到）
+    if len(most_common) > 0:
+        last_tuple = most_common[-1][0]
+        for i in range(len(most_common), EFFECTIVE_BIG_BLOCK_CODEBOOK_SIZE):
+            big_block_codebook[i] = np.array(last_tuple)
+    
+    # Step 4: 为每个大块计算是否使用大块索引
+    big_block_usage = []
+    
+    for i, (indices, big_vector) in enumerate(zip(big_block_tuples, big_block_vectors)):
+        tuple_key = tuple(indices)
+        
+        if tuple_key in tuple_to_index:
+            # 命中码表，计算YUV空间误差
+            big_idx = tuple_to_index[tuple_key]
+            
+            # 重建码表对应的YUV向量
+            reconstructed_vector = []
+            for idx in big_block_codebook[big_idx]:
+                block = unified_codebook[idx]
+                y_values = block[:4].astype(np.float32) * 2
+                d_r = block[4].view(np.int8).astype(np.float32)
+                d_g = block[5].view(np.int8).astype(np.float32)
+                d_b = block[6].view(np.int8).astype(np.float32)
+                
+                cb = d_b
+                cr = d_r
+                
+                block_vector = np.concatenate([
+                    y_values,
+                    np.full(4, cb, dtype=np.float32),
+                    np.full(4, cr, dtype=np.float32)
+                ])
+                reconstructed_vector.extend(block_vector)
+            
+            reconstructed_vector = np.array(reconstructed_vector)
+            
+            # 计算L2误差
+            error = np.sum((big_vector - reconstructed_vector)**2)
+            use_big_block = error <= error_threshold
+            big_block_usage.append((use_big_block, big_idx, indices))
+        else:
+            # 未命中码表，使用原始索引
+            big_block_usage.append((False, 0, indices))
+    
+    print(f"    大块码表统计: 收集{len(big_block_tuples)}个大块, 唯一{len(tuple_counter)}个, Top-{len(most_common)}个")
+    
+    return big_block_codebook, big_block_usage
+
+def classify_4x4_blocks_with_big_block(blocks: np.ndarray, variance_threshold: float = 5.0) -> tuple:
+    """将4x4块分类，并收集纹理大块用于生成大块索引表"""
+    blocks_h, blocks_w = blocks.shape[:2]
+    big_blocks_h = blocks_h // 2
+    big_blocks_w = blocks_w // 2
+    
+    all_blocks = []  # 所有2x2块
+    block_types = {}   # 记录每个4x4块的类型
+    detail_big_blocks = []  # 纹理大块数据
+    
+    for big_by in range(big_blocks_h):
+        for big_bx in range(big_blocks_w):
+            # 收集4x4大块内的4个2x2小块
+            blocks_4x4 = []
+            for sub_by in range(2):
+                for sub_bx in range(2):
+                    by = big_by * 2 + sub_by
+                    bx = big_bx * 2 + sub_bx
+                    if by < blocks_h and bx < blocks_w:
+                        blocks_4x4.append(blocks[by, bx])
+                    else:
+                        blocks_4x4.append(np.zeros(BYTES_PER_BLOCK, dtype=np.uint8))
+            
+            # 计算方差判断是否为纯色块
+            variance = calculate_block_variance(blocks_4x4)
+            
+            if variance < variance_threshold:
+                # 纯色块
+                avg_block = np.mean(blocks_4x4, axis=0).round().astype(np.uint8)
+                for i in range(4, 7):
+                    avg_val = np.mean([b[i].view(np.int8) for b in blocks_4x4])
+                    avg_block[i] = np.clip(avg_val, -128, 127).astype(np.int8).view(np.uint8)
+                
+                block_idx = len(all_blocks)
+                all_blocks.append(avg_block)
+                block_types[(big_by, big_bx)] = ('color', [block_idx])
+            else:
+                # 纹理块：收集大块数据
+                block_indices = []
+                for block in blocks_4x4:
+                    block_idx = len(all_blocks)
+                    all_blocks.append(block)
+                    block_indices.append(block_idx)
+                block_types[(big_by, big_bx)] = ('detail', block_indices)
+                detail_big_blocks.append(np.array(blocks_4x4))
+    
+    return all_blocks, block_types, detail_big_blocks
+
+def encode_strip_i_frame_unified_with_big_block(blocks: np.ndarray, unified_codebook: np.ndarray, 
+                                               big_block_codebook: np.ndarray, block_types: dict,
+                                               big_block_usage: list) -> bytes:
+    """编码条带I帧（统一码本 + 大块索引）"""
+    data = bytearray()
+    data.append(FRAME_TYPE_I)
+    
+    if blocks.size > 0:
+        blocks_h, blocks_w = blocks.shape[:2]
+        big_blocks_h = blocks_h // 2
+        big_blocks_w = blocks_w // 2
+        
+        # 存储统一码本
+        data.extend(unified_codebook.flatten().tobytes())
+        
+        # 存储大块索引码表
+        data.extend(big_block_codebook.flatten().tobytes())
+        
+        # 按4x4大块的顺序编码
+        big_block_usage_idx = 0
+        for big_by in range(big_blocks_h):
+            for big_bx in range(big_blocks_w):
+                if (big_by, big_bx) in block_types:
+                    block_type, block_indices = block_types[(big_by, big_bx)]
+                    
+                    if block_type == 'color':
+                        # 色块：标记0xFF + 1个码本索引
+                        data.append(COLOR_BLOCK_MARKER)
+                        
+                        # 从原始blocks重建平均块
+                        blocks_4x4 = []
+                        for sub_by in range(2):
+                            for sub_bx in range(2):
+                                by = big_by * 2 + sub_by
+                                bx = big_bx * 2 + sub_bx
+                                if by < blocks_h and bx < blocks_w:
+                                    blocks_4x4.append(blocks[by, bx])
+                        
+                        avg_block = np.mean(blocks_4x4, axis=0).round().astype(np.uint8)
+                        for i in range(4, 7):
+                            avg_val = np.mean([b[i].view(np.int8) for b in blocks_4x4])
+                            avg_block[i] = np.clip(avg_val, -128, 127).astype(np.int8).view(np.uint8)
+                        
+                        unified_idx = quantize_blocks_unified(avg_block.reshape(1, -1), unified_codebook)[0]
+                        data.append(unified_idx)
+                    else:
+                        # 纹理块：使用大块索引优化
+                        if big_block_usage_idx < len(big_block_usage):
+                            use_big_block, best_big_idx, original_indices = big_block_usage[big_block_usage_idx]
+                            big_block_usage_idx += 1
+                            
+                            if use_big_block:
+                                # 使用大块索引（1字节）
+                                data.append(best_big_idx)
+                            else:
+                                # 使用复杂纹理标记 + 4个索引（5字节）
+                                data.append(COMPLEX_TEXTURE_MARKER)
+                                for idx in original_indices:
+                                    data.append(idx)
+                        else:
+                            # 兜底：直接量化
+                            for sub_by in range(2):
+                                for sub_bx in range(2):
+                                    by = big_by * 2 + sub_by
+                                    bx = big_bx * 2 + sub_bx
+                                    if by < blocks_h and bx < blocks_w:
+                                        block = blocks[by, bx]
+                                        unified_idx = quantize_blocks_unified(block.reshape(1, -1), unified_codebook)[0]
+                                        data.append(unified_idx)
+                                    else:
+                                        data.append(0)
+    
+    return bytes(data)
+
+def encode_strip_differential_unified_with_big_block(current_blocks: np.ndarray, prev_blocks: np.ndarray,
+                                                   unified_codebook: np.ndarray, big_block_codebook: np.ndarray,
+                                                   block_types: dict, big_block_usage: list,
+                                                   diff_threshold: float, force_i_threshold: float = 0.7) -> tuple:
+    """差分编码当前条带（统一码本 + 大块索引）"""
+    if prev_blocks is None or current_blocks.shape != prev_blocks.shape:
+        i_frame_data = encode_strip_i_frame_unified_with_big_block(
+            current_blocks, unified_codebook, big_block_codebook, block_types, big_block_usage)
+        return i_frame_data, True, 0, 0, 0
+    
+    blocks_h, blocks_w = current_blocks.shape[:2]
+    total_blocks = blocks_h * blocks_w
+    
+    if total_blocks == 0:
+        return b'', True, 0, 0, 0
+    
+    # 计算块差异
+    current_flat = current_blocks.reshape(-1, BYTES_PER_BLOCK)
+    prev_flat = prev_blocks.reshape(-1, BYTES_PER_BLOCK)
+    
+    y_current = current_flat[:, :4].astype(np.int16)
+    y_prev = prev_flat[:, :4].astype(np.int16)
+    y_diff = np.abs(y_current - y_prev)
+    block_diffs_flat = y_diff.mean(axis=1)
+    block_diffs = block_diffs_flat.reshape(blocks_h, blocks_w)
+    
+    big_blocks_h = blocks_h // 2
+    big_blocks_w = blocks_w // 2
+    
+    # 计算区域数量
+    zones_count = (big_blocks_h + ZONE_HEIGHT_BIG_BLOCKS - 1) // ZONE_HEIGHT_BIG_BLOCKS
+    if zones_count > 8:
+        zones_count = 8
+    
+    # 按区域组织更新
+    zone_detail_updates = [[] for _ in range(zones_count)]
+    zone_color_updates = [[] for _ in range(zones_count)]
+    total_updated_blocks = 0
+    
+    # 重建大块使用信息的映射
+    big_block_usage_map = {}
+    big_block_usage_idx = 0
+    for big_by in range(big_blocks_h):
+        for big_bx in range(big_blocks_w):
+            if (big_by, big_bx) in block_types:
+                block_type, _ = block_types[(big_by, big_bx)]
+                if block_type == 'detail':
+                    if big_block_usage_idx < len(big_block_usage):
+                        big_block_usage_map[(big_by, big_bx)] = big_block_usage[big_block_usage_idx]
+                        big_block_usage_idx += 1
+    
+    for big_by in range(big_blocks_h):
+        for big_bx in range(big_blocks_w):
+            needs_update = False
+            positions = [
+                (big_by * 2, big_bx * 2),
+                (big_by * 2, big_bx * 2 + 1),
+                (big_by * 2 + 1, big_bx * 2),
+                (big_by * 2 + 1, big_bx * 2 + 1)
+            ]
+            
+            for by, bx in positions:
+                if by < blocks_h and bx < blocks_w:
+                    if block_diffs[by, bx] > diff_threshold:
+                        needs_update = True
+                        break
+            
+            if needs_update:
+                zone_idx = min(big_by // ZONE_HEIGHT_BIG_BLOCKS, zones_count - 1)
+                zone_relative_by = big_by % ZONE_HEIGHT_BIG_BLOCKS
+                zone_relative_idx = zone_relative_by * big_blocks_w + big_bx
+                
+                total_updated_blocks += 4
+                
+                if (big_by, big_bx) in block_types:
+                    block_type, _ = block_types[(big_by, big_bx)]
+                    
+                    if block_type == 'color':
+                        # 色块更新
+                        blocks_4x4 = []
+                        for by, bx in positions:
+                            if by < blocks_h and bx < blocks_w:
+                                blocks_4x4.append(current_blocks[by, bx])
+                        
+                        avg_block = np.mean(blocks_4x4, axis=0).round().astype(np.uint8)
+                        for i in range(4, 7):
+                            avg_val = np.mean([b[i].view(np.int8) for b in blocks_4x4])
+                            avg_block[i] = np.clip(avg_val, -128, 127).astype(np.int8).view(np.uint8)
+                        
+                        unified_idx = quantize_blocks_unified(avg_block.reshape(1, -1), unified_codebook)[0]
+                        zone_color_updates[zone_idx].append((zone_relative_idx, unified_idx))
+                    else:
+                        # 纹理块更新：使用大块索引优化
+                        if (big_by, big_bx) in big_block_usage_map:
+                            use_big_block, best_big_idx, original_indices = big_block_usage_map[(big_by, big_bx)]
+                            
+                            if use_big_block:
+                                # 使用大块索引
+                                zone_detail_updates[zone_idx].append((zone_relative_idx, 'big_block', best_big_idx))
+                            else:
+                                # 使用传统模式
+                                zone_detail_updates[zone_idx].append((zone_relative_idx, 'complex', original_indices))
+                        else:
+                            # 兜底：直接量化
+                            indices = []
+                            for by, bx in positions:
+                                if by < blocks_h and bx < blocks_w:
+                                    block = current_blocks[by, bx]
+                                    unified_idx = quantize_blocks_unified(block.reshape(1, -1), unified_codebook)[0]
+                                    indices.append(unified_idx)
+                                else:
+                                    indices.append(0)
+                            zone_detail_updates[zone_idx].append((zone_relative_idx, 'complex', indices))
+    
+    # 判断是否需要I帧
+    update_ratio = total_updated_blocks / total_blocks
+    if update_ratio > force_i_threshold:
+        i_frame_data = encode_strip_i_frame_unified_with_big_block(
+            current_blocks, unified_codebook, big_block_codebook, block_types, big_block_usage)
+        return i_frame_data, True, 0, 0, 0
+    
+    # 编码P帧
+    data = bytearray()
+    data.append(FRAME_TYPE_P)
+    
+    # 统计使用的区域数量
+    used_zones = 0
+    total_color_updates = 0
+    total_detail_updates = 0
+    
+    # 生成区域bitmap
+    zone_bitmap = 0
+    for zone_idx in range(zones_count):
+        if zone_detail_updates[zone_idx] or zone_color_updates[zone_idx]:
+            zone_bitmap |= (1 << zone_idx)
+            used_zones += 1
+            total_color_updates += len(zone_color_updates[zone_idx])
+            total_detail_updates += len(zone_detail_updates[zone_idx])
+    
+    data.append(zone_bitmap)
+    
+    # 按区域编码更新
+    for zone_idx in range(zones_count):
+        if zone_bitmap & (1 << zone_idx):
+            detail_updates = zone_detail_updates[zone_idx]
+            color_updates = zone_color_updates[zone_idx]
+            
+            data.append(len(detail_updates))
+            data.append(len(color_updates))
+            
+            # 存储纹理块更新
+            for relative_idx, update_type, *indices in detail_updates:
+                data.append(relative_idx)
+                if update_type == 'big_block':
+                    # 大块索引模式（1字节）
+                    data.append(indices[0])
+                else:  # update_type == 'complex'
+                    # 复杂纹理模式（5字节）
+                    data.append(COMPLEX_TEXTURE_MARKER)
+                    for idx in indices[0]:
+                        data.append(idx)
+            
+            # 存储色块更新
+            for relative_idx, unified_idx in color_updates:
+                data.append(relative_idx)
+                data.append(COLOR_BLOCK_MARKER)
+                data.append(unified_idx)
+    
+    return bytes(data), False, used_zones, total_color_updates, total_detail_updates
+
+def generate_gop_unified_codebooks_with_big_block(frames: list, strip_count: int, i_frame_interval: int,
+                                                 variance_threshold: float, 
+                                                 codebook_size: int = DEFAULT_UNIFIED_CODEBOOK_SIZE,
+                                                 error_threshold: float = 10.0,
+                                                 kmeans_max_iter: int = 100) -> dict:
+    """为每个GOP生成统一码本和大块索引码表"""
+    print("正在为每个GOP生成统一码本和大块索引码表...")
+    
+    gop_codebooks = {}
+    
+    i_frame_positions = []
+    for frame_idx in range(len(frames)):
+        if frame_idx % i_frame_interval == 0:
+            i_frame_positions.append(frame_idx)
+    
+    for gop_idx, gop_start in enumerate(i_frame_positions):
+        if gop_idx + 1 < len(i_frame_positions):
+            gop_end = i_frame_positions[gop_idx + 1]
+        else:
+            gop_end = len(frames)
+        
+        print(f"  处理GOP {gop_idx}: 帧 {gop_start} 到 {gop_end-1}")
+        
+        gop_codebooks[gop_start] = []
+        
+        for strip_idx in range(strip_count):
+            all_blocks = []
+            block_types_list = []
+            all_detail_big_blocks = []
+            
+            for frame_idx in range(gop_start, gop_end):
+                strip_blocks = frames[frame_idx][strip_idx]
+                if strip_blocks.size > 0:
+                    frame_blocks, block_types, detail_big_blocks = classify_4x4_blocks_with_big_block(
+                        strip_blocks, variance_threshold)
+                    all_blocks.extend(frame_blocks)
+                    all_detail_big_blocks.extend(detail_big_blocks)
+                    block_types_list.append((frame_idx, block_types))
+            
+            # 生成统一码本
+            unified_codebook = generate_unified_codebook(all_blocks, codebook_size, kmeans_max_iter)
+            
+            # 生成大块索引码表
+            big_block_codebook, big_block_usage_all = generate_big_block_codebook(
+                all_detail_big_blocks, unified_codebook, error_threshold, kmeans_max_iter)
+            
+            # 为每一帧分配大块使用信息
+            frame_big_block_usage = {}
+            usage_idx = 0
+            
+            for frame_idx, block_types in block_types_list:
+                frame_usage = []
+                # 按4x4大块的顺序收集usage信息
+                big_blocks_h = None
+                big_blocks_w = None
+                
+                # 确定大块网格尺寸
+                if block_types:
+                    max_big_by = max(pos[0] for pos in block_types.keys()) + 1
+                    max_big_bx = max(pos[1] for pos in block_types.keys()) + 1
+                    big_blocks_h = max_big_by
+                    big_blocks_w = max_big_bx
+                
+                if big_blocks_h and big_blocks_w:
+                    for big_by in range(big_blocks_h):
+                        for big_bx in range(big_blocks_w):
+                            if (big_by, big_bx) in block_types:
+                                block_type, _ = block_types[(big_by, big_bx)]
+                                if block_type == 'detail':
+                                    if usage_idx < len(big_block_usage_all):
+                                        frame_usage.append(big_block_usage_all[usage_idx])
+                                        usage_idx += 1
+                
+                frame_big_block_usage[frame_idx] = frame_usage
+            
+            gop_codebooks[gop_start].append({
+                'unified_codebook': unified_codebook,
+                'big_block_codebook': big_block_codebook,
+                'block_types_list': block_types_list,
+                'big_block_usage': frame_big_block_usage,
+                'total_blocks_count': len(all_blocks),
+                'detail_big_blocks_count': len(all_detail_big_blocks)
+            })
+            
+            # 统计色块和纹理块数量
+            color_count = 0
+            detail_count = 0
+            for _, block_types in block_types_list:
+                for (big_by, big_bx), (block_type, _) in block_types.items():
+                    if block_type == 'color':
+                        color_count += 1
+                    else:
+                        detail_count += 1
+            
+            # 统计大块索引使用率
+            big_block_usage_count = sum(1 for usage in big_block_usage_all if usage[0])
+            total_detail_blocks = len(big_block_usage_all)
+            usage_rate = big_block_usage_count / total_detail_blocks * 100 if total_detail_blocks > 0 else 0
+            
+            print(f"    条带{strip_idx}: 总块数{len(all_blocks)}, 色块{color_count}, 纹理块{detail_count}")
+            print(f"      大块索引使用率: {usage_rate:.1f}% ({big_block_usage_count}/{total_detail_blocks})")
+    
+    return gop_codebooks
+
 class EncodingStats:
     """编码统计类"""
     def __init__(self):
@@ -727,6 +1242,9 @@ def main():
                    help=f"统一码本大小（默认{DEFAULT_UNIFIED_CODEBOOK_SIZE}）")
     pa.add_argument("--kmeans-max-iter", type=int, default=200)
     pa.add_argument("--threads", type=int, default=None)
+    # 添加大块索引相关参数
+    pa.add_argument("--big-block-error-threshold", type=float, default=10.0,
+                   help="大块索引误差阈值（默认10.0）")
     args = pa.parse_args()
 
     cap = cv2.VideoCapture(args.input)
@@ -784,10 +1302,11 @@ def main():
 
     print(f"总共提取了 {len(frames)} 帧")
 
-    # 生成统一码本
-    gop_codebooks = generate_gop_unified_codebooks(
+    # 生成统一码本和大块索引码表
+    gop_codebooks = generate_gop_unified_codebooks_with_big_block(
         frames, args.strip_count, args.i_frame_interval, 
-        args.variance_threshold, args.codebook_size, args.kmeans_max_iter
+        args.variance_threshold, args.codebook_size, 
+        args.big_block_error_threshold, args.kmeans_max_iter
     )
 
     # 编码所有帧
@@ -809,24 +1328,27 @@ def main():
         for strip_idx, current_strip in enumerate(current_strips):
             strip_gop_data = gop_data[strip_idx]
             unified_codebook = strip_gop_data['unified_codebook']
+            big_block_codebook = strip_gop_data['big_block_codebook']
             
-            # 找到当前帧的block_types
+            # 找到当前帧的block_types和big_block_usage
             block_types = None
+            big_block_usage = []
             for fid, bt in strip_gop_data['block_types_list']:
                 if fid == frame_idx:
                     block_types = bt
+                    big_block_usage = strip_gop_data['big_block_usage'].get(frame_idx, [])
                     break
             
             force_i_frame = (frame_idx % args.i_frame_interval == 0) or frame_idx == 0
             
             if force_i_frame or prev_strips[strip_idx] is None:
-                strip_data = encode_strip_i_frame_unified(
-                    current_strip, unified_codebook, block_types
+                strip_data = encode_strip_i_frame_unified_with_big_block(
+                    current_strip, unified_codebook, big_block_codebook, block_types, big_block_usage
                 )
                 is_i_frame = True
                 
-                # 计算码本和索引大小
-                codebook_size = args.codebook_size * BYTES_PER_BLOCK
+                # 计算码本和索引大小（包括大块索引表）
+                codebook_size = args.codebook_size * BYTES_PER_BLOCK + BIG_BLOCK_CODEBOOK_SIZE * 4
                 index_size = len(strip_data) - 1 - codebook_size
                 
                 encoding_stats.add_i_frame(
@@ -836,14 +1358,14 @@ def main():
                     index_size=max(0, index_size)
                 )
             else:
-                strip_data, is_i_frame, used_zones, color_updates, detail_updates = encode_strip_differential_unified(
+                strip_data, is_i_frame, used_zones, color_updates, detail_updates = encode_strip_differential_unified_with_big_block(
                     current_strip, prev_strips[strip_idx],
-                    unified_codebook, block_types,
+                    unified_codebook, big_block_codebook, block_types, big_block_usage,
                     args.diff_threshold, args.force_i_threshold
                 )
                 
                 if is_i_frame:
-                    codebook_size = args.codebook_size * BYTES_PER_BLOCK
+                    codebook_size = args.codebook_size * BYTES_PER_BLOCK + BIG_BLOCK_CODEBOOK_SIZE * 4
                     index_size = len(strip_data) - 1 - codebook_size
                     
                     encoding_stats.add_i_frame(
@@ -896,6 +1418,8 @@ def write_header(path_h: pathlib.Path, frame_cnt: int, total_bytes: int, strip_c
             #define VIDEO_STRIP_COUNT   {strip_count}
             #define UNIFIED_CODEBOOK_SIZE {codebook_size}
             #define EFFECTIVE_UNIFIED_CODEBOOK_SIZE {EFFECTIVE_UNIFIED_CODEBOOK_SIZE}
+            #define BIG_BLOCK_CODEBOOK_SIZE {BIG_BLOCK_CODEBOOK_SIZE}
+            #define EFFECTIVE_BIG_BLOCK_CODEBOOK_SIZE {EFFECTIVE_BIG_BLOCK_CODEBOOK_SIZE}
             
             // 帧类型定义
             #define FRAME_TYPE_I        0x00
@@ -903,6 +1427,7 @@ def write_header(path_h: pathlib.Path, frame_cnt: int, total_bytes: int, strip_c
             
             // 特殊标记
             #define COLOR_BLOCK_MARKER  0xFF
+            #define COMPLEX_TEXTURE_MARKER 0xFE
             
             // 块参数
             #define BLOCK_WIDTH         2
