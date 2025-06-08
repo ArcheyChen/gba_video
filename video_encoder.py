@@ -11,6 +11,8 @@ import struct
 import concurrent.futures
 from sklearn.cluster import MiniBatchKMeans
 from scipy.spatial.distance import cdist
+from collections import defaultdict
+import statistics
 
 WIDTH, HEIGHT = 240, 160
 DEFAULT_STRIP_COUNT = 4
@@ -183,16 +185,27 @@ def encode_strip_i_frame_dual_vq(blocks: np.ndarray, color_codebook: np.ndarray,
         big_blocks_h = blocks_h // 2
         big_blocks_w = blocks_w // 2
         
+        # 记录码本大小
+        codebook_start = len(data)
+        
         # 存储两个码本
         # 先存储细节码本（256项，包括占位）
         data.extend(detail_codebook.flatten().tobytes())
         # 再存储色块码本（可配置项数）
         data.extend(color_codebook.flatten().tobytes())
         
+        codebook_bytes = len(data) - codebook_start
+        index_start = len(data)
+        
+        # 统计色块和纹理块数量
+        color_block_count = 0
+        detail_block_count = 0
+        
         # 按4x4大块的顺序编码
         for big_by in range(big_blocks_h):
             for big_bx in range(big_blocks_w):
                 if (big_by, big_bx) in block_types and block_types[(big_by, big_bx)] == 'color':
+                    color_block_count += 1
                     # 色块：标记0xFF + 1个色块码本索引
                     data.append(0xFF)
                     
@@ -214,6 +227,7 @@ def encode_strip_i_frame_dual_vq(blocks: np.ndarray, color_codebook: np.ndarray,
                     color_idx = quantize_blocks(avg_block.reshape(1, -1), color_codebook)[0]
                     data.append(color_idx)
                 else:
+                    detail_block_count += 1
                     # 纹理块：4个细节码本索引
                     for sub_by in range(2):
                         for sub_bx in range(2):
@@ -225,6 +239,14 @@ def encode_strip_i_frame_dual_vq(blocks: np.ndarray, color_codebook: np.ndarray,
                                 data.append(detail_idx)
                             else:
                                 data.append(0)
+        
+        index_bytes = len(data) - index_start
+        
+        # 更新统计
+        encoding_stats.add_block_stats(
+            color_block_count * 2,  # 色块：标记 + 索引
+            detail_block_count * 4  # 纹理块：4个索引
+        )
     
     return bytes(data)
 
@@ -234,13 +256,14 @@ def encode_strip_differential_dual_vq(current_blocks: np.ndarray, prev_blocks: n
                                      force_i_threshold: float = 0.7) -> tuple:
     """差分编码当前条带（双码本）- 使用区域优化"""
     if prev_blocks is None or current_blocks.shape != prev_blocks.shape:
-        return encode_strip_i_frame_dual_vq(current_blocks, color_codebook, detail_codebook, block_types), True
+        i_frame_data = encode_strip_i_frame_dual_vq(current_blocks, color_codebook, detail_codebook, block_types)
+        return i_frame_data, True, 0, 0, 0  # 返回5个值，后3个为统计用的0值
     
     blocks_h, blocks_w = current_blocks.shape[:2]
     total_blocks = blocks_h * blocks_w
     
     if total_blocks == 0:
-        return b'', True
+        return b'', True, 0, 0, 0
     
     # 计算块差异
     current_flat = current_blocks.reshape(-1, BYTES_PER_BLOCK)
@@ -319,17 +342,26 @@ def encode_strip_differential_dual_vq(current_blocks: np.ndarray, prev_blocks: n
     # 判断是否需要I帧
     update_ratio = total_updated_blocks / total_blocks
     if update_ratio > force_i_threshold:
-        return encode_strip_i_frame_dual_vq(current_blocks, color_codebook, detail_codebook, block_types), True
+        i_frame_data = encode_strip_i_frame_dual_vq(current_blocks, color_codebook, detail_codebook, block_types)
+        return i_frame_data, True, 0, 0, 0  # 返回5个值，后3个为统计用的0值
     
     # 编码P帧
     data = bytearray()
     data.append(FRAME_TYPE_P)
+    
+    # 统计使用的区域数量
+    used_zones = 0
+    total_color_updates = 0
+    total_detail_updates = 0
     
     # 生成区域bitmap
     zone_bitmap = 0
     for zone_idx in range(zones_count):
         if zone_detail_updates[zone_idx] or zone_color_updates[zone_idx]:
             zone_bitmap |= (1 << zone_idx)
+            used_zones += 1
+            total_color_updates += len(zone_color_updates[zone_idx])
+            total_detail_updates += len(zone_detail_updates[zone_idx])
     
     data.append(zone_bitmap)
     
@@ -355,7 +387,7 @@ def encode_strip_differential_dual_vq(current_blocks: np.ndarray, prev_blocks: n
                 data.append(relative_idx)  # 使用u8而不是u16
                 data.append(color_idx)
     
-    return bytes(data), False
+    return bytes(data), False, used_zones, total_color_updates, total_detail_updates
 
 def generate_codebook(blocks_data: np.ndarray, codebook_size: int, max_iter: int = 100) -> tuple:
     """使用K-Means聚类生成码表"""
@@ -489,62 +521,132 @@ def generate_gop_dual_codebooks(frames: list, strip_count: int, i_frame_interval
     
     return gop_codebooks
 
-def write_header(path_h: pathlib.Path, frame_cnt: int, total_bytes: int, strip_count: int, 
-                strip_heights: list, color_codebook_size: int):
-    guard = "VIDEO_DATA_H"
-    strip_heights_str = ', '.join(map(str, strip_heights))
+class EncodingStats:
+    """编码统计类"""
+    def __init__(self):
+        # 帧统计
+        self.total_i_frames = 0
+        self.forced_i_frames = 0  # 强制I帧（GOP开始）
+        self.threshold_i_frames = 0  # 超阈值I帧
+        self.total_p_frames = 0
+        
+        # 大小统计
+        self.total_i_frame_bytes = 0
+        self.total_p_frame_bytes = 0
+        self.total_codebook_bytes = 0
+        self.total_index_bytes = 0
+        
+        # P帧块更新统计
+        self.p_frame_updates = []  # 每个P帧的更新块数
+        self.zone_usage = defaultdict(int)  # 区域使用次数
+        
+        # 细节统计
+        self.color_block_bytes = 0
+        self.detail_block_bytes = 0
+        self.color_update_count = 0
+        self.detail_update_count = 0
+        
+        # 条带统计
+        self.strip_stats = defaultdict(lambda: {
+            'i_frames': 0, 'p_frames': 0, 
+            'i_bytes': 0, 'p_bytes': 0
+        })
     
-    with path_h.open("w", encoding="utf-8") as f:
-        f.write(textwrap.dedent(f"""\
-            #ifndef {guard}
-            #define {guard}
-
-            #define VIDEO_FRAME_COUNT   {frame_cnt}
-            #define VIDEO_WIDTH         {WIDTH}
-            #define VIDEO_HEIGHT        {HEIGHT}
-            #define VIDEO_TOTAL_BYTES   {total_bytes}
-            #define VIDEO_STRIP_COUNT   {strip_count}
-            #define DETAIL_CODEBOOK_SIZE {DETAIL_CODEBOOK_SIZE}
-            #define COLOR_CODEBOOK_SIZE  {color_codebook_size}
-            
-            // 帧类型定义
-            #define FRAME_TYPE_I        0x00
-            #define FRAME_TYPE_P        0x01
-            
-            // 块参数
-            #define BLOCK_WIDTH         2
-            #define BLOCK_HEIGHT        2
-            #define BYTES_PER_BLOCK     7
-
-            // 条带高度数组
-            extern const unsigned char strip_heights[VIDEO_STRIP_COUNT];
-            
-            extern const unsigned char video_data[VIDEO_TOTAL_BYTES];
-            extern const unsigned int frame_offsets[VIDEO_FRAME_COUNT];
-
-            #endif // {guard}
-            """))
-
-def write_source(path_c: pathlib.Path, data: bytes, frame_offsets: list, strip_heights: list):
-    with path_c.open("w", encoding="utf-8") as f:
-        f.write('#include "video_data.h"\n\n')
+    def add_i_frame(self, strip_idx, size_bytes, is_forced=True, codebook_size=0, index_size=0):
+        self.total_i_frames += 1
+        if is_forced:
+            self.forced_i_frames += 1
+        else:
+            self.threshold_i_frames += 1
         
-        f.write("const unsigned char strip_heights[] = {\n")
-        f.write("    " + ', '.join(map(str, strip_heights)) + "\n")
-        f.write("};\n\n")
+        self.total_i_frame_bytes += size_bytes
+        self.total_codebook_bytes += codebook_size
+        self.total_index_bytes += index_size
         
-        f.write("const unsigned int frame_offsets[] = {\n")
-        for i in range(0, len(frame_offsets), 8):
-            chunk = ', '.join(f"{offset}" for offset in frame_offsets[i:i+8])
-            f.write("    " + chunk + ",\n")
-        f.write("};\n\n")
+        self.strip_stats[strip_idx]['i_frames'] += 1
+        self.strip_stats[strip_idx]['i_bytes'] += size_bytes
+    
+    def add_p_frame(self, strip_idx, size_bytes, updates_count, zone_count, 
+                   color_updates=0, detail_updates=0):
+        self.total_p_frames += 1
+        self.total_p_frame_bytes += size_bytes
+        self.p_frame_updates.append(updates_count)
+        self.zone_usage[zone_count] += 1
         
-        f.write("const unsigned char video_data[] = {\n")
-        per_line = 16
-        for i in range(0, len(data), per_line):
-            chunk = ', '.join(f"0x{v:02X}" for v in data[i:i+per_line])
-            f.write("    " + chunk + ",\n")
-        f.write("};\n")
+        self.color_update_count += color_updates
+        self.detail_update_count += detail_updates
+        
+        self.strip_stats[strip_idx]['p_frames'] += 1
+        self.strip_stats[strip_idx]['p_bytes'] += size_bytes
+    
+    def add_block_stats(self, color_bytes, detail_bytes):
+        self.color_block_bytes += color_bytes
+        self.detail_block_bytes += detail_bytes
+    
+    def print_summary(self, total_frames, total_bytes):
+        print(f"\n📊 编码统计报告")
+        print(f"=" * 60)
+        
+        # 基本统计
+        print(f"🎬 帧统计:")
+        print(f"   总帧数: {total_frames}")
+        print(f"   I帧: {self.total_i_frames} ({self.total_i_frames/total_frames*100:.1f}%)")
+        print(f"     - 强制I帧: {self.forced_i_frames}")
+        print(f"     - 超阈值I帧: {self.threshold_i_frames}")
+        print(f"   P帧: {self.total_p_frames} ({self.total_p_frames/total_frames*100:.1f}%)")
+        
+        # 大小统计
+        print(f"\n💾 空间占用:")
+        print(f"   总大小: {total_bytes:,} bytes ({total_bytes/1024:.1f} KB)")
+        print(f"   I帧数据: {self.total_i_frame_bytes:,} bytes ({self.total_i_frame_bytes/total_bytes*100:.1f}%)")
+        print(f"   P帧数据: {self.total_p_frame_bytes:,} bytes ({self.total_p_frame_bytes/total_bytes*100:.1f}%)")
+        
+        if self.total_i_frames > 0:
+            print(f"   平均I帧大小: {self.total_i_frame_bytes/self.total_i_frames:.1f} bytes")
+        if self.total_p_frames > 0:
+            print(f"   平均P帧大小: {self.total_p_frame_bytes/self.total_p_frames:.1f} bytes")
+        
+        # 码本vs索引统计
+        print(f"\n🎨 数据构成:")
+        print(f"   码本数据: {self.total_codebook_bytes:,} bytes ({self.total_codebook_bytes/total_bytes*100:.1f}%)")
+        print(f"   索引数据: {self.total_index_bytes:,} bytes ({self.total_index_bytes/total_bytes*100:.1f}%)")
+        print(f"   色块数据: {self.color_block_bytes:,} bytes ({self.color_block_bytes/total_bytes*100:.1f}%)")
+        print(f"   纹理数据: {self.detail_block_bytes:,} bytes ({self.detail_block_bytes/total_bytes*100:.1f}%)")
+        
+        # P帧更新统计
+        if self.p_frame_updates:
+            avg_updates = statistics.mean(self.p_frame_updates)
+            median_updates = statistics.median(self.p_frame_updates)
+            max_updates = max(self.p_frame_updates)
+            min_updates = min(self.p_frame_updates)
+            
+            print(f"\n⚡ P帧更新分析:")
+            print(f"   平均更新块数: {avg_updates:.1f}")
+            print(f"   中位数更新块数: {median_updates}")
+            print(f"   最大更新块数: {max_updates}")
+            print(f"   最小更新块数: {min_updates}")
+            print(f"   色块更新总数: {self.color_update_count:,}")
+            print(f"   纹理块更新总数: {self.detail_update_count:,}")
+        
+        # 区域使用统计
+        if self.zone_usage:
+            print(f"\n🗺️  区域使用分布:")
+            for zone_count in sorted(self.zone_usage.keys()):
+                frames_count = self.zone_usage[zone_count]
+                print(f"   {zone_count}个区域: {frames_count}帧 ({frames_count/self.total_p_frames*100:.1f}%)")
+        
+        # 条带统计
+        print(f"\n📏 条带统计:")
+        for strip_idx in sorted(self.strip_stats.keys()):
+            stats = self.strip_stats[strip_idx]
+            total_strip_frames = stats['i_frames'] + stats['p_frames']
+            total_strip_bytes = stats['i_bytes'] + stats['p_bytes']
+            if total_strip_frames > 0:
+                print(f"   条带{strip_idx}: {total_strip_frames}帧, {total_strip_bytes:,}bytes, "
+                      f"平均{total_strip_bytes/total_strip_frames:.1f}bytes/帧")
+
+# 全局统计对象
+encoding_stats = EncodingStats()
 
 def main():
     pa = argparse.ArgumentParser(description="Encode to GBA YUV9 with dual codebook")
@@ -661,12 +763,41 @@ def main():
                     current_strip, color_codebook, detail_codebook, block_types
                 )
                 is_i_frame = True
+                
+                # 计算码本和索引大小
+                codebook_size = 256 * BYTES_PER_BLOCK + args.color_codebook_size * BYTES_PER_BLOCK
+                index_size = len(strip_data) - 1 - codebook_size  # 减去帧类型标记
+                
+                encoding_stats.add_i_frame(
+                    strip_idx, len(strip_data), 
+                    is_forced=force_i_frame,
+                    codebook_size=codebook_size,
+                    index_size=index_size
+                )
             else:
-                strip_data, is_i_frame = encode_strip_differential_dual_vq(
+                strip_data, is_i_frame, used_zones, color_updates, detail_updates = encode_strip_differential_dual_vq(
                     current_strip, prev_strips[strip_idx],
                     color_codebook, detail_codebook, block_types,
                     args.diff_threshold, args.force_i_threshold
                 )
+                
+                if is_i_frame:  # 返回的是I帧
+                    codebook_size = 256 * BYTES_PER_BLOCK + args.color_codebook_size * BYTES_PER_BLOCK
+                    index_size = len(strip_data) - 1 - codebook_size
+                    
+                    encoding_stats.add_i_frame(
+                        strip_idx, len(strip_data), 
+                        is_forced=False,
+                        codebook_size=codebook_size,
+                        index_size=index_size
+                    )
+                else:  # 返回的是P帧
+                    total_updates = color_updates + detail_updates
+                    
+                    encoding_stats.add_p_frame(
+                        strip_idx, len(strip_data), total_updates, used_zones,
+                        color_updates, detail_updates
+                    )
             
             frame_data.extend(struct.pack('<H', len(strip_data)))
             frame_data.extend(strip_data)
@@ -685,17 +816,65 @@ def main():
                 args.strip_count, strip_heights, args.color_codebook_size)
     write_source(pathlib.Path(args.out).with_suffix(".c"), all_data, frame_offsets, strip_heights)
     
-    # 统计信息
-    total_color_blocks = sum(sum(d['color_blocks_count'] for d in gop_data) for gop_data in gop_codebooks.values())
-    total_detail_blocks = sum(sum(d['detail_blocks_count'] for d in gop_data) for gop_data in gop_codebooks.values())
+    # 打印详细统计
+    encoding_stats.print_summary(len(frames), len(all_data))
+
+def write_header(path_h: pathlib.Path, frame_cnt: int, total_bytes: int, strip_count: int, 
+                strip_heights: list, color_codebook_size: int):
+    guard = "VIDEO_DATA_H"
+    strip_heights_str = ', '.join(map(str, strip_heights))
     
-    print(f"\n✅ 编码完成：")
-    print(f"   总帧数: {len(frames)}")
-    print(f"   条带数: {args.strip_count}")
-    print(f"   GOP数量: {len(gop_codebooks)}")
-    print(f"   总色块数: {total_color_blocks}")
-    print(f"   总纹理块数: {total_detail_blocks}")
-    print(f"   压缩后大小: {len(all_data):,} bytes")
+    with path_h.open("w", encoding="utf-8") as f:
+        f.write(textwrap.dedent(f"""\
+            #ifndef {guard}
+            #define {guard}
+
+            #define VIDEO_FRAME_COUNT   {frame_cnt}
+            #define VIDEO_WIDTH         {WIDTH}
+            #define VIDEO_HEIGHT        {HEIGHT}
+            #define VIDEO_TOTAL_BYTES   {total_bytes}
+            #define VIDEO_STRIP_COUNT   {strip_count}
+            #define DETAIL_CODEBOOK_SIZE {DETAIL_CODEBOOK_SIZE}
+            #define COLOR_CODEBOOK_SIZE  {color_codebook_size}
+            
+            // 帧类型定义
+            #define FRAME_TYPE_I        0x00
+            #define FRAME_TYPE_P        0x01
+            
+            // 块参数
+            #define BLOCK_WIDTH         2
+            #define BLOCK_HEIGHT        2
+            #define BYTES_PER_BLOCK     7
+
+            // 条带高度数组
+            extern const unsigned char strip_heights[VIDEO_STRIP_COUNT];
+            
+            extern const unsigned char video_data[VIDEO_TOTAL_BYTES];
+            extern const unsigned int frame_offsets[VIDEO_FRAME_COUNT];
+
+            #endif // {guard}
+            """))
+
+def write_source(path_c: pathlib.Path, data: bytes, frame_offsets: list, strip_heights: list):
+    with path_c.open("w", encoding="utf-8") as f:
+        f.write('#include "video_data.h"\n\n')
+        
+        f.write("const unsigned char strip_heights[] = {\n")
+        f.write("    " + ', '.join(map(str, strip_heights)) + "\n")
+        f.write("};\n\n")
+        
+        f.write("const unsigned int frame_offsets[] = {\n")
+        for i in range(0, len(frame_offsets), 8):
+            chunk = ', '.join(f"{offset}" for offset in frame_offsets[i:i+8])
+            f.write("    " + chunk + ",\n")
+        f.write("};\n\n")
+        
+        f.write("const unsigned char video_data[] = {\n")
+        per_line = 16
+        for i in range(0, len(data), per_line):
+            chunk = ', '.join(f"0x{v:02X}" for v in data[i:i+per_line])
+            f.write("    " + chunk + ",\n")
+        f.write("};\n")
 
 if __name__ == "__main__":
     main()
