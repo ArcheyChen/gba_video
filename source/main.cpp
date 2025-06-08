@@ -27,9 +27,9 @@ struct YUV_Struct{
 
 // 双码本存储（在IWRAM中）
 // 细节码本：256项（0xFF保留作为标记）
-// 色块码本：256项
+// 色块码本：可配置项数（由COLOR_CODEBOOK_SIZE定义）
 IWRAM_DATA u8 strip_detail_codebooks_raw[VIDEO_STRIP_COUNT][256*sizeof(YUV_Struct)+4]__attribute__((aligned(32)));
-IWRAM_DATA u8 strip_color_codebooks_raw[VIDEO_STRIP_COUNT][256*sizeof(YUV_Struct)+4]__attribute__((aligned(32)));
+IWRAM_DATA u8 strip_color_codebooks_raw[VIDEO_STRIP_COUNT][COLOR_CODEBOOK_SIZE*sizeof(YUV_Struct)+4]__attribute__((aligned(32)));
 IWRAM_DATA YUV_Struct *strip_detail_codebooks[VIDEO_STRIP_COUNT];
 IWRAM_DATA YUV_Struct *strip_color_codebooks[VIDEO_STRIP_COUNT];
 
@@ -215,10 +215,10 @@ IWRAM_CODE void decode_strip_i_frame_dual(int strip_idx, const u8* src, u16* dst
                   &strip_detail_codebooks[strip_idx], 256);
     src += 256 * BYTES_PER_BLOCK;
     
-    // 拷贝色块码本（256项）
+    // 拷贝色块码本（COLOR_CODEBOOK_SIZE项）
     copy_codebook(strip_color_codebooks_raw[strip_idx], src, 
-                  &strip_color_codebooks[strip_idx], 256);
-    src += 256 * BYTES_PER_BLOCK;
+                  &strip_color_codebooks[strip_idx], COLOR_CODEBOOK_SIZE);
+    src += COLOR_CODEBOOK_SIZE * BYTES_PER_BLOCK;
     
     auto &strip = strip_info[strip_idx];
     auto &detail_codebook = strip_detail_codebooks[strip_idx];

@@ -15,7 +15,7 @@ from scipy.spatial.distance import cdist
 WIDTH, HEIGHT = 240, 160
 DEFAULT_STRIP_COUNT = 4
 DETAIL_CODEBOOK_SIZE = 255  # 细节码本大小（0xFF保留）
-COLOR_CODEBOOK_SIZE = 256   # 色块码本大小
+DEFAULT_COLOR_CODEBOOK_SIZE = 256   # 默认色块码本大小
 
 Y_COEFF  = np.array([0.28571429,  0.57142857,  0.14285714])
 CB_COEFF = np.array([-0.14285714, -0.28571429,  0.42857143])
@@ -145,14 +145,15 @@ def classify_4x4_blocks(blocks: np.ndarray, variance_threshold: float = 5.0) -> 
     return color_blocks, detail_blocks, block_types
 
 def generate_dual_codebooks(all_color_blocks: list, all_detail_blocks: list, 
+                          color_codebook_size: int = DEFAULT_COLOR_CODEBOOK_SIZE,
                           kmeans_max_iter: int = 100) -> tuple:
     """生成双码本：色块码本和细节码本"""
     # 生成色块码本
     if all_color_blocks:
         color_blocks_array = np.array(all_color_blocks)
-        color_codebook, _ = generate_codebook(color_blocks_array, COLOR_CODEBOOK_SIZE, kmeans_max_iter)
+        color_codebook, _ = generate_codebook(color_blocks_array, color_codebook_size, kmeans_max_iter)
     else:
-        color_codebook = np.zeros((COLOR_CODEBOOK_SIZE, BYTES_PER_BLOCK), dtype=np.uint8)
+        color_codebook = np.zeros((color_codebook_size, BYTES_PER_BLOCK), dtype=np.uint8)
     
     # 生成细节码本（只用255项，0xFF保留）
     if all_detail_blocks:
@@ -181,7 +182,7 @@ def encode_strip_i_frame_dual_vq(blocks: np.ndarray, color_codebook: np.ndarray,
         # 存储两个码本
         # 先存储细节码本（256项，包括占位）
         data.extend(detail_codebook.flatten().tobytes())
-        # 再存储色块码本（256项）
+        # 再存储色块码本（可配置项数）
         data.extend(color_codebook.flatten().tobytes())
         
         # 按4x4大块的顺序编码
@@ -407,7 +408,8 @@ def convert_codebook_from_clustering(codebook_float: np.ndarray) -> np.ndarray:
     return codebook
 
 def generate_gop_dual_codebooks(frames: list, strip_count: int, i_frame_interval: int,
-                              variance_threshold: float, kmeans_max_iter: int = 100) -> dict:
+                              variance_threshold: float, color_codebook_size: int = DEFAULT_COLOR_CODEBOOK_SIZE,
+                              kmeans_max_iter: int = 100) -> dict:
     """为每个GOP生成双码本"""
     print("正在为每个GOP生成双码本...")
     
@@ -443,7 +445,7 @@ def generate_gop_dual_codebooks(frames: list, strip_count: int, i_frame_interval
             
             # 生成双码本
             color_codebook, detail_codebook = generate_dual_codebooks(
-                all_color_blocks, all_detail_blocks, kmeans_max_iter
+                all_color_blocks, all_detail_blocks, color_codebook_size, kmeans_max_iter
             )
             
             gop_codebooks[gop_start].append({
@@ -458,7 +460,8 @@ def generate_gop_dual_codebooks(frames: list, strip_count: int, i_frame_interval
     
     return gop_codebooks
 
-def write_header(path_h: pathlib.Path, frame_cnt: int, total_bytes: int, strip_count: int, strip_heights: list):
+def write_header(path_h: pathlib.Path, frame_cnt: int, total_bytes: int, strip_count: int, 
+                strip_heights: list, color_codebook_size: int):
     guard = "VIDEO_DATA_H"
     strip_heights_str = ', '.join(map(str, strip_heights))
     
@@ -473,7 +476,7 @@ def write_header(path_h: pathlib.Path, frame_cnt: int, total_bytes: int, strip_c
             #define VIDEO_TOTAL_BYTES   {total_bytes}
             #define VIDEO_STRIP_COUNT   {strip_count}
             #define DETAIL_CODEBOOK_SIZE {DETAIL_CODEBOOK_SIZE}
-            #define COLOR_CODEBOOK_SIZE  {COLOR_CODEBOOK_SIZE}
+            #define COLOR_CODEBOOK_SIZE  {color_codebook_size}
             
             // 帧类型定义
             #define FRAME_TYPE_I        0x00
@@ -527,6 +530,8 @@ def main():
     pa.add_argument("--force-i-threshold", type=float, default=0.7)
     pa.add_argument("--variance-threshold", type=float, default=5.0,
                    help="方差阈值，用于区分纯色块和纹理块（默认5.0）")
+    pa.add_argument("--color-codebook-size", type=int, default=DEFAULT_COLOR_CODEBOOK_SIZE,
+                   help=f"色块码本大小（默认{DEFAULT_COLOR_CODEBOOK_SIZE}）")
     pa.add_argument("--kmeans-max-iter", type=int, default=200)
     pa.add_argument("--threads", type=int, default=None)
     args = pa.parse_args()
@@ -549,6 +554,7 @@ def main():
 
     strip_heights = calculate_strip_heights(HEIGHT, args.strip_count)
     print(f"条带配置: {args.strip_count} 个条带，高度分别为: {strip_heights}")
+    print(f"码本配置: 细节码本{DETAIL_CODEBOOK_SIZE}项，色块码本{args.color_codebook_size}项")
 
     frames = []
     idx = 0
@@ -588,7 +594,7 @@ def main():
     # 生成双码本
     gop_codebooks = generate_gop_dual_codebooks(
         frames, args.strip_count, args.i_frame_interval, 
-        args.variance_threshold, args.kmeans_max_iter
+        args.variance_threshold, args.color_codebook_size, args.kmeans_max_iter
     )
 
     # 编码所有帧
@@ -647,7 +653,7 @@ def main():
     all_data = b''.join(encoded_frames)
     
     write_header(pathlib.Path(args.out).with_suffix(".h"), len(frames), len(all_data), 
-                args.strip_count, strip_heights)
+                args.strip_count, strip_heights, args.color_codebook_size)
     write_source(pathlib.Path(args.out).with_suffix(".c"), all_data, frame_offsets, strip_heights)
     
     # 统计信息
