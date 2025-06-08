@@ -265,25 +265,22 @@ IWRAM_CODE void decode_strip_p_frame_dual(int strip_idx, const u8* src, u16* dst
     
     // 计算该条带的大块布局
     u16 strip_big_blocks_w = VIDEO_WIDTH / (BLOCK_WIDTH * 2);
-    // u16 strip_big_blocks_h = strip_info[strip_idx].height / (BLOCK_HEIGHT * 2);
     
     // 使用bitmap右移优化处理每个有效区域
     u8 zone_idx = 0;
     while (zone_bitmap) {
         if (zone_bitmap & 1) {
-            // 读取纹理块更新数量
-            u16 detail_blocks_to_update = src[0] | (src[1] << 8);
-            src += 2;
+            // 读取纹理块更新数量（改为u8）
+            u8 detail_blocks_to_update = *src++;
             
-            // 读取色块更新数量
-            u16 color_blocks_to_update = src[0] | (src[1] << 8);
-            src += 2;
+            // 读取色块更新数量（改为u8）
+            u8 color_blocks_to_update = *src++;
             
             // 计算区域在条带中的起始大块行
             u16 zone_start_big_by = zone_idx * ZONE_HEIGHT_BIG_BLOCKS;
             
             // 处理纹理块更新
-            for (u16 i = 0; i < detail_blocks_to_update; i++) {
+            for (u8 i = 0; i < detail_blocks_to_update; i++) {
                 u8 zone_relative_idx = *src++;  // 使用u8读取相对坐标
                 
                 u8 quant_indices[4];
@@ -302,7 +299,7 @@ IWRAM_CODE void decode_strip_p_frame_dual(int strip_idx, const u8* src, u16* dst
             }
             
             // 处理色块更新
-            for (u16 i = 0; i < color_blocks_to_update; i++) {
+            for (u8 i = 0; i < color_blocks_to_update; i++) {
                 u8 zone_relative_idx = *src++;  // 使用u8读取相对坐标
                 u8 color_idx = *src++;
                 

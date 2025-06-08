@@ -340,9 +340,9 @@ def encode_strip_differential_dual_vq(current_blocks: np.ndarray, prev_blocks: n
             detail_updates = zone_detail_updates[zone_idx]
             color_updates = zone_color_updates[zone_idx]
             
-            # 存储纹理块更新数量和色块更新数量
-            data.extend(struct.pack('<H', len(detail_updates)))
-            data.extend(struct.pack('<H', len(color_updates)))
+            # 存储纹理块更新数量和色块更新数量（改为u8）
+            data.append(len(detail_updates))  # 直接用u8存储
+            data.append(len(color_updates))   # 直接用u8存储
             
             # 存储纹理块更新
             for relative_idx, indices in detail_updates:
