@@ -525,6 +525,7 @@ class EncodingStats:
     """编码统计类"""
     def __init__(self):
         # 帧统计
+        self.total_frames_processed = 0  # 实际处理的帧数（条带级别）
         self.total_i_frames = 0
         self.forced_i_frames = 0  # 强制I帧（GOP开始）
         self.threshold_i_frames = 0  # 超阈值I帧
@@ -533,8 +534,9 @@ class EncodingStats:
         # 大小统计
         self.total_i_frame_bytes = 0
         self.total_p_frame_bytes = 0
-        self.total_codebook_bytes = 0
-        self.total_index_bytes = 0
+        self.total_codebook_bytes = 0  # 只计算I帧中的码本数据
+        self.total_index_bytes = 0     # 只计算I帧中的索引数据
+        self.total_p_overhead_bytes = 0  # P帧的开销数据（bitmap等）
         
         # P帧块更新统计
         self.p_frame_updates = []  # 每个P帧的更新块数
@@ -553,6 +555,7 @@ class EncodingStats:
         })
     
     def add_i_frame(self, strip_idx, size_bytes, is_forced=True, codebook_size=0, index_size=0):
+        self.total_frames_processed += 1
         self.total_i_frames += 1
         if is_forced:
             self.forced_i_frames += 1
@@ -568,10 +571,15 @@ class EncodingStats:
     
     def add_p_frame(self, strip_idx, size_bytes, updates_count, zone_count, 
                    color_updates=0, detail_updates=0):
+        self.total_frames_processed += 1
         self.total_p_frames += 1
         self.total_p_frame_bytes += size_bytes
         self.p_frame_updates.append(updates_count)
         self.zone_usage[zone_count] += 1
+        
+        # P帧开销：帧类型(1) + bitmap(1) + 每个区域的计数(2*zones)
+        overhead = 2 + zone_count * 2  # 大致估算
+        self.total_p_overhead_bytes += overhead
         
         self.color_update_count += color_updates
         self.detail_update_count += detail_updates
@@ -587,13 +595,18 @@ class EncodingStats:
         print(f"\n📊 编码统计报告")
         print(f"=" * 60)
         
+        # 计算条带级别的统计
+        strip_count = len(self.strip_stats) if self.strip_stats else 1
+        
         # 基本统计
         print(f"🎬 帧统计:")
-        print(f"   总帧数: {total_frames}")
-        print(f"   I帧: {self.total_i_frames} ({self.total_i_frames/total_frames*100:.1f}%)")
+        print(f"   视频帧数: {total_frames}")
+        print(f"   条带总数: {strip_count}")
+        print(f"   处理的条带帧: {self.total_frames_processed}")
+        print(f"   I帧条带: {self.total_i_frames} ({self.total_i_frames/self.total_frames_processed*100:.1f}%)")
         print(f"     - 强制I帧: {self.forced_i_frames}")
         print(f"     - 超阈值I帧: {self.threshold_i_frames}")
-        print(f"   P帧: {self.total_p_frames} ({self.total_p_frames/total_frames*100:.1f}%)")
+        print(f"   P帧条带: {self.total_p_frames} ({self.total_p_frames/self.total_frames_processed*100:.1f}%)")
         
         # 大小统计
         print(f"\n💾 空间占用:")
@@ -606,12 +619,27 @@ class EncodingStats:
         if self.total_p_frames > 0:
             print(f"   平均P帧大小: {self.total_p_frame_bytes/self.total_p_frames:.1f} bytes")
         
-        # 码本vs索引统计
+        # 数据构成统计（修正）
         print(f"\n🎨 数据构成:")
         print(f"   码本数据: {self.total_codebook_bytes:,} bytes ({self.total_codebook_bytes/total_bytes*100:.1f}%)")
-        print(f"   索引数据: {self.total_index_bytes:,} bytes ({self.total_index_bytes/total_bytes*100:.1f}%)")
-        print(f"   色块数据: {self.color_block_bytes:,} bytes ({self.color_block_bytes/total_bytes*100:.1f}%)")
-        print(f"   纹理数据: {self.detail_block_bytes:,} bytes ({self.detail_block_bytes/total_bytes*100:.1f}%)")
+        print(f"   I帧索引: {self.total_index_bytes:,} bytes ({self.total_index_bytes/total_bytes*100:.1f}%)")
+        
+        # P帧数据构成
+        p_frame_data_bytes = self.total_p_frame_bytes - self.total_p_overhead_bytes
+        print(f"   P帧更新数据: {p_frame_data_bytes:,} bytes ({p_frame_data_bytes/total_bytes*100:.1f}%)")
+        print(f"   P帧开销: {self.total_p_overhead_bytes:,} bytes ({self.total_p_overhead_bytes/total_bytes*100:.1f}%)")
+        
+        # 其他数据
+        other_bytes = total_bytes - (self.total_codebook_bytes + self.total_index_bytes + self.total_p_frame_bytes)
+        if other_bytes > 0:
+            print(f"   其他数据: {other_bytes:,} bytes ({other_bytes/total_bytes*100:.1f}%)")
+        
+        # 块类型统计
+        print(f"\n🧩 块类型分布:")
+        if self.color_block_bytes > 0 or self.detail_block_bytes > 0:
+            total_block_data = self.color_block_bytes + self.detail_block_bytes
+            print(f"   色块索引: {self.color_block_bytes} 个 ({self.color_block_bytes/total_block_data*100:.1f}%)")
+            print(f"   纹理块索引: {self.detail_block_bytes} 个 ({self.detail_block_bytes/total_block_data*100:.1f}%)")
         
         # P帧更新统计
         if self.p_frame_updates:
@@ -633,7 +661,8 @@ class EncodingStats:
             print(f"\n🗺️  区域使用分布:")
             for zone_count in sorted(self.zone_usage.keys()):
                 frames_count = self.zone_usage[zone_count]
-                print(f"   {zone_count}个区域: {frames_count}帧 ({frames_count/self.total_p_frames*100:.1f}%)")
+                if self.total_p_frames > 0:
+                    print(f"   {zone_count}个区域: {frames_count}次 ({frames_count/self.total_p_frames*100:.1f}%)")
         
         # 条带统计
         print(f"\n📏 条带统计:")
@@ -644,6 +673,14 @@ class EncodingStats:
             if total_strip_frames > 0:
                 print(f"   条带{strip_idx}: {total_strip_frames}帧, {total_strip_bytes:,}bytes, "
                       f"平均{total_strip_bytes/total_strip_frames:.1f}bytes/帧")
+        
+        # 压缩效率
+        raw_size = total_frames * WIDTH * HEIGHT * 2  # 假设16位像素
+        compression_ratio = raw_size / total_bytes if total_bytes > 0 else 0
+        print(f"\n📈 压缩效率:")
+        print(f"   原始大小估算: {raw_size:,} bytes ({raw_size/1024/1024:.1f} MB)")
+        print(f"   压缩比: {compression_ratio:.1f}:1")
+        print(f"   压缩率: {(1-total_bytes/raw_size)*100:.1f}%")
 
 # 全局统计对象
 encoding_stats = EncodingStats()
@@ -772,7 +809,7 @@ def main():
                     strip_idx, len(strip_data), 
                     is_forced=force_i_frame,
                     codebook_size=codebook_size,
-                    index_size=index_size
+                    index_size=max(0, index_size)  # 确保非负
                 )
             else:
                 strip_data, is_i_frame, used_zones, color_updates, detail_updates = encode_strip_differential_dual_vq(
@@ -789,7 +826,7 @@ def main():
                         strip_idx, len(strip_data), 
                         is_forced=False,
                         codebook_size=codebook_size,
-                        index_size=index_size
+                        index_size=max(0, index_size)
                     )
                 else:  # 返回的是P帧
                     total_updates = color_updates + detail_updates
