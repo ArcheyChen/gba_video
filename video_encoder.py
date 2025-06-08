@@ -19,6 +19,7 @@ DEFAULT_STRIP_COUNT = 4
 DETAIL_CODEBOOK_SIZE = 255  # 细节码本大小（0xFF保留）
 DEFAULT_COLOR_CODEBOOK_SIZE = 256   # 默认色块码本大小
 DEFAULT_UNIFIED_CODEBOOK_SIZE = 256   # 统一码本大小
+EFFECTIVE_UNIFIED_CODEBOOK_SIZE = 255  # 有效码本大小（0xFF保留）
 
 Y_COEFF  = np.array([0.28571429,  0.57142857,  0.14285714])
 CB_COEFF = np.array([-0.14285714, -0.28571429,  0.42857143])
@@ -258,22 +259,34 @@ def generate_dual_codebooks(all_color_blocks: list, all_detail_blocks: list,
 
 def generate_unified_codebook(all_blocks: list, codebook_size: int = DEFAULT_UNIFIED_CODEBOOK_SIZE,
                              kmeans_max_iter: int = 100) -> np.ndarray:
-    """生成统一码本"""
+    """生成统一码本（保留0xFF作为特殊标记）"""
     if all_blocks:
         blocks_array = np.array(all_blocks)
-        codebook, _ = generate_codebook(blocks_array, codebook_size, kmeans_max_iter)
+        # 只使用255项有效码本，保留0xFF
+        effective_size = min(codebook_size - 1, EFFECTIVE_UNIFIED_CODEBOOK_SIZE)
+        codebook, _ = generate_codebook(blocks_array, effective_size, kmeans_max_iter)
+        
+        # 创建完整的256项码本
+        full_codebook = np.zeros((codebook_size, BYTES_PER_BLOCK), dtype=np.uint8)
+        full_codebook[:effective_size] = codebook[:effective_size]
+        # 第255项（索引255/0xFF）复制最后一个有效项作为占位
+        if effective_size > 0:
+            full_codebook[255] = full_codebook[effective_size - 1]
     else:
-        codebook = np.zeros((codebook_size, BYTES_PER_BLOCK), dtype=np.uint8)
+        full_codebook = np.zeros((codebook_size, BYTES_PER_BLOCK), dtype=np.uint8)
     
-    return codebook
+    return full_codebook
 
-def quantize_blocks(blocks_data: np.ndarray, codebook: np.ndarray) -> np.ndarray:
-    """使用码表对块进行量化"""
+def quantize_blocks_unified(blocks_data: np.ndarray, codebook: np.ndarray) -> np.ndarray:
+    """使用统一码表对块进行量化（避免产生0xFF）"""
     if len(blocks_data) == 0:
         return np.array([], dtype=np.uint8)
     
+    # 只使用前255项进行量化
+    effective_codebook = codebook[:EFFECTIVE_UNIFIED_CODEBOOK_SIZE]
+    
     blocks_for_clustering = convert_blocks_for_clustering(blocks_data)
-    codebook_for_clustering = convert_blocks_for_clustering(codebook)
+    codebook_for_clustering = convert_blocks_for_clustering(effective_codebook)
     
     blocks_expanded = blocks_for_clustering[:, np.newaxis, :]
     codebook_expanded = codebook_for_clustering[np.newaxis, :, :]
@@ -427,7 +440,7 @@ def encode_strip_i_frame_unified(blocks: np.ndarray, unified_codebook: np.ndarra
                             avg_val = np.mean([b[i].view(np.int8) for b in blocks_4x4])
                             avg_block[i] = np.clip(avg_val, -128, 127).astype(np.int8).view(np.uint8)
                         
-                        unified_idx = quantize_blocks(avg_block.reshape(1, -1), unified_codebook)[0]
+                        unified_idx = quantize_blocks_unified(avg_block.reshape(1, -1), unified_codebook)[0]
                         data.append(unified_idx)
                     else:
                         # 纹理块：4个码本索引
@@ -437,7 +450,7 @@ def encode_strip_i_frame_unified(blocks: np.ndarray, unified_codebook: np.ndarra
                                 bx = big_bx * 2 + sub_bx
                                 if by < blocks_h and bx < blocks_w:
                                     block = blocks[by, bx]
-                                    unified_idx = quantize_blocks(block.reshape(1, -1), unified_codebook)[0]
+                                    unified_idx = quantize_blocks_unified(block.reshape(1, -1), unified_codebook)[0]
                                     data.append(unified_idx)
                                 else:
                                     data.append(0)
@@ -657,7 +670,7 @@ def encode_strip_differential_unified(current_blocks: np.ndarray, prev_blocks: n
                             avg_val = np.mean([b[i].view(np.int8) for b in blocks_4x4])
                             avg_block[i] = np.clip(avg_val, -128, 127).astype(np.int8).view(np.uint8)
                         
-                        unified_idx = quantize_blocks(avg_block.reshape(1, -1), unified_codebook)[0]
+                        unified_idx = quantize_blocks_unified(avg_block.reshape(1, -1), unified_codebook)[0]
                         zone_color_updates[zone_idx].append((zone_relative_idx, unified_idx))
                     else:
                         # 纹理块更新
@@ -665,7 +678,7 @@ def encode_strip_differential_unified(current_blocks: np.ndarray, prev_blocks: n
                         for by, bx in positions:
                             if by < blocks_h and bx < blocks_w:
                                 block = current_blocks[by, bx]
-                                unified_idx = quantize_blocks(block.reshape(1, -1), unified_codebook)[0]
+                                unified_idx = quantize_blocks_unified(block.reshape(1, -1), unified_codebook)[0]
                                 indices.append(unified_idx)
                             else:
                                 indices.append(0)
@@ -718,59 +731,6 @@ def encode_strip_differential_unified(current_blocks: np.ndarray, prev_blocks: n
                 data.append(unified_idx)
     
     return bytes(data), False, used_zones, total_color_updates, total_detail_updates
-
-def generate_gop_dual_codebooks(frames: list, strip_count: int, i_frame_interval: int,
-                              variance_threshold: float, color_codebook_size: int = DEFAULT_COLOR_CODEBOOK_SIZE,
-                              kmeans_max_iter: int = 100) -> dict:
-    """为每个GOP生成双码本"""
-    print("正在为每个GOP生成双码本...")
-    
-    gop_codebooks = {}
-    
-    i_frame_positions = []
-    for frame_idx in range(len(frames)):
-        if frame_idx % i_frame_interval == 0:
-            i_frame_positions.append(frame_idx)
-    
-    for gop_idx, gop_start in enumerate(i_frame_positions):
-        if gop_idx + 1 < len(i_frame_positions):
-            gop_end = i_frame_positions[gop_idx + 1]
-        else:
-            gop_end = len(frames)
-        
-        print(f"  处理GOP {gop_idx}: 帧 {gop_start} 到 {gop_end-1}")
-        
-        gop_codebooks[gop_start] = []
-        
-        for strip_idx in range(strip_count):
-            all_color_blocks = []
-            all_detail_blocks = []
-            block_types_list = []
-            
-            for frame_idx in range(gop_start, gop_end):
-                strip_blocks = frames[frame_idx][strip_idx]
-                if strip_blocks.size > 0:
-                    color_blocks, detail_blocks, block_types = classify_4x4_blocks(strip_blocks, variance_threshold)
-                    all_color_blocks.extend(color_blocks)
-                    all_detail_blocks.extend(detail_blocks)
-                    block_types_list.append((frame_idx, block_types))
-            
-            # 生成双码本
-            color_codebook, detail_codebook = generate_dual_codebooks(
-                all_color_blocks, all_detail_blocks, color_codebook_size, kmeans_max_iter
-            )
-            
-            gop_codebooks[gop_start].append({
-                'color_codebook': color_codebook,
-                'detail_codebook': detail_codebook,
-                'block_types_list': block_types_list,
-                'color_blocks_count': len(all_color_blocks),
-                'detail_blocks_count': len(all_detail_blocks) // 4  # 4个2x2块组成一个4x4块
-            })
-            
-            print(f"    条带{strip_idx}: 色块{len(all_color_blocks)}, 纹理块{len(all_detail_blocks)//4}")
-    
-    return gop_codebooks
 
 def generate_gop_unified_codebooks(frames: list, strip_count: int, i_frame_interval: int,
                                   variance_threshold: float, codebook_size: int = DEFAULT_UNIFIED_CODEBOOK_SIZE,
@@ -1178,10 +1138,14 @@ def write_header(path_h: pathlib.Path, frame_cnt: int, total_bytes: int, strip_c
             #define VIDEO_TOTAL_BYTES   {total_bytes}
             #define VIDEO_STRIP_COUNT   {strip_count}
             #define UNIFIED_CODEBOOK_SIZE {codebook_size}
+            #define EFFECTIVE_UNIFIED_CODEBOOK_SIZE {EFFECTIVE_UNIFIED_CODEBOOK_SIZE}
             
             // 帧类型定义
             #define FRAME_TYPE_I        0x00
             #define FRAME_TYPE_P        0x01
+            
+            // 特殊标记
+            #define COLOR_BLOCK_MARKER  0xFF
             
             // 块参数
             #define BLOCK_WIDTH         2
