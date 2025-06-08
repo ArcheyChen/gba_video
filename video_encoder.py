@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-gba_encode.py  v6  ——  把视频/图片序列转成 GBA Mode3 YUV9 数据（支持条带帧间差分 + 双码本向量量化）
+gba_encode.py  v7  ——  把视频/图片序列转成 GBA Mode3 YUV9 数据（支持条带帧间差分 + 统一码本向量量化）
 输出 video_data.c / video_data.h
 默认 5 s @ 30 fps，可用 --duration / --fps 修改，或使用 --full-duration 编码整个视频
-支持条带处理，每个条带独立进行I/P帧编码 + 双码本压缩（细节码本255项，色块码本256项）
+支持条带处理，每个条带独立进行I/P帧编码 + 统一码本压缩（有效255项，0xFF保留作为色块标记）
 """
 
 import argparse, cv2, numpy as np, pathlib, textwrap
@@ -16,8 +16,6 @@ import statistics
 
 WIDTH, HEIGHT = 240, 160
 DEFAULT_STRIP_COUNT = 4
-DETAIL_CODEBOOK_SIZE = 255  # 细节码本大小（0xFF保留）
-DEFAULT_COLOR_CODEBOOK_SIZE = 256   # 默认色块码本大小
 DEFAULT_UNIFIED_CODEBOOK_SIZE = 256   # 统一码本大小
 EFFECTIVE_UNIFIED_CODEBOOK_SIZE = 255  # 有效码本大小（0xFF保留）
 
@@ -153,7 +151,7 @@ def classify_4x4_blocks(blocks: np.ndarray, variance_threshold: float = 5.0) -> 
     return color_blocks, detail_blocks, block_types
 
 def classify_4x4_blocks_unified(blocks: np.ndarray, variance_threshold: float = 5.0) -> tuple:
-    """将4x4块分类为纯色块和纹理块，但都转换为2x2块用于统一码本"""
+    """将4x4块分类为纯色块和纹理块，用于统一码本"""
     blocks_h, blocks_w = blocks.shape[:2]
     big_blocks_h = blocks_h // 2
     big_blocks_w = blocks_w // 2
@@ -233,30 +231,6 @@ def generate_codebook(blocks_data: np.ndarray, codebook_size: int, max_iter: int
     
     return codebook, codebook_size
 
-def generate_dual_codebooks(all_color_blocks: list, all_detail_blocks: list, 
-                          color_codebook_size: int = DEFAULT_COLOR_CODEBOOK_SIZE,
-                          kmeans_max_iter: int = 100) -> tuple:
-    """生成双码本：色块码本和细节码本"""
-    # 生成色块码本
-    if all_color_blocks:
-        color_blocks_array = np.array(all_color_blocks)
-        color_codebook, _ = generate_codebook(color_blocks_array, color_codebook_size, kmeans_max_iter)
-    else:
-        color_codebook = np.zeros((color_codebook_size, BYTES_PER_BLOCK), dtype=np.uint8)
-    
-    # 生成细节码本（只用255项，0xFF保留）
-    if all_detail_blocks:
-        detail_blocks_array = np.array(all_detail_blocks)
-        detail_codebook, _ = generate_codebook(detail_blocks_array, DETAIL_CODEBOOK_SIZE, kmeans_max_iter)
-        # 添加一个占位块使总大小为256
-        detail_codebook_full = np.zeros((256, BYTES_PER_BLOCK), dtype=np.uint8)
-        detail_codebook_full[:DETAIL_CODEBOOK_SIZE] = detail_codebook[:DETAIL_CODEBOOK_SIZE]
-        detail_codebook_full[255] = detail_codebook_full[254]  # 复制最后一个有效项作为占位
-    else:
-        detail_codebook_full = np.zeros((256, BYTES_PER_BLOCK), dtype=np.uint8)
-    
-    return color_codebook, detail_codebook_full
-
 def generate_unified_codebook(all_blocks: list, codebook_size: int = DEFAULT_UNIFIED_CODEBOOK_SIZE,
                              kmeans_max_iter: int = 100) -> np.ndarray:
     """生成统一码本（保留0xFF作为特殊标记）"""
@@ -324,82 +298,6 @@ def convert_codebook_from_clustering(codebook_float: np.ndarray) -> np.ndarray:
     
     return codebook
 
-def encode_strip_i_frame_dual_vq(blocks: np.ndarray, color_codebook: np.ndarray, 
-                                detail_codebook: np.ndarray, block_types: dict) -> bytes:
-    """编码条带I帧（双码本）"""
-    data = bytearray()
-    data.append(FRAME_TYPE_I)
-    
-    if blocks.size > 0:
-        blocks_h, blocks_w = blocks.shape[:2]
-        big_blocks_h = blocks_h // 2
-        big_blocks_w = blocks_w // 2
-        
-        # 记录码本大小
-        codebook_start = len(data)
-        
-        # 存储两个码本
-        # 先存储细节码本（256项，包括占位）
-        data.extend(detail_codebook.flatten().tobytes())
-        # 再存储色块码本（可配置项数）
-        data.extend(color_codebook.flatten().tobytes())
-        
-        codebook_bytes = len(data) - codebook_start
-        index_start = len(data)
-        
-        # 统计色块和纹理块数量
-        color_block_count = 0
-        detail_block_count = 0
-        
-        # 按4x4大块的顺序编码
-        for big_by in range(big_blocks_h):
-            for big_bx in range(big_blocks_w):
-                if (big_by, big_bx) in block_types and block_types[(big_by, big_bx)] == 'color':
-                    color_block_count += 1
-                    # 色块：标记0xFF + 1个色块码本索引
-                    data.append(0xFF)
-                    
-                    # 收集4x4块用于计算平均值
-                    blocks_4x4 = []
-                    for sub_by in range(2):
-                        for sub_bx in range(2):
-                            by = big_by * 2 + sub_by
-                            bx = big_bx * 2 + sub_bx
-                            if by < blocks_h and bx < blocks_w:
-                                blocks_4x4.append(blocks[by, bx])
-                    
-                    # 计算平均块并量化
-                    avg_block = np.mean(blocks_4x4, axis=0).round().astype(np.uint8)
-                    for i in range(4, 7):
-                        avg_val = np.mean([b[i].view(np.int8) for b in blocks_4x4])
-                        avg_block[i] = np.clip(avg_val, -128, 127).astype(np.int8).view(np.uint8)
-                    
-                    color_idx = quantize_blocks(avg_block.reshape(1, -1), color_codebook)[0]
-                    data.append(color_idx)
-                else:
-                    detail_block_count += 1
-                    # 纹理块：4个细节码本索引
-                    for sub_by in range(2):
-                        for sub_bx in range(2):
-                            by = big_by * 2 + sub_by
-                            bx = big_bx * 2 + sub_bx
-                            if by < blocks_h and bx < blocks_w:
-                                block = blocks[by, bx]
-                                detail_idx = quantize_blocks(block.reshape(1, -1), detail_codebook[:DETAIL_CODEBOOK_SIZE])[0]
-                                data.append(detail_idx)
-                            else:
-                                data.append(0)
-        
-        index_bytes = len(data) - index_start
-        
-        # 更新统计
-        encoding_stats.add_block_stats(
-            color_block_count * 2,  # 色块：标记 + 索引
-            detail_block_count * 4  # 纹理块：4个索引
-        )
-    
-    return bytes(data)
-
 def encode_strip_i_frame_unified(blocks: np.ndarray, unified_codebook: np.ndarray, 
                                 block_types: dict) -> bytes:
     """编码条带I帧（统一码本）"""
@@ -424,8 +322,6 @@ def encode_strip_i_frame_unified(blocks: np.ndarray, unified_codebook: np.ndarra
                         # 色块：标记0xFF + 1个码本索引
                         data.append(0xFF)
                         
-                        # 获取原始2x2块并量化
-                        block_idx = block_indices[0]
                         # 从原始blocks重建平均块
                         blocks_4x4 = []
                         for sub_by in range(2):
@@ -456,144 +352,6 @@ def encode_strip_i_frame_unified(blocks: np.ndarray, unified_codebook: np.ndarra
                                     data.append(0)
     
     return bytes(data)
-
-def encode_strip_differential_dual_vq(current_blocks: np.ndarray, prev_blocks: np.ndarray,
-                                     color_codebook: np.ndarray, detail_codebook: np.ndarray,
-                                     block_types: dict, diff_threshold: float,
-                                     force_i_threshold: float = 0.7) -> tuple:
-    """差分编码当前条带（双码本）- 使用区域优化"""
-    if prev_blocks is None or current_blocks.shape != prev_blocks.shape:
-        i_frame_data = encode_strip_i_frame_dual_vq(current_blocks, color_codebook, detail_codebook, block_types)
-        return i_frame_data, True, 0, 0, 0  # 返回5个值，后3个为统计用的0值
-    
-    blocks_h, blocks_w = current_blocks.shape[:2]
-    total_blocks = blocks_h * blocks_w
-    
-    if total_blocks == 0:
-        return b'', True, 0, 0, 0
-    
-    # 计算块差异
-    current_flat = current_blocks.reshape(-1, BYTES_PER_BLOCK)
-    prev_flat = prev_blocks.reshape(-1, BYTES_PER_BLOCK)
-    
-    y_current = current_flat[:, :4].astype(np.int16)
-    y_prev = prev_flat[:, :4].astype(np.int16)
-    y_diff = np.abs(y_current - y_prev)
-    block_diffs_flat = y_diff.mean(axis=1)
-    block_diffs = block_diffs_flat.reshape(blocks_h, blocks_w)
-    
-    big_blocks_h = blocks_h // 2
-    big_blocks_w = blocks_w // 2
-    
-    # 计算区域数量
-    zones_count = (big_blocks_h + ZONE_HEIGHT_BIG_BLOCKS - 1) // ZONE_HEIGHT_BIG_BLOCKS  # 向上取整
-    if zones_count > 8:
-        zones_count = 8  # 限制最多8个区域（u8 bitmap）
-    
-    # 按区域组织更新
-    zone_detail_updates = [[] for _ in range(zones_count)]  # 每个区域的纹理块更新
-    zone_color_updates = [[] for _ in range(zones_count)]   # 每个区域的色块更新
-    total_updated_blocks = 0
-    
-    for big_by in range(big_blocks_h):
-        for big_bx in range(big_blocks_w):
-            needs_update = False
-            positions = [
-                (big_by * 2, big_bx * 2),
-                (big_by * 2, big_bx * 2 + 1),
-                (big_by * 2 + 1, big_bx * 2),
-                (big_by * 2 + 1, big_bx * 2 + 1)
-            ]
-            
-            for by, bx in positions:
-                if by < blocks_h and bx < blocks_w:
-                    if block_diffs[by, bx] > diff_threshold:
-                        needs_update = True
-                        break
-            
-            if needs_update:
-                # 计算属于哪个区域
-                zone_idx = min(big_by // ZONE_HEIGHT_BIG_BLOCKS, zones_count - 1)
-                # 计算在区域内的相对坐标
-                zone_relative_by = big_by % ZONE_HEIGHT_BIG_BLOCKS
-                zone_relative_idx = zone_relative_by * big_blocks_w + big_bx
-                
-                total_updated_blocks += 4
-                
-                if (big_by, big_bx) in block_types and block_types[(big_by, big_bx)] == 'color':
-                    # 色块更新
-                    blocks_4x4 = []
-                    for by, bx in positions:
-                        if by < blocks_h and bx < blocks_w:
-                            blocks_4x4.append(current_blocks[by, bx])
-                    
-                    avg_block = np.mean(blocks_4x4, axis=0).round().astype(np.uint8)
-                    for i in range(4, 7):
-                        avg_val = np.mean([b[i].view(np.int8) for b in blocks_4x4])
-                        avg_block[i] = np.clip(avg_val, -128, 127).astype(np.int8).view(np.uint8)
-                    
-                    color_idx = quantize_blocks(avg_block.reshape(1, -1), color_codebook)[0]
-                    zone_color_updates[zone_idx].append((zone_relative_idx, color_idx))
-                else:
-                    # 纹理块更新
-                    indices = []
-                    for by, bx in positions:
-                        if by < blocks_h and bx < blocks_w:
-                            block = current_blocks[by, bx]
-                            detail_idx = quantize_blocks(block.reshape(1, -1), detail_codebook[:DETAIL_CODEBOOK_SIZE])[0]
-                            indices.append(detail_idx)
-                        else:
-                            indices.append(0)
-                    zone_detail_updates[zone_idx].append((zone_relative_idx, indices))
-    
-    # 判断是否需要I帧
-    update_ratio = total_updated_blocks / total_blocks
-    if update_ratio > force_i_threshold:
-        i_frame_data = encode_strip_i_frame_dual_vq(current_blocks, color_codebook, detail_codebook, block_types)
-        return i_frame_data, True, 0, 0, 0  # 返回5个值，后3个为统计用的0值
-    
-    # 编码P帧
-    data = bytearray()
-    data.append(FRAME_TYPE_P)
-    
-    # 统计使用的区域数量
-    used_zones = 0
-    total_color_updates = 0
-    total_detail_updates = 0
-    
-    # 生成区域bitmap
-    zone_bitmap = 0
-    for zone_idx in range(zones_count):
-        if zone_detail_updates[zone_idx] or zone_color_updates[zone_idx]:
-            zone_bitmap |= (1 << zone_idx)
-            used_zones += 1
-            total_color_updates += len(zone_color_updates[zone_idx])
-            total_detail_updates += len(zone_detail_updates[zone_idx])
-    
-    data.append(zone_bitmap)
-    
-    # 按区域编码更新
-    for zone_idx in range(zones_count):
-        if zone_bitmap & (1 << zone_idx):
-            detail_updates = zone_detail_updates[zone_idx]
-            color_updates = zone_color_updates[zone_idx]
-            
-            # 存储纹理块更新数量和色块更新数量（改为u8）
-            data.append(len(detail_updates))  # 直接用u8存储
-            data.append(len(color_updates))   # 直接用u8存储
-            
-            # 存储纹理块更新
-            for relative_idx, indices in detail_updates:
-                data.append(relative_idx)  # 使用u8而不是u16
-                for idx in indices:
-                    data.append(idx)
-            
-            # 存储色块更新
-            for relative_idx, color_idx in color_updates:
-                data.append(relative_idx)  # 使用u8而不是u16
-                data.append(color_idx)
-    
-    return bytes(data), False, used_zones, total_color_updates, total_detail_updates
 
 def encode_strip_differential_unified(current_blocks: np.ndarray, prev_blocks: np.ndarray,
                                      unified_codebook: np.ndarray, block_types: dict, 
@@ -649,40 +407,39 @@ def encode_strip_differential_unified(current_blocks: np.ndarray, prev_blocks: n
                         break
             
             if needs_update:
+                # 计算属于哪个区域
                 zone_idx = min(big_by // ZONE_HEIGHT_BIG_BLOCKS, zones_count - 1)
+                # 计算在区域内的相对坐标
                 zone_relative_by = big_by % ZONE_HEIGHT_BIG_BLOCKS
                 zone_relative_idx = zone_relative_by * big_blocks_w + big_bx
                 
                 total_updated_blocks += 4
                 
-                if (big_by, big_bx) in block_types:
-                    block_type, _ = block_types[(big_by, big_bx)]
+                if (big_by, big_bx) in block_types and block_types[(big_by, big_bx)] == 'color':
+                    # 色块更新
+                    blocks_4x4 = []
+                    for by, bx in positions:
+                        if by < blocks_h and bx < blocks_w:
+                            blocks_4x4.append(current_blocks[by, bx])
                     
-                    if block_type == 'color':
-                        # 色块更新
-                        blocks_4x4 = []
-                        for by, bx in positions:
-                            if by < blocks_h and bx < blocks_w:
-                                blocks_4x4.append(current_blocks[by, bx])
-                        
-                        avg_block = np.mean(blocks_4x4, axis=0).round().astype(np.uint8)
-                        for i in range(4, 7):
-                            avg_val = np.mean([b[i].view(np.int8) for b in blocks_4x4])
-                            avg_block[i] = np.clip(avg_val, -128, 127).astype(np.int8).view(np.uint8)
-                        
-                        unified_idx = quantize_blocks_unified(avg_block.reshape(1, -1), unified_codebook)[0]
-                        zone_color_updates[zone_idx].append((zone_relative_idx, unified_idx))
-                    else:
-                        # 纹理块更新
-                        indices = []
-                        for by, bx in positions:
-                            if by < blocks_h and bx < blocks_w:
-                                block = current_blocks[by, bx]
-                                unified_idx = quantize_blocks_unified(block.reshape(1, -1), unified_codebook)[0]
-                                indices.append(unified_idx)
-                            else:
-                                indices.append(0)
-                        zone_detail_updates[zone_idx].append((zone_relative_idx, indices))
+                    avg_block = np.mean(blocks_4x4, axis=0).round().astype(np.uint8)
+                    for i in range(4, 7):
+                        avg_val = np.mean([b[i].view(np.int8) for b in blocks_4x4])
+                        avg_block[i] = np.clip(avg_val, -128, 127).astype(np.int8).view(np.uint8)
+                    
+                    color_idx = quantize_blocks_unified(avg_block.reshape(1, -1), unified_codebook)[0]
+                    zone_color_updates[zone_idx].append((zone_relative_idx, color_idx))
+                else:
+                    # 纹理块更新
+                    indices = []
+                    for by, bx in positions:
+                        if by < blocks_h and bx < blocks_w:
+                            block = current_blocks[by, bx]
+                            unified_idx = quantize_blocks_unified(block.reshape(1, -1), unified_codebook)[0]
+                            indices.append(unified_idx)
+                        else:
+                            indices.append(0)
+                    zone_detail_updates[zone_idx].append((zone_relative_idx, indices))
     
     # 判断是否需要I帧
     update_ratio = total_updated_blocks / total_blocks
