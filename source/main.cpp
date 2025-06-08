@@ -1,5 +1,5 @@
-// gba_video_player.cpp  v6
-// Mode 3 单缓冲 + YUV9 → RGB555 + 条带帧间差分解码 + 向量量化
+// gba_video_player.cpp  v7
+// Mode 3 单缓冲 + YUV9 → RGB555 + 条带帧间差分解码 + 双码本向量量化
 
 #include <gba_systemcalls.h>
 #include <gba_video.h>
@@ -15,8 +15,9 @@ constexpr int PIXELS_PER_FRAME = SCREEN_WIDTH * SCREEN_HEIGHT;
 
 // EWRAM 单缓冲
 EWRAM_BSS u16 ewramBuffer[PIXELS_PER_FRAME];
-IWRAM_DATA static u8 clip_table_raw[512];//u8+s8最大范围是在[512]大小内的
-u8* clip_lookup_table = clip_table_raw + 128; //s8最小值是-128，预先添加偏移，这样查表的时候，遇到负数也直接查
+IWRAM_DATA static u8 clip_table_raw[512];
+u8* clip_lookup_table = clip_table_raw + 128;
+
 struct YUV_Struct{
     u8 y[2][2];
     s8 d_r;    // 预计算的 Cr
@@ -24,30 +25,33 @@ struct YUV_Struct{
     s8 d_b;    // 预计算的 Cb
 } __attribute__((packed));
 
-// 每个条带的码表存储（在EWRAM中）
-// IWRAM_DATA YUV_Struct strip_codebooks_raw[VIDEO_STRIP_COUNT][CODEBOOK_SIZE];
-IWRAM_DATA u8 strip_codebooks_raw[VIDEO_STRIP_COUNT][CODEBOOK_SIZE*sizeof(YUV_Struct)+4]__attribute__((aligned(32)));
-IWRAM_DATA YUV_Struct *strip_codebooks[VIDEO_STRIP_COUNT];
+// 双码本存储（在IWRAM中）
+// 细节码本：256项（0xFF保留作为标记）
+// 色块码本：256项
+IWRAM_DATA u8 strip_detail_codebooks_raw[VIDEO_STRIP_COUNT][256*sizeof(YUV_Struct)+4]__attribute__((aligned(32)));
+IWRAM_DATA u8 strip_color_codebooks_raw[VIDEO_STRIP_COUNT][256*sizeof(YUV_Struct)+4]__attribute__((aligned(32)));
+IWRAM_DATA YUV_Struct *strip_detail_codebooks[VIDEO_STRIP_COUNT];
+IWRAM_DATA YUV_Struct *strip_color_codebooks[VIDEO_STRIP_COUNT];
 
 void init_table(){
     for(int i = 0; i < VIDEO_STRIP_COUNT; i++) {
-        strip_codebooks[i] = (YUV_Struct*)strip_codebooks_raw[i];
+        strip_detail_codebooks[i] = (YUV_Struct*)strip_detail_codebooks_raw[i];
+        strip_color_codebooks[i] = (YUV_Struct*)strip_color_codebooks_raw[i];
     }
     for(int i=-128;i<512-128;i++){
         u8 raw_val;
         if(i<=0)
-            raw_val = 0; // 小于等于0的值都裁剪为0
+            raw_val = 0;
         else if(i>=255)
-            raw_val = 255; // 大于等于255的值都裁剪为255
+            raw_val = 255;
         else
-            raw_val = static_cast<u8>(i); // 其他值直接赋值
-        clip_lookup_table[i] = raw_val>>2; // 填充查找表，改为>>2因为码表值已预先>>1
+            raw_val = static_cast<u8>(i);
+        clip_lookup_table[i] = raw_val>>2;
     }
 }
 
 IWRAM_CODE inline u32 yuv_to_rgb555_2pix(const u8 y[2], s8 d_r, s8 d_g, s8 d_b)
 {
-    // 使用预计算的查找表进行转换
     u8 _y = y[0];
     u32 result = clip_lookup_table[_y + d_r];
     result |= (clip_lookup_table[_y + d_g] << 5);
@@ -63,41 +67,36 @@ IWRAM_CODE inline u32 yuv_to_rgb555_2pix(const u8 y[2], s8 d_r, s8 d_g, s8 d_b)
 
 // 条带信息结构
 struct StripInfo {
-    u16 start_y;       // 条带起始Y坐标
-    u16 height;        // 条带高度
-    u16 blocks_per_row; // 每行块数
-    u16 blocks_per_col; // 每列块数
-    u16 total_blocks;   // 总块数
-    u16 buffer_offset; // 条带在缓冲区中的起始偏移
+    u16 start_y;
+    u16 height;
+    u16 blocks_per_row;
+    u16 blocks_per_col;
+    u16 total_blocks;
+    u16 buffer_offset;
 };
 
 IWRAM_DATA StripInfo strip_info[VIDEO_STRIP_COUNT];
-// 通用的4x4大块相对偏移表，所有条带共用，记录左上角位置
-IWRAM_DATA u16 big_block_relative_offsets[240/4*80/4]; // 4x4大块数
+IWRAM_DATA u16 big_block_relative_offsets[240/4*80/4];
 
 void init_strip_info(){
     u16 current_y = 0;
 
-    // 首先计算最大的条带4x4大块数，用于初始化通用偏移表
-    u16 max_big_blocks_per_row = VIDEO_WIDTH / (BLOCK_WIDTH * 2);  // 4x4大块每行数量
+    u16 max_big_blocks_per_row = VIDEO_WIDTH / (BLOCK_WIDTH * 2);
     u16 max_big_blocks_per_col = 0;
 
     for(int strip_idx = 0; strip_idx < VIDEO_STRIP_COUNT; strip_idx++){
-        u16 strip_big_blocks_per_col = strip_heights[strip_idx] / (BLOCK_HEIGHT * 2);  // 4x4大块每列数量
+        u16 strip_big_blocks_per_col = strip_heights[strip_idx] / (BLOCK_HEIGHT * 2);
         if(strip_big_blocks_per_col > max_big_blocks_per_col) {
             max_big_blocks_per_col = strip_big_blocks_per_col;
         }
     }
 
-    // 初始化通用的4x4大块相对偏移表（记录左上角位置）
     for(int big_block_idx = 0; big_block_idx < max_big_blocks_per_row * max_big_blocks_per_col; big_block_idx++){
         u16 big_bx = big_block_idx % max_big_blocks_per_row;
         u16 big_by = big_block_idx / max_big_blocks_per_row;
-        // 4x4大块左上角的位置偏移
         big_block_relative_offsets[big_block_idx] = (big_by * BLOCK_HEIGHT * 2 * SCREEN_WIDTH) + (big_bx * BLOCK_WIDTH * 2);
     }
 
-    // 初始化各条带信息
     for(int strip_idx = 0; strip_idx < VIDEO_STRIP_COUNT; strip_idx++){
         strip_info[strip_idx].start_y = current_y;
         strip_info[strip_idx].height = strip_heights[strip_idx];
@@ -109,15 +108,13 @@ void init_strip_info(){
     }
 }
 
-// 解码单个4x4块到指定位置
+// 解码单个2x2块
 IWRAM_CODE inline void decode_block(const YUV_Struct &yuv_data, u16* dst)
 {
-
     const s8 &d_r = yuv_data.d_r;
     const s8 &d_g = yuv_data.d_g;
     const s8 &d_b = yuv_data.d_b;
 
-    // 解码2x2像素
     u32* dst_row = (u32*)dst;
     *dst_row = yuv_to_rgb555_2pix(
         yuv_data.y[0], d_r, d_g, d_b);
@@ -125,104 +122,172 @@ IWRAM_CODE inline void decode_block(const YUV_Struct &yuv_data, u16* dst)
         yuv_data.y[1], d_r, d_g, d_b);
 }
 
+// 解码色块（2x2上采样到4x4）
+IWRAM_CODE inline void decode_color_block(const YUV_Struct &yuv_data, u16* dst)
+{
+    const s8 &d_r = yuv_data.d_r;
+    const s8 &d_g = yuv_data.d_g;
+    const s8 &d_b = yuv_data.d_b;
 
-// 通用的4x4大块解码函数
+    // 将2x2的Y值上采样到4x4
+    // 原始: 12/34 -> 目标: 1122/1122/3344/3344
+    // y[0][0]=1, y[0][1]=2, y[1][0]=3, y[1][1]=4
+    
+    // 为每个重复的Y值对创建数组
+    u8 y_11[2] = {yuv_data.y[0][0], yuv_data.y[0][0]}; // 1,1
+    u8 y_22[2] = {yuv_data.y[0][1], yuv_data.y[0][1]}; // 2,2
+    u8 y_33[2] = {yuv_data.y[1][0], yuv_data.y[1][0]}; // 3,3
+    u8 y_44[2] = {yuv_data.y[1][1], yuv_data.y[1][1]}; // 4,4
+    
+    // 生成4个2像素组合
+    u32 pix_11 = yuv_to_rgb555_2pix(y_11, d_r, d_g, d_b);
+    u32 pix_22 = yuv_to_rgb555_2pix(y_22, d_r, d_g, d_b);
+    u32 pix_33 = yuv_to_rgb555_2pix(y_33, d_r, d_g, d_b);
+    u32 pix_44 = yuv_to_rgb555_2pix(y_44, d_r, d_g, d_b);
+
+    u32* dst_row = (u32*)dst;
+    
+    // 第一行：1122
+    *dst_row = pix_11;
+    *(dst_row + 1) = pix_22;
+    
+    // 第二行：1122
+    dst_row += SCREEN_WIDTH/2;
+    *dst_row = pix_11;
+    *(dst_row + 1) = pix_22;
+    
+    // 第三行：3344
+    dst_row += SCREEN_WIDTH/2;
+    *dst_row = pix_33;
+    *(dst_row + 1) = pix_44;
+    
+    // 第四行：3344
+    dst_row += SCREEN_WIDTH/2;
+    *dst_row = pix_33;
+    *(dst_row + 1) = pix_44;
+}
+
+// 通用的4x4大块解码函数（纹理块）
 IWRAM_CODE inline void decode_big_block(const YUV_Struct* codebook, const u8 quant_indices[4], u16* big_block_dst)
 {
-    // 解码4x4大块中的4个2x2小块，使用简单的加法偏移
-    // 左上 (0,0)
     decode_block(codebook[quant_indices[0]], big_block_dst);
-    
-    // 右上 (0,1) - 向右偏移2像素
     decode_block(codebook[quant_indices[1]], big_block_dst + 2);
-    
-    // 左下 (1,0) - 向下偏移2行
     decode_block(codebook[quant_indices[2]], big_block_dst + SCREEN_WIDTH * 2);
-    
-    // 右下 (1,1) - 向右2像素，向下2行
     decode_block(codebook[quant_indices[3]], big_block_dst + SCREEN_WIDTH * 2 + 2);
 }
 
-
-IWRAM_CODE void decode_strip_i_frame(int strip_idx, const u8* src, u16* dst)
+// DMA拷贝码本的辅助函数
+IWRAM_CODE void copy_codebook(u8* dst_raw, const u8* src, YUV_Struct** codebook_ptr, int codebook_size)
 {
-    u16 strip_base_offset = strip_info[strip_idx].buffer_offset;
-    
-    // 读取码表大小（应该是CODEBOOK_SIZE）
-    u16 codebook_size = src[0] | (src[1] << 8);
-    src += 2;
-    
-    u8* copy_raw_ptr = strip_codebooks_raw[strip_idx] + 4; // 跳过对齐填充的4字节
-    strip_codebooks[strip_idx] = (YUV_Struct*)copy_raw_ptr; // 设置条带的码表指针
+    u8* copy_raw_ptr = dst_raw + 4; // 跳过对齐填充的4字节
+    *codebook_ptr = (YUV_Struct*)copy_raw_ptr;
     int remain_copy = codebook_size * BYTES_PER_BLOCK;
     
-    if(((u32)src) & 1){// 确保src地址对齐
-        // 如果src地址不是偶数，则需要调整
+    if(((u32)src) & 1){
         u8 data = *src++;
         copy_raw_ptr[-1] = copy_raw_ptr[-3] = data;
-        // strip_codebooks[strip_idx] = (YUV_Struct*)(copy_raw_ptr - 1); // 更新条带的码表指针
-        strip_codebooks[strip_idx] = (YUV_Struct*)((u32)strip_codebooks[strip_idx] - 1); // 更新条带的码表指针
-        remain_copy -= 1; // 调整后少拷贝一个字节
+        *codebook_ptr = (YUV_Struct*)((u32)*codebook_ptr - 1);
+        remain_copy -= 1;
     }
     if(((u32)src) & 2){
         copy_raw_ptr[-2] = *src++;
         copy_raw_ptr[-1] = *src++;
-        strip_codebooks[strip_idx] = (YUV_Struct*)((u32)strip_codebooks[strip_idx] - 2);
-        remain_copy -= 2; // 调整后少拷贝两个字节
+        *codebook_ptr = (YUV_Struct*)((u32)*codebook_ptr - 2);
+        remain_copy -= 2;
     }
 
-    DMA3COPY(src, copy_raw_ptr, (remain_copy>>2)/*2B为单位，因此除2*/ | DMA32); // 使用DMA拷贝码表数据,不会改变指针地址和remain_copy
-    int tail = remain_copy & 3; // 计算剩余的字节数
-    int body = remain_copy - tail; // 计算剩余的字节数（除去尾部的1-3字节）
-    src += body; // 更新src指针位置
-    copy_raw_ptr += body; // 更新码表指针位置
+    DMA3COPY(src, copy_raw_ptr, (remain_copy>>2) | DMA32);
+    int tail = remain_copy & 3;
+    int body = remain_copy - tail;
+    src += body;
+    copy_raw_ptr += body;
     while(tail--) {
-        *copy_raw_ptr++ = *src++; // 拷贝剩余的1-3字节
-    }
-
-    auto &strip = strip_info[strip_idx];
-    auto &code_book = strip_codebooks[strip_idx];
-    
-    // 新格式：按4x4大块解码（12/34排布）
-    u16 tot_big_blocks = strip.total_blocks >> 2; // 每个条带的4x4大块总数
-    
-    // 解码条带内所有4x4大块
-    u16* strip_dst = dst + strip_base_offset;
-    for (int big_block_idx = 0; big_block_idx < tot_big_blocks; big_block_idx++) {
-        // 使用大块偏移表获取4x4大块左上角位置
-        u16* big_block_dst = strip_dst + big_block_relative_offsets[big_block_idx];
-        
-        // 解码4x4大块
-        decode_big_block(code_book, src, big_block_dst);
-        src+=4;
+        *copy_raw_ptr++ = *src++;
     }
 }
 
-IWRAM_CODE void decode_strip_p_frame(int strip_idx, const u8* src, u16* dst)
+IWRAM_CODE void decode_strip_i_frame_dual(int strip_idx, const u8* src, u16* dst)
 {
     u16 strip_base_offset = strip_info[strip_idx].buffer_offset;
     
-    // 读取需要更新的4x4大块数（小端序）
-    u16 big_blocks_to_update = src[0] | (src[1] << 8);
+    // 拷贝细节码本（256项）
+    copy_codebook(strip_detail_codebooks_raw[strip_idx], src, 
+                  &strip_detail_codebooks[strip_idx], 256);
+    src += 256 * BYTES_PER_BLOCK;
+    
+    // 拷贝色块码本（256项）
+    copy_codebook(strip_color_codebooks_raw[strip_idx], src, 
+                  &strip_color_codebooks[strip_idx], 256);
+    src += 256 * BYTES_PER_BLOCK;
+    
+    auto &strip = strip_info[strip_idx];
+    auto &detail_codebook = strip_detail_codebooks[strip_idx];
+    auto &color_codebook = strip_color_codebooks[strip_idx];
+    
+    u16 tot_big_blocks = strip.total_blocks >> 2;
+    u16* strip_dst = dst + strip_base_offset;
+    
+    // 解码所有4x4大块
+    for (int big_block_idx = 0; big_block_idx < tot_big_blocks; big_block_idx++) {
+        u16* big_block_dst = strip_dst + big_block_relative_offsets[big_block_idx];
+        
+        // 读取第一个索引
+        u8 first_idx = *src++;
+        
+        if (first_idx == 0xFF) {
+            // 色块：读取色块码本索引
+            u8 color_idx = *src++;
+            decode_color_block(color_codebook[color_idx], big_block_dst);
+        } else {
+            // 纹理块：已经读了第一个索引，再读3个
+            u8 quant_indices[4];
+            quant_indices[0] = first_idx;
+            quant_indices[1] = *src++;
+            quant_indices[2] = *src++;
+            quant_indices[3] = *src++;
+            decode_big_block(detail_codebook, quant_indices, big_block_dst);
+        }
+    }
+}
+
+IWRAM_CODE void decode_strip_p_frame_dual(int strip_idx, const u8* src, u16* dst)
+{
+    u16 strip_base_offset = strip_info[strip_idx].buffer_offset;
+    
+    // 读取纹理块更新数量
+    u16 detail_blocks_to_update = src[0] | (src[1] << 8);
     src += 2;
     
-    // 处理每个需要更新的4x4大块
-    for (u16 i = 0; i < big_blocks_to_update; i++) {
-        // 读取4x4大块索引（小端序）
+    // 读取色块更新数量
+    u16 color_blocks_to_update = src[0] | (src[1] << 8);
+    src += 2;
+    
+    auto &detail_codebook = strip_detail_codebooks[strip_idx];
+    auto &color_codebook = strip_color_codebooks[strip_idx];
+    
+    // 处理纹理块更新
+    for (u16 i = 0; i < detail_blocks_to_update; i++) {
         u16 big_block_idx = src[0] | (src[1] << 8);
         src += 2;
         
-        // 读取4个2x2小块的量化索引
         u8 quant_indices[4];
         for (int j = 0; j < 4; j++) {
             quant_indices[j] = *src++;
         }
         
-        // 使用优化的大块偏移表获取4x4大块左上角位置
         u16* big_block_dst = dst + strip_base_offset + big_block_relative_offsets[big_block_idx];
+        decode_big_block(detail_codebook, quant_indices, big_block_dst);
+    }
+    
+    // 处理色块更新
+    for (u16 i = 0; i < color_blocks_to_update; i++) {
+        u16 big_block_idx = src[0] | (src[1] << 8);
+        src += 2;
         
-        // 解码4x4大块
-        decode_big_block(strip_codebooks[strip_idx], quant_indices, big_block_dst);
+        u8 color_idx = *src++;
+        
+        u16* big_block_dst = dst + strip_base_offset + big_block_relative_offsets[big_block_idx];
+        decode_color_block(color_codebook[color_idx], big_block_dst);
     }
 }
 
@@ -230,13 +295,12 @@ IWRAM_CODE void decode_strip(int strip_idx, const u8* src, u16 strip_data_size, 
 {
     if (strip_data_size == 0) return;
     
-    // 检查帧类型
     u8 frame_type = *src++;
     
     if (frame_type == FRAME_TYPE_I) {
-        decode_strip_i_frame(strip_idx, src, dst);
+        decode_strip_i_frame_dual(strip_idx, src, dst);
     } else if (frame_type == FRAME_TYPE_P) {
-        decode_strip_p_frame(strip_idx, src, dst);
+        decode_strip_p_frame_dual(strip_idx, src, dst);
     }
 }
 
@@ -244,16 +308,11 @@ IWRAM_CODE void decode_frame(const u8* frame_data, u16* dst)
 {
     const u8* src = frame_data;
     
-    // 解码每个条带
     for (int strip_idx = 0; strip_idx < VIDEO_STRIP_COUNT; strip_idx++) {
-        // 读取条带数据长度（小端序）
         u16 strip_data_size = src[0] | (src[1] << 8);
         src += 2;
         
-        // 解码当前条带
         decode_strip(strip_idx, src, strip_data_size, dst);
-        
-        // 移动到下一个条带
         src += strip_data_size;
     }
 }
@@ -272,46 +331,22 @@ int main()
     init_table();
     init_strip_info();
     
-    // 清空缓冲区
     memset(ewramBuffer, 0, PIXELS_PER_FRAME * sizeof(u16));
-    // VBlankIntrWait();
     DMA3COPY(ewramBuffer, VRAM, PIXELS_PER_FRAME | DMA16);
 
     int frame = 0;
     
     while (1)
     {
-        // 使用偏移表获取当前帧的数据位置
         const unsigned char* frame_data = video_data + frame_offsets[frame];
-        
-        // 解码当前帧（按条带处理I帧或P帧）
         decode_frame(frame_data, ewramBuffer);
-
-        // 等待垂直同步并复制到VRAM
-        // VBlankIntrWait();
+        
+        // VBlankIntrWait(); // 注释掉以提高性能，让DMA自动等待
         DMA3COPY(ewramBuffer, VRAM, PIXELS_PER_FRAME | DMA16);
 
         frame++;
         if(frame >= VIDEO_FRAME_COUNT) {
-            frame = 0; // 循环播放
+            frame = 0;
         }
-
-        // 按键检测（可选）
-        // scanKeys();
-        // u16 keys = keysDown();
-        
-        // if (keys & KEY_START) {
-        //     // 暂停功能
-        //     while (!(keysDown() & KEY_START)) {
-        //         scanKeys();
-        //         VBlankIntrWait();
-        //     }
-        // }
-        
-        // if (keys & KEY_A) {
-        //     // 快进：跳过5帧
-        //     frame += 5;
-        //     if (frame >= VIDEO_FRAME_COUNT) frame = 0;
-        // }
     }
 }
