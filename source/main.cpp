@@ -25,18 +25,13 @@ struct YUV_Struct{
     s8 d_b;    // 预计算的 Cb
 } __attribute__((packed));
 
-// 双码本存储（在IWRAM中）
-// 细节码本：256项（0xFF保留作为标记）
-// 色块码本：可配置项数（由COLOR_CODEBOOK_SIZE定义）
-IWRAM_DATA u8 strip_detail_codebooks_raw[VIDEO_STRIP_COUNT][256*sizeof(YUV_Struct)+4]__attribute__((aligned(32)));
-IWRAM_DATA u8 strip_color_codebooks_raw[VIDEO_STRIP_COUNT][COLOR_CODEBOOK_SIZE*sizeof(YUV_Struct)+4]__attribute__((aligned(32)));
-IWRAM_DATA YUV_Struct *strip_detail_codebooks[VIDEO_STRIP_COUNT];
-IWRAM_DATA YUV_Struct *strip_color_codebooks[VIDEO_STRIP_COUNT];
+// 统一码本存储（在IWRAM中）
+IWRAM_DATA u8 strip_unified_codebooks_raw[VIDEO_STRIP_COUNT][UNIFIED_CODEBOOK_SIZE*sizeof(YUV_Struct)+4]__attribute__((aligned(32)));
+IWRAM_DATA YUV_Struct *strip_unified_codebooks[VIDEO_STRIP_COUNT];
 
 void init_table(){
     for(int i = 0; i < VIDEO_STRIP_COUNT; i++) {
-        strip_detail_codebooks[i] = (YUV_Struct*)strip_detail_codebooks_raw[i];
-        strip_color_codebooks[i] = (YUV_Struct*)strip_color_codebooks_raw[i];
+        strip_unified_codebooks[i] = (YUV_Struct*)strip_unified_codebooks_raw[i];
     }
     for(int i=-128;i<512-128;i++){
         u8 raw_val;
@@ -177,7 +172,7 @@ IWRAM_CODE inline void decode_big_block(const YUV_Struct* codebook, const u8 qua
 }
 
 // DMA拷贝码本的辅助函数
-IWRAM_CODE void copy_codebook(u8* dst_raw, const u8* src, YUV_Struct** codebook_ptr, int codebook_size)
+IWRAM_CODE void copy_unified_codebook(u8* dst_raw, const u8* src, YUV_Struct** codebook_ptr, int codebook_size)
 {
     u8* copy_raw_ptr = dst_raw + 4; // 跳过对齐填充的4字节
     *codebook_ptr = (YUV_Struct*)copy_raw_ptr;
@@ -206,23 +201,17 @@ IWRAM_CODE void copy_codebook(u8* dst_raw, const u8* src, YUV_Struct** codebook_
     }
 }
 
-IWRAM_CODE void decode_strip_i_frame_dual(int strip_idx, const u8* src, u16* dst)
+IWRAM_CODE void decode_strip_i_frame_unified(int strip_idx, const u8* src, u16* dst)
 {
     u16 strip_base_offset = strip_info[strip_idx].buffer_offset;
     
-    // 拷贝细节码本（256项）
-    copy_codebook(strip_detail_codebooks_raw[strip_idx], src, 
-                  &strip_detail_codebooks[strip_idx], 256);
-    src += 256 * BYTES_PER_BLOCK;
-    
-    // 拷贝色块码本（COLOR_CODEBOOK_SIZE项）
-    copy_codebook(strip_color_codebooks_raw[strip_idx], src, 
-                  &strip_color_codebooks[strip_idx], COLOR_CODEBOOK_SIZE);
-    src += COLOR_CODEBOOK_SIZE * BYTES_PER_BLOCK;
+    // 拷贝统一码本
+    copy_unified_codebook(strip_unified_codebooks_raw[strip_idx], src, 
+                         &strip_unified_codebooks[strip_idx], UNIFIED_CODEBOOK_SIZE);
+    src += UNIFIED_CODEBOOK_SIZE * BYTES_PER_BLOCK;
     
     auto &strip = strip_info[strip_idx];
-    auto &detail_codebook = strip_detail_codebooks[strip_idx];
-    auto &color_codebook = strip_color_codebooks[strip_idx];
+    auto &unified_codebook = strip_unified_codebooks[strip_idx];
     
     u16 tot_big_blocks = strip.total_blocks >> 2;
     u16* strip_dst = dst + strip_base_offset;
@@ -235,9 +224,9 @@ IWRAM_CODE void decode_strip_i_frame_dual(int strip_idx, const u8* src, u16* dst
         u8 first_idx = *src++;
         
         if (first_idx == 0xFF) {
-            // 色块：读取色块码本索引
-            u8 color_idx = *src++;
-            decode_color_block(color_codebook[color_idx], big_block_dst);
+            // 色块：读取统一码本索引
+            u8 unified_idx = *src++;
+            decode_color_block(unified_codebook[unified_idx], big_block_dst);
         } else {
             // 纹理块：已经读了第一个索引，再读3个
             u8 quant_indices[4];
@@ -245,7 +234,7 @@ IWRAM_CODE void decode_strip_i_frame_dual(int strip_idx, const u8* src, u16* dst
             quant_indices[1] = *src++;
             quant_indices[2] = *src++;
             quant_indices[3] = *src++;
-            decode_big_block(detail_codebook, quant_indices, big_block_dst);
+            decode_big_block(unified_codebook, quant_indices, big_block_dst);
         }
     }
 }
@@ -253,15 +242,14 @@ IWRAM_CODE void decode_strip_i_frame_dual(int strip_idx, const u8* src, u16* dst
 #define ZONE_HEIGHT_PIXELS 16
 #define ZONE_HEIGHT_BIG_BLOCKS (ZONE_HEIGHT_PIXELS / (BLOCK_HEIGHT * 2))  // 每个区域的4x4大块行数
 
-IWRAM_CODE void decode_strip_p_frame_dual(int strip_idx, const u8* src, u16* dst)
+IWRAM_CODE void decode_strip_p_frame_unified(int strip_idx, const u8* src, u16* dst)
 {
     u16 strip_base_offset = strip_info[strip_idx].buffer_offset;
     
     // 读取区域bitmap
     u8 zone_bitmap = *src++;
     
-    auto &detail_codebook = strip_detail_codebooks[strip_idx];
-    auto &color_codebook = strip_color_codebooks[strip_idx];
+    auto &unified_codebook = strip_unified_codebooks[strip_idx];
     
     // 计算该条带的大块布局
     u16 strip_big_blocks_w = VIDEO_WIDTH / (BLOCK_WIDTH * 2);
@@ -270,10 +258,10 @@ IWRAM_CODE void decode_strip_p_frame_dual(int strip_idx, const u8* src, u16* dst
     u8 zone_idx = 0;
     while (zone_bitmap) {
         if (zone_bitmap & 1) {
-            // 读取纹理块更新数量（改为u8）
+            // 读取纹理块更新数量
             u8 detail_blocks_to_update = *src++;
             
-            // 读取色块更新数量（改为u8）
+            // 读取色块更新数量
             u8 color_blocks_to_update = *src++;
             
             // 计算区域在条带中的起始大块行
@@ -281,7 +269,7 @@ IWRAM_CODE void decode_strip_p_frame_dual(int strip_idx, const u8* src, u16* dst
             
             // 处理纹理块更新
             for (u8 i = 0; i < detail_blocks_to_update; i++) {
-                u8 zone_relative_idx = *src++;  // 使用u8读取相对坐标
+                u8 zone_relative_idx = *src++;
                 
                 u8 quant_indices[4];
                 for (int j = 0; j < 4; j++) {
@@ -295,13 +283,13 @@ IWRAM_CODE void decode_strip_p_frame_dual(int strip_idx, const u8* src, u16* dst
                 u16 big_block_idx = absolute_big_by * strip_big_blocks_w + relative_big_bx;
                 
                 u16* big_block_dst = dst + strip_base_offset + big_block_relative_offsets[big_block_idx];
-                decode_big_block(detail_codebook, quant_indices, big_block_dst);
+                decode_big_block(unified_codebook, quant_indices, big_block_dst);
             }
             
             // 处理色块更新
             for (u8 i = 0; i < color_blocks_to_update; i++) {
-                u8 zone_relative_idx = *src++;  // 使用u8读取相对坐标
-                u8 color_idx = *src++;
+                u8 zone_relative_idx = *src++;
+                u8 unified_idx = *src++;
                 
                 // 将区域相对坐标转换为条带内的绝对坐标
                 u16 relative_big_by = zone_relative_idx / strip_big_blocks_w;
@@ -310,7 +298,7 @@ IWRAM_CODE void decode_strip_p_frame_dual(int strip_idx, const u8* src, u16* dst
                 u16 big_block_idx = absolute_big_by * strip_big_blocks_w + relative_big_bx;
                 
                 u16* big_block_dst = dst + strip_base_offset + big_block_relative_offsets[big_block_idx];
-                decode_color_block(color_codebook[color_idx], big_block_dst);
+                decode_color_block(unified_codebook[unified_idx], big_block_dst);
             }
         }
         zone_bitmap >>= 1;
@@ -325,9 +313,9 @@ IWRAM_CODE void decode_strip(int strip_idx, const u8* src, u16 strip_data_size, 
     u8 frame_type = *src++;
     
     if (frame_type == FRAME_TYPE_I) {
-        decode_strip_i_frame_dual(strip_idx, src, dst);
+        decode_strip_i_frame_unified(strip_idx, src, dst);
     } else if (frame_type == FRAME_TYPE_P) {
-        decode_strip_p_frame_dual(strip_idx, src, dst);
+        decode_strip_p_frame_unified(strip_idx, src, dst);
     }
 }
 
