@@ -172,7 +172,7 @@ IWRAM_CODE inline void decode_color_block(const YUV_Struct &yuv_data, u16* dst)
 }
 
 // 通用的4x4大块解码函数（纹理块）
-IWRAM_CODE inline void decode_big_block(const YUV_Struct* codebook, const u8 quant_indices[4], u16* big_block_dst)
+IWRAM_CODE void decode_big_block(const YUV_Struct* codebook, const u8 quant_indices[4], u16* big_block_dst)
 {
     decode_block(codebook[quant_indices[0]], big_block_dst);
     decode_block(codebook[quant_indices[1]], big_block_dst + 2);
@@ -273,16 +273,8 @@ IWRAM_CODE void decode_strip_i_frame_unified_with_big_block(int strip_idx, const
             u8 unified_idx = *src++;
             decode_color_block(unified_codebook[unified_idx], big_block_dst);
         } else if (first_byte == COMPLEX_TEXTURE_MARKER) {
-            // 复杂纹理块：读取4个统一码本索引
-            u8 quant_indices[4];
-            quant_indices[0] = *src++;
-            quant_indices[1] = *src++;
-            quant_indices[2] = *src++;
-            quant_indices[3] = *src++;
-            decode_big_block(unified_codebook, quant_indices, big_block_dst);
-        } else {
-            // 大块索引：使用大块索引码表
-            u8 big_block_idx_val = first_byte;
+            // 大块索引模式：读取1个大块索引
+            u8 big_block_idx_val = *src++;
             if (big_block_idx_val < EFFECTIVE_BIG_BLOCK_CODEBOOK_SIZE) {
                 // 从大块索引码表获取4个统一码本索引
                 decode_big_block(unified_codebook, big_block_codebook[big_block_idx_val], big_block_dst);
@@ -291,6 +283,14 @@ IWRAM_CODE void decode_strip_i_frame_unified_with_big_block(int strip_idx, const
                 u8 quant_indices[4] = {0, 0, 0, 0};
                 decode_big_block(unified_codebook, quant_indices, big_block_dst);
             }
+        } else {
+            // 默认小块模式：当前字节是第一个统一码本索引，继续读取3个
+            u8 quant_indices[4];
+            quant_indices[0] = first_byte;
+            quant_indices[1] = *src++;
+            quant_indices[2] = *src++;
+            quant_indices[3] = *src++;
+            decode_big_block(unified_codebook, quant_indices, big_block_dst);
         }
     }
 }
@@ -331,14 +331,8 @@ IWRAM_CODE void decode_strip_p_frame_unified_with_big_block(int strip_idx, const
                 u8 quant_indices[4];
                 
                 if (first_byte == COMPLEX_TEXTURE_MARKER) {
-                    // 复杂纹理模式：读取4个统一码本索引
-                    quant_indices[0] = *src++;
-                    quant_indices[1] = *src++;
-                    quant_indices[2] = *src++;
-                    quant_indices[3] = *src++;
-                } else {
-                    // 大块索引模式：从大块索引码表获取4个索引
-                    u8 big_block_idx_val = first_byte;
+                    // 大块索引模式：读取1个大块索引
+                    u8 big_block_idx_val = *src++;
                     if (big_block_idx_val < EFFECTIVE_BIG_BLOCK_CODEBOOK_SIZE) {
                         quant_indices[0] = big_block_codebook[big_block_idx_val][0];
                         quant_indices[1] = big_block_codebook[big_block_idx_val][1];
@@ -348,6 +342,12 @@ IWRAM_CODE void decode_strip_p_frame_unified_with_big_block(int strip_idx, const
                         // 错误情况，使用默认值
                         quant_indices[0] = quant_indices[1] = quant_indices[2] = quant_indices[3] = 0;
                     }
+                } else {
+                    // 默认小块模式：当前字节是第一个索引，继续读取3个
+                    quant_indices[0] = first_byte;
+                    quant_indices[1] = *src++;
+                    quant_indices[2] = *src++;
+                    quant_indices[3] = *src++;
                 }
                 
                 // 将区域相对坐标转换为条带内的绝对坐标

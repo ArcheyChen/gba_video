@@ -17,7 +17,7 @@ import statistics
 WIDTH, HEIGHT = 240, 160
 DEFAULT_STRIP_COUNT = 4
 DEFAULT_UNIFIED_CODEBOOK_SIZE = 256   # 统一码本大小
-EFFECTIVE_UNIFIED_CODEBOOK_SIZE = 255  # 有效码本大小（0xFF保留）
+EFFECTIVE_UNIFIED_CODEBOOK_SIZE = 254  # 有效码本大小（0xFF保留）
 BIG_BLOCK_CODEBOOK_SIZE = 256  # 大块索引码表大小
 EFFECTIVE_BIG_BLOCK_CODEBOOK_SIZE = 254  # 有效大块索引码表大小（0xFF, 0xFE保留）
 
@@ -759,21 +759,21 @@ def encode_strip_i_frame_unified_with_big_block(blocks: np.ndarray, unified_code
                         unified_idx = quantize_blocks_unified(avg_block.reshape(1, -1), unified_codebook)[0]
                         data.append(unified_idx)
                     else:
-                        # 纹理块：使用大块索引优化
+                        # 纹理块：检查是否使用大块索引优化
                         if big_block_usage_idx < len(big_block_usage):
                             use_big_block, best_big_idx, original_indices = big_block_usage[big_block_usage_idx]
                             big_block_usage_idx += 1
                             
                             if use_big_block:
-                                # 使用大块索引（1字节）
+                                # 使用大块索引：FE标记 + 1字节大块索引
+                                data.append(COMPLEX_TEXTURE_MARKER)
                                 data.append(best_big_idx)
                             else:
-                                # 使用复杂纹理标记 + 4个索引（5字节）
-                                data.append(COMPLEX_TEXTURE_MARKER)
+                                # 默认小块模式：直接4个统一码本索引
                                 for idx in original_indices:
                                     data.append(idx)
                         else:
-                            # 兜底：直接量化
+                            # 兜底：直接量化为4个索引
                             for sub_by in range(2):
                                 for sub_bx in range(2):
                                     by = big_by * 2 + sub_by
@@ -879,7 +879,7 @@ def encode_strip_differential_unified_with_big_block(current_blocks: np.ndarray,
                         unified_idx = quantize_blocks_unified(avg_block.reshape(1, -1), unified_codebook)[0]
                         zone_color_updates[zone_idx].append((zone_relative_idx, unified_idx))
                     else:
-                        # 纹理块更新：使用大块索引优化
+                        # 纹理块更新：检查大块索引优化
                         if (big_by, big_bx) in big_block_usage_map:
                             use_big_block, best_big_idx, original_indices = big_block_usage_map[(big_by, big_bx)]
                             
@@ -887,8 +887,8 @@ def encode_strip_differential_unified_with_big_block(current_blocks: np.ndarray,
                                 # 使用大块索引
                                 zone_detail_updates[zone_idx].append((zone_relative_idx, 'big_block', best_big_idx))
                             else:
-                                # 使用传统模式
-                                zone_detail_updates[zone_idx].append((zone_relative_idx, 'complex', original_indices))
+                                # 使用小块模式
+                                zone_detail_updates[zone_idx].append((zone_relative_idx, 'small_blocks', original_indices))
                         else:
                             # 兜底：直接量化
                             indices = []
@@ -899,7 +899,7 @@ def encode_strip_differential_unified_with_big_block(current_blocks: np.ndarray,
                                     indices.append(unified_idx)
                                 else:
                                     indices.append(0)
-                            zone_detail_updates[zone_idx].append((zone_relative_idx, 'complex', indices))
+                            zone_detail_updates[zone_idx].append((zone_relative_idx, 'small_blocks', indices))
     
     # 判断是否需要I帧
     update_ratio = total_updated_blocks / total_blocks
@@ -941,11 +941,11 @@ def encode_strip_differential_unified_with_big_block(current_blocks: np.ndarray,
             for relative_idx, update_type, *indices in detail_updates:
                 data.append(relative_idx)
                 if update_type == 'big_block':
-                    # 大块索引模式（1字节）
-                    data.append(indices[0])
-                else:  # update_type == 'complex'
-                    # 复杂纹理模式（5字节）
+                    # 大块索引模式：FE标记 + 1字节大块索引
                     data.append(COMPLEX_TEXTURE_MARKER)
+                    data.append(indices[0])
+                else:  # update_type == 'small_blocks'
+                    # 小块模式：直接4个统一码本索引
                     for idx in indices[0]:
                         data.append(idx)
             
@@ -1029,8 +1029,6 @@ def generate_gop_unified_codebooks_with_big_block(frames: list, strip_count: int
                                     if usage_idx < len(big_block_usage_all):
                                         frame_usage.append(big_block_usage_all[usage_idx])
                                         usage_idx += 1
-                
-                frame_big_block_usage[frame_idx] = frame_usage
             
             gop_codebooks[gop_start].append({
                 'unified_codebook': unified_codebook,
