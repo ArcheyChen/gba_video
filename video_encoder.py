@@ -23,6 +23,10 @@ CR_COEFF = np.array([ 0.35714286, -0.28571429, -0.07142857])
 BLOCK_W, BLOCK_H = 2, 2
 BYTES_PER_BLOCK  = 7  # 4Y + d_r + d_g + d_b
 
+# 新增常量
+ZONE_HEIGHT_PIXELS = 16  # 每个区域的像素高度
+ZONE_HEIGHT_BIG_BLOCKS = ZONE_HEIGHT_PIXELS // (BLOCK_H * 2)  # 每个区域的4x4大块行数 (16像素 = 4行4x4大块)
+
 # 帧类型标识
 FRAME_TYPE_I = 0x00  # I帧（关键帧）
 FRAME_TYPE_P = 0x01  # P帧（差分帧）
@@ -228,7 +232,7 @@ def encode_strip_differential_dual_vq(current_blocks: np.ndarray, prev_blocks: n
                                      color_codebook: np.ndarray, detail_codebook: np.ndarray,
                                      block_types: dict, diff_threshold: float,
                                      force_i_threshold: float = 0.7) -> tuple:
-    """差分编码当前条带（双码本）"""
+    """差分编码当前条带（双码本）- 使用区域优化"""
     if prev_blocks is None or current_blocks.shape != prev_blocks.shape:
         return encode_strip_i_frame_dual_vq(current_blocks, color_codebook, detail_codebook, block_types), True
     
@@ -251,9 +255,14 @@ def encode_strip_differential_dual_vq(current_blocks: np.ndarray, prev_blocks: n
     big_blocks_h = blocks_h // 2
     big_blocks_w = blocks_w // 2
     
-    # 收集需要更新的大块，分别记录纹理块和色块
-    detail_updates = []  # [(big_block_idx, [4个索引])]
-    color_updates = []   # [(big_block_idx, 色块索引)]
+    # 计算区域数量
+    zones_count = (big_blocks_h + ZONE_HEIGHT_BIG_BLOCKS - 1) // ZONE_HEIGHT_BIG_BLOCKS  # 向上取整
+    if zones_count > 8:
+        zones_count = 8  # 限制最多8个区域（u8 bitmap）
+    
+    # 按区域组织更新
+    zone_detail_updates = [[] for _ in range(zones_count)]  # 每个区域的纹理块更新
+    zone_color_updates = [[] for _ in range(zones_count)]   # 每个区域的色块更新
     total_updated_blocks = 0
     
     for big_by in range(big_blocks_h):
@@ -273,7 +282,12 @@ def encode_strip_differential_dual_vq(current_blocks: np.ndarray, prev_blocks: n
                         break
             
             if needs_update:
-                big_block_idx = big_by * big_blocks_w + big_bx
+                # 计算属于哪个区域
+                zone_idx = min(big_by // ZONE_HEIGHT_BIG_BLOCKS, zones_count - 1)
+                # 计算在区域内的相对坐标
+                zone_relative_by = big_by % ZONE_HEIGHT_BIG_BLOCKS
+                zone_relative_idx = zone_relative_by * big_blocks_w + big_bx
+                
                 total_updated_blocks += 4
                 
                 if (big_by, big_bx) in block_types and block_types[(big_by, big_bx)] == 'color':
@@ -289,7 +303,7 @@ def encode_strip_differential_dual_vq(current_blocks: np.ndarray, prev_blocks: n
                         avg_block[i] = np.clip(avg_val, -128, 127).astype(np.int8).view(np.uint8)
                     
                     color_idx = quantize_blocks(avg_block.reshape(1, -1), color_codebook)[0]
-                    color_updates.append((big_block_idx, color_idx))
+                    zone_color_updates[zone_idx].append((zone_relative_idx, color_idx))
                 else:
                     # 纹理块更新
                     indices = []
@@ -300,7 +314,7 @@ def encode_strip_differential_dual_vq(current_blocks: np.ndarray, prev_blocks: n
                             indices.append(detail_idx)
                         else:
                             indices.append(0)
-                    detail_updates.append((big_block_idx, indices))
+                    zone_detail_updates[zone_idx].append((zone_relative_idx, indices))
     
     # 判断是否需要I帧
     update_ratio = total_updated_blocks / total_blocks
@@ -311,20 +325,35 @@ def encode_strip_differential_dual_vq(current_blocks: np.ndarray, prev_blocks: n
     data = bytearray()
     data.append(FRAME_TYPE_P)
     
-    # 存储纹理块更新数量和色块更新数量
-    data.extend(struct.pack('<H', len(detail_updates)))
-    data.extend(struct.pack('<H', len(color_updates)))
+    # 生成区域bitmap
+    zone_bitmap = 0
+    for zone_idx in range(zones_count):
+        if zone_detail_updates[zone_idx] or zone_color_updates[zone_idx]:
+            zone_bitmap |= (1 << zone_idx)
     
-    # 存储纹理块更新
-    for big_block_idx, indices in detail_updates:
-        data.extend(struct.pack('<H', big_block_idx))
-        for idx in indices:
-            data.append(idx)
+    data.append(zone_bitmap)
     
-    # 存储色块更新
-    for big_block_idx, color_idx in color_updates:
-        data.extend(struct.pack('<H', big_block_idx))
-        data.append(color_idx)
+    # 按区域编码更新
+    for zone_idx in range(zones_count):
+        if zone_bitmap & (1 << zone_idx):
+            # 编码该区域的更新
+            detail_updates = zone_detail_updates[zone_idx]
+            color_updates = zone_color_updates[zone_idx]
+            
+            # 存储纹理块更新数量和色块更新数量
+            data.extend(struct.pack('<H', len(detail_updates)))
+            data.extend(struct.pack('<H', len(color_updates)))
+            
+            # 存储纹理块更新
+            for relative_idx, indices in detail_updates:
+                data.append(relative_idx)  # 使用u8而不是u16
+                for idx in indices:
+                    data.append(idx)
+            
+            # 存储色块更新
+            for relative_idx, color_idx in color_updates:
+                data.append(relative_idx)  # 使用u8而不是u16
+                data.append(color_idx)
     
     return bytes(data), False
 

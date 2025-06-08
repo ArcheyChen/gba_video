@@ -250,44 +250,74 @@ IWRAM_CODE void decode_strip_i_frame_dual(int strip_idx, const u8* src, u16* dst
     }
 }
 
+#define ZONE_HEIGHT_PIXELS 16
+#define ZONE_HEIGHT_BIG_BLOCKS (ZONE_HEIGHT_PIXELS / (BLOCK_HEIGHT * 2))  // 每个区域的4x4大块行数
+
 IWRAM_CODE void decode_strip_p_frame_dual(int strip_idx, const u8* src, u16* dst)
 {
     u16 strip_base_offset = strip_info[strip_idx].buffer_offset;
     
-    // 读取纹理块更新数量
-    u16 detail_blocks_to_update = src[0] | (src[1] << 8);
-    src += 2;
-    
-    // 读取色块更新数量
-    u16 color_blocks_to_update = src[0] | (src[1] << 8);
-    src += 2;
+    // 读取区域bitmap
+    u8 zone_bitmap = *src++;
     
     auto &detail_codebook = strip_detail_codebooks[strip_idx];
     auto &color_codebook = strip_color_codebooks[strip_idx];
     
-    // 处理纹理块更新
-    for (u16 i = 0; i < detail_blocks_to_update; i++) {
-        u16 big_block_idx = src[0] | (src[1] << 8);
-        src += 2;
-        
-        u8 quant_indices[4];
-        for (int j = 0; j < 4; j++) {
-            quant_indices[j] = *src++;
-        }
-        
-        u16* big_block_dst = dst + strip_base_offset + big_block_relative_offsets[big_block_idx];
-        decode_big_block(detail_codebook, quant_indices, big_block_dst);
-    }
+    // 计算该条带的大块布局
+    u16 strip_big_blocks_w = VIDEO_WIDTH / (BLOCK_WIDTH * 2);
+    // u16 strip_big_blocks_h = strip_info[strip_idx].height / (BLOCK_HEIGHT * 2);
     
-    // 处理色块更新
-    for (u16 i = 0; i < color_blocks_to_update; i++) {
-        u16 big_block_idx = src[0] | (src[1] << 8);
-        src += 2;
-        
-        u8 color_idx = *src++;
-        
-        u16* big_block_dst = dst + strip_base_offset + big_block_relative_offsets[big_block_idx];
-        decode_color_block(color_codebook[color_idx], big_block_dst);
+    // 使用bitmap右移优化处理每个有效区域
+    u8 zone_idx = 0;
+    while (zone_bitmap) {
+        if (zone_bitmap & 1) {
+            // 读取纹理块更新数量
+            u16 detail_blocks_to_update = src[0] | (src[1] << 8);
+            src += 2;
+            
+            // 读取色块更新数量
+            u16 color_blocks_to_update = src[0] | (src[1] << 8);
+            src += 2;
+            
+            // 计算区域在条带中的起始大块行
+            u16 zone_start_big_by = zone_idx * ZONE_HEIGHT_BIG_BLOCKS;
+            
+            // 处理纹理块更新
+            for (u16 i = 0; i < detail_blocks_to_update; i++) {
+                u8 zone_relative_idx = *src++;  // 使用u8读取相对坐标
+                
+                u8 quant_indices[4];
+                for (int j = 0; j < 4; j++) {
+                    quant_indices[j] = *src++;
+                }
+                
+                // 将区域相对坐标转换为条带内的绝对坐标
+                u16 relative_big_by = zone_relative_idx / strip_big_blocks_w;
+                u16 relative_big_bx = zone_relative_idx % strip_big_blocks_w;
+                u16 absolute_big_by = zone_start_big_by + relative_big_by;
+                u16 big_block_idx = absolute_big_by * strip_big_blocks_w + relative_big_bx;
+                
+                u16* big_block_dst = dst + strip_base_offset + big_block_relative_offsets[big_block_idx];
+                decode_big_block(detail_codebook, quant_indices, big_block_dst);
+            }
+            
+            // 处理色块更新
+            for (u16 i = 0; i < color_blocks_to_update; i++) {
+                u8 zone_relative_idx = *src++;  // 使用u8读取相对坐标
+                u8 color_idx = *src++;
+                
+                // 将区域相对坐标转换为条带内的绝对坐标
+                u16 relative_big_by = zone_relative_idx / strip_big_blocks_w;
+                u16 relative_big_bx = zone_relative_idx % strip_big_blocks_w;
+                u16 absolute_big_by = zone_start_big_by + relative_big_by;
+                u16 big_block_idx = absolute_big_by * strip_big_blocks_w + relative_big_bx;
+                
+                u16* big_block_dst = dst + strip_base_offset + big_block_relative_offsets[big_block_idx];
+                decode_color_block(color_codebook[color_idx], big_block_dst);
+            }
+        }
+        zone_bitmap >>= 1;
+        zone_idx++;
     }
 }
 
