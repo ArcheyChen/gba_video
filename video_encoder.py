@@ -210,20 +210,24 @@ def generate_codebook(blocks_data: np.ndarray, codebook_size: int, max_iter: int
     if blocks_data.ndim > 2:
         blocks_data = blocks_data.reshape(-1, BYTES_PER_BLOCK)
     
-    blocks_as_tuples = [tuple(block) for block in blocks_data]
-    unique_tuples = list(set(blocks_as_tuples))
-    unique_blocks = np.array(unique_tuples, dtype=np.uint8)
+    # 移除去重操作，直接使用原始数据进行聚类
+    # 这样K-Means可以基于数据的真实分布（包括频次）进行更好的聚类
+    effective_size = min(len(blocks_data), codebook_size)
     
-    effective_size = min(len(unique_blocks), codebook_size)
-    
-    if len(unique_blocks) <= codebook_size:
+    if len(blocks_data) <= codebook_size:
+        # 如果数据量小于码本大小，需要去重避免重复
+        blocks_as_tuples = [tuple(block) for block in blocks_data]
+        unique_tuples = list(set(blocks_as_tuples))
+        unique_blocks = np.array(unique_tuples, dtype=np.uint8)
+        
         codebook = np.zeros((codebook_size, BYTES_PER_BLOCK), dtype=np.uint8)
         codebook[:len(unique_blocks)] = unique_blocks
         if len(unique_blocks) > 0:
             for i in range(len(unique_blocks), codebook_size):
                 codebook[i] = unique_blocks[-1]
-        return codebook, effective_size
+        return codebook, len(unique_blocks)
     
+    # 对于大数据集，直接进行K-Means聚类
     kmeans = MiniBatchKMeans(
         n_clusters=codebook_size,
         random_state=42,
