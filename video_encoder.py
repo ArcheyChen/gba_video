@@ -272,7 +272,7 @@ def quantize_blocks_unified(blocks_data: np.ndarray, codebook: np.ndarray) -> np
     
     diff = blocks_expanded - codebook_expanded
     squared_distances = np.sum(diff * diff, axis=2)
-    indices = np.argmin(squared_distances, axis=1).astype(np.uint8)
+    indices = np.argmin(squared_distances, axis=1).astype(np.uint16)
     
     return indices
 
@@ -324,8 +324,8 @@ def encode_strip_i_frame_unified(blocks: np.ndarray, unified_codebook: np.ndarra
                     block_type, block_indices = block_types[(big_by, big_bx)]
                     
                     if block_type == 'color':
-                        # 色块：标记0xFF + 1个码本索引
-                        data.append(0xFF)
+                        # 色块：标记0xFFFF + 1个码本索引（u16）
+                        data.extend(struct.pack('<H', 0xFFFF))
                         
                         # 从原始blocks重建平均块
                         blocks_8x8 = []
@@ -342,9 +342,9 @@ def encode_strip_i_frame_unified(blocks: np.ndarray, unified_codebook: np.ndarra
                             avg_block[i] = np.clip(avg_val, -128, 127).astype(np.int8).view(np.uint8)
                         
                         unified_idx = quantize_blocks_unified(avg_block.reshape(1, -1), unified_codebook)[0]
-                        data.append(unified_idx)
+                        data.extend(struct.pack('<H', unified_idx))
                     else:
-                        # 纹理块：4个码本索引
+                        # 纹理块：4个码本索引（u16）
                         for sub_by in range(2):
                             for sub_bx in range(2):
                                 by = big_by * 2 + sub_by
@@ -352,9 +352,9 @@ def encode_strip_i_frame_unified(blocks: np.ndarray, unified_codebook: np.ndarra
                                 if by < blocks_h and bx < blocks_w:
                                     block = blocks[by, bx]
                                     unified_idx = quantize_blocks_unified(block.reshape(1, -1), unified_codebook)[0]
-                                    data.append(unified_idx)
+                                    data.extend(struct.pack('<H', unified_idx))
                                 else:
-                                    data.append(0)
+                                    data.extend(struct.pack('<H', 0))
     
     return bytes(data)
 
@@ -474,12 +474,12 @@ def encode_strip_differential_unified(current_blocks: np.ndarray, prev_blocks: n
     for big_block_idx, indices in zone_detail_updates:
         data.append(big_block_idx)
         for idx in indices:
-            data.append(idx)
+            data.extend(struct.pack('<H', idx))  # u16索引
     
     # 存储色块更新
     for big_block_idx, unified_idx in zone_color_updates:
         data.append(big_block_idx)
-        data.append(unified_idx)
+        data.extend(struct.pack('<H', unified_idx))  # u16索引
     
     return bytes(data), False, 1, len(zone_color_updates), len(zone_detail_updates)
 
@@ -905,7 +905,7 @@ def write_header(path_h: pathlib.Path, frame_cnt: int, total_bytes: int, strip_c
             #define FRAME_TYPE_P        0x01
             
             // 特殊标记
-            #define COLOR_BLOCK_MARKER  0xFF
+            #define COLOR_BLOCK_MARKER  0xFFFF
             
             // 块参数 - 4x4块和8x8大块
             #define BLOCK_WIDTH         4

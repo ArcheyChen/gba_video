@@ -146,7 +146,7 @@ IWRAM_CODE inline void decode_color_8x8_block(const YUV_Struct &yuv_data, u16* d
 }
 
 // 通用的8x8大块解码函数（纹理块）
-IWRAM_CODE inline void decode_8x8_big_block(const YUV_Struct* codebook, const u8 quant_indices[4], u16* big_block_dst)
+IWRAM_CODE inline void decode_8x8_big_block(const YUV_Struct* codebook, const u16 quant_indices[4], u16* big_block_dst)
 {
     // 解码4个4x4块组成8x8大块
     decode_4x4_block(codebook[quant_indices[0]], big_block_dst);                           // 左上
@@ -209,19 +209,24 @@ IWRAM_CODE void decode_strip_i_frame_unified(int strip_idx, const u8* src, u16* 
         u16* big_block_dst = strip_dst + big_block_relative_offsets[big_block_idx];
         
         // 读取第一个索引
-        u8 first_idx = *src++;
+        u16 first_idx = src[0] | (src[1] << 8);
+        src += 2;
         
-        if (first_idx == 0xFF) {
+        if (first_idx == 0xFFFF) {
             // 色块：读取统一码本索引
-            u8 unified_idx = *src++;
+            u16 unified_idx = src[0] | (src[1] << 8);
+            src += 2;
             decode_color_8x8_block(unified_codebook[unified_idx], big_block_dst);
         } else {
             // 纹理块：已经读了第一个索引，再读3个
-            u8 quant_indices[4];
+            u16 quant_indices[4];
             quant_indices[0] = first_idx;
-            quant_indices[1] = *src++;
-            quant_indices[2] = *src++;
-            quant_indices[3] = *src++;
+            quant_indices[1] = src[0] | (src[1] << 8);
+            src += 2;
+            quant_indices[2] = src[0] | (src[1] << 8);
+            src += 2;
+            quant_indices[3] = src[0] | (src[1] << 8);
+            src += 2;
             decode_8x8_big_block(unified_codebook, quant_indices, big_block_dst);
         }
     }
@@ -243,9 +248,10 @@ IWRAM_CODE void decode_strip_p_frame_unified(int strip_idx, const u8* src, u16* 
     for (u8 i = 0; i < detail_blocks_to_update; i++) {
         u8 big_block_idx = *src++;
         
-        u8 quant_indices[4];
+        u16 quant_indices[4];
         for (int j = 0; j < 4; j++) {
-            quant_indices[j] = *src++;
+            quant_indices[j] = src[0] | (src[1] << 8);
+            src += 2;
         }
         
         u16* big_block_dst = dst + strip_base_offset + big_block_relative_offsets[big_block_idx];
@@ -255,7 +261,8 @@ IWRAM_CODE void decode_strip_p_frame_unified(int strip_idx, const u8* src, u16* 
     // 处理色块更新
     for (u8 i = 0; i < color_blocks_to_update; i++) {
         u8 big_block_idx = *src++;
-        u8 unified_idx = *src++;
+        u16 unified_idx = src[0] | (src[1] << 8);
+        src += 2;
         
         u16* big_block_dst = dst + strip_base_offset + big_block_relative_offsets[big_block_idx];
         decode_color_8x8_block(unified_codebook[unified_idx], big_block_dst);
