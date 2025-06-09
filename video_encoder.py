@@ -26,11 +26,12 @@ CR_COEFF = np.array([ 0.35714286, -0.28571429, -0.07142857])
 BLOCK_W, BLOCK_H = 2, 2
 BYTES_PER_BLOCK  = 19  # 16Y + d_r + d_g + d_b (4x4块)
 
-# 新增常量 - 8x8大块
+# 新增常量 - 8x8大块和zone
 BIG_BLOCK_W = 8  # 8x8大块宽度
 BIG_BLOCK_H = 8  # 8x8大块高度
-ZONE_HEIGHT_PIXELS = HEIGHT  # 每个区域覆盖整个条带高度
-ZONE_WIDTH_PIXELS = WIDTH    # 每个区域覆盖整个条带宽度
+ZONE_HEIGHT_PIXELS = 16  # 每个区域的像素高度
+ZONE_HEIGHT_BIG_BLOCKS = ZONE_HEIGHT_PIXELS // BIG_BLOCK_H  # 每个区域的8x8大块行数（2行）
+MAX_BIG_BLOCKS_PER_ZONE = 240  # 每个zone最多240个大块（30×8）
 
 # 帧类型标识
 FRAME_TYPE_I = 0x00  # I帧（关键帧）
@@ -361,7 +362,7 @@ def encode_strip_i_frame_unified(blocks: np.ndarray, unified_codebook: np.ndarra
 def encode_strip_differential_unified(current_blocks: np.ndarray, prev_blocks: np.ndarray,
                                      unified_codebook: np.ndarray, block_types: dict, 
                                      diff_threshold: float, force_i_threshold: float = 0.7) -> tuple:
-    """差分编码当前条带（统一码本）"""
+    """差分编码当前条带（统一码本 + zone支持）"""
     if prev_blocks is None or current_blocks.shape != prev_blocks.shape:
         i_frame_data = encode_strip_i_frame_unified(current_blocks, unified_codebook, block_types)
         return i_frame_data, True, 0, 0, 0
@@ -385,17 +386,12 @@ def encode_strip_differential_unified(current_blocks: np.ndarray, prev_blocks: n
     big_blocks_h = blocks_h // 2
     big_blocks_w = blocks_w // 2
     
-    # 检查8x8大块总数是否超出u8范围
-    max_big_blocks = big_blocks_h * big_blocks_w
-    if max_big_blocks > 255:
-        print(f"警告: 8x8大块数量 {max_big_blocks} 超出u8范围，强制使用I帧")
-        i_frame_data = encode_strip_i_frame_unified(current_blocks, unified_codebook, block_types)
-        return i_frame_data, True, 0, 0, 0
+    # 计算zone数量
+    strip_height_pixels = blocks_h * 4  # 4x4块转像素
+    zones_per_strip = (strip_height_pixels + ZONE_HEIGHT_PIXELS - 1) // ZONE_HEIGHT_PIXELS
     
-    # 现在每个条带就是一个zone
-    zone_detail_updates = []
-    zone_color_updates = []
-    total_updated_blocks = 0
+    # 按zone组织更新
+    zone_updates = {}  # {zone_idx: {'detail': [], 'color': []}}
     
     for big_by in range(big_blocks_h):
         for big_bx in range(big_blocks_w):
@@ -414,15 +410,25 @@ def encode_strip_differential_unified(current_blocks: np.ndarray, prev_blocks: n
                         break
             
             if needs_update:
-                # 计算在条带内的相对坐标
-                big_block_idx = big_by * big_blocks_w + big_bx
+                # 计算所属zone
+                big_block_y_pixel = big_by * BIG_BLOCK_H
+                zone_idx = big_block_y_pixel // ZONE_HEIGHT_PIXELS
                 
-                # 确保索引在u8范围内
-                if big_block_idx > 255:
-                    print(f"警告: big_block_idx {big_block_idx} 超出u8范围，跳过此块")
+                if zone_idx >= zones_per_strip:
                     continue
                 
-                total_updated_blocks += 4
+                # 计算在zone内的相对索引
+                zone_start_big_by = zone_idx * ZONE_HEIGHT_BIG_BLOCKS
+                relative_big_by = big_by - zone_start_big_by
+                zone_relative_idx = relative_big_by * big_blocks_w + big_bx
+                
+                # 检查是否超出zone范围
+                if zone_relative_idx >= MAX_BIG_BLOCKS_PER_ZONE:
+                    print(f"警告: zone_relative_idx {zone_relative_idx} 超出范围，跳过")
+                    continue
+                
+                if zone_idx not in zone_updates:
+                    zone_updates[zone_idx] = {'detail': [], 'color': []}
                 
                 if (big_by, big_bx) in block_types and block_types[(big_by, big_bx)][0] == 'color':
                     # 色块更新
@@ -437,7 +443,7 @@ def encode_strip_differential_unified(current_blocks: np.ndarray, prev_blocks: n
                         avg_block[i] = np.clip(avg_val, -128, 127).astype(np.int8).view(np.uint8)
                     
                     color_idx = quantize_blocks_unified(avg_block.reshape(1, -1), unified_codebook)[0]
-                    zone_color_updates.append((big_block_idx, color_idx))
+                    zone_updates[zone_idx]['color'].append((zone_relative_idx, color_idx))
                 else:
                     # 纹理块更新
                     indices = []
@@ -448,16 +454,11 @@ def encode_strip_differential_unified(current_blocks: np.ndarray, prev_blocks: n
                             indices.append(unified_idx)
                         else:
                             indices.append(0)
-                    zone_detail_updates.append((big_block_idx, indices))
+                    zone_updates[zone_idx]['detail'].append((zone_relative_idx, indices))
     
-    # 检查更新数量是否超出u8范围
-    if len(zone_detail_updates) > 255 or len(zone_color_updates) > 255:
-        print(f"警告: 更新数量超出u8范围 (纹理:{len(zone_detail_updates)}, 色块:{len(zone_color_updates)})，强制使用I帧")
-        i_frame_data = encode_strip_i_frame_unified(current_blocks, unified_codebook, block_types)
-        return i_frame_data, True, 0, 0, 0
-    
-    # 判断是否需要I帧
-    update_ratio = total_updated_blocks / total_blocks
+    # 检查是否需要I帧
+    total_updated_blocks = sum(len(z['detail']) + len(z['color']) for z in zone_updates.values()) * 4
+    update_ratio = total_updated_blocks / total_blocks if total_blocks > 0 else 0
     if update_ratio > force_i_threshold:
         i_frame_data = encode_strip_i_frame_unified(current_blocks, unified_codebook, block_types)
         return i_frame_data, True, 0, 0, 0
@@ -466,22 +467,49 @@ def encode_strip_differential_unified(current_blocks: np.ndarray, prev_blocks: n
     data = bytearray()
     data.append(FRAME_TYPE_P)
     
-    # 编码更新
-    data.append(len(zone_detail_updates))
-    data.append(len(zone_color_updates))
+    # 计算实际需要的zone数量
+    active_zones = sorted(zone_updates.keys())
+    num_zones = len(active_zones)
     
-    # 存储纹理块更新
-    for big_block_idx, indices in zone_detail_updates:
-        data.append(big_block_idx)
-        for idx in indices:
-            data.extend(struct.pack('<H', idx))  # u16索引
+    # 存储zone数量（u8）
+    data.append(num_zones)
     
-    # 存储色块更新
-    for big_block_idx, unified_idx in zone_color_updates:
-        data.append(big_block_idx)
-        data.extend(struct.pack('<H', unified_idx))  # u16索引
+    # 编码每个活跃zone的数据
+    total_color_updates = 0
+    total_detail_updates = 0
     
-    return bytes(data), False, 1, len(zone_color_updates), len(zone_detail_updates)
+    for zone_idx in active_zones:
+        # 存储zone索引
+        data.append(zone_idx)
+        
+        zone_data = zone_updates[zone_idx]
+        detail_updates = zone_data['detail']
+        color_updates = zone_data['color']
+        
+        # 检查更新数量是否超出u8范围
+        if len(detail_updates) > 255 or len(color_updates) > 255:
+            print(f"警告: zone {zone_idx} 更新数量超出u8范围，强制使用I帧")
+            i_frame_data = encode_strip_i_frame_unified(current_blocks, unified_codebook, block_types)
+            return i_frame_data, True, 0, 0, 0
+        
+        data.append(len(detail_updates))
+        data.append(len(color_updates))
+        
+        # 存储纹理块更新
+        for zone_relative_idx, indices in detail_updates:
+            data.append(zone_relative_idx)
+            for idx in indices:
+                data.extend(struct.pack('<H', idx))
+        
+        # 存储色块更新
+        for zone_relative_idx, unified_idx in color_updates:
+            data.append(zone_relative_idx)
+            data.extend(struct.pack('<H', unified_idx))
+        
+        total_color_updates += len(color_updates)
+        total_detail_updates += len(detail_updates)
+    
+    return bytes(data), False, len(active_zones), total_color_updates, total_detail_updates
 
 def generate_gop_unified_codebooks(frames: list, strip_count: int, i_frame_interval: int,
                                   variance_threshold: float, codebook_size: int = DEFAULT_UNIFIED_CODEBOOK_SIZE,
@@ -913,6 +941,11 @@ def write_header(path_h: pathlib.Path, frame_cnt: int, total_bytes: int, strip_c
             #define BIG_BLOCK_WIDTH     8
             #define BIG_BLOCK_HEIGHT    8
             #define BYTES_PER_BLOCK     {BYTES_PER_BLOCK}
+            
+            // Zone参数
+            #define ZONE_HEIGHT_PIXELS  {ZONE_HEIGHT_PIXELS}
+            #define ZONE_HEIGHT_BIG_BLOCKS  {ZONE_HEIGHT_BIG_BLOCKS}
+            #define MAX_BIG_BLOCKS_PER_ZONE {MAX_BIG_BLOCKS_PER_ZONE}
 
             // 条带高度数组
             extern const unsigned char strip_heights[VIDEO_STRIP_COUNT];
