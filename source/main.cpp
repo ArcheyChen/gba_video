@@ -21,6 +21,20 @@ constexpr int PIXELS_PER_FRAME = SCREEN_WIDTH * SCREEN_HEIGHT;
 EWRAM_BSS u16 ewramBuffer[PIXELS_PER_FRAME];
 IWRAM_DATA static u8 clip_table_raw[512];
 u8* clip_lookup_table = clip_table_raw + 128;
+IWRAM_DATA static s8 bayer_bias_4_2x2[4][4] =
+//  {};
+{
+    {-2, 0, 1, -1},
+    {-1, 0, 1, 0},
+    {0, -1, 0,1},
+    {0, -1, 1, -2}
+};
+// IWRAM_DATA const  s8 bayer_bias1d[16] = {
+//         -4,  0, -3,  1,
+//          2, -2,  3, -1,
+//         -3,  1, -4,  0,
+//          4,  0,  3, -2
+//     };
 
 struct YUV_Struct{
     u8 y[2][2];
@@ -54,14 +68,14 @@ void init_table(){
     }
 }
 
-IWRAM_CODE inline u32 yuv_to_rgb555_2pix(const u8 y[2], s8 d_r, s8 d_g, s8 d_b)
+IWRAM_CODE inline u32 yuv_to_rgb555_2pix(const u8 y[2], s8 d_r, s8 d_g, s8 d_b, const s8* bayer_bias)
 {
-    u8 _y = y[0];
+    s16 _y = y[0] + bayer_bias[0];
     u32 result = clip_lookup_table[_y + d_r];
     result |= (clip_lookup_table[_y + d_g] << 5);
     result |= (clip_lookup_table[_y + d_b] << 10);
 
-    _y = y[1];
+    _y = y[1] + bayer_bias[1];
     result |= (clip_lookup_table[_y + d_r] << 16);
     result |= (clip_lookup_table[_y + d_g] << 21);
     result |= (clip_lookup_table[_y + d_b] << 26);
@@ -112,8 +126,10 @@ void init_strip_info(){
     }
 }
 
+
+
 // 解码单个2x2块
-IWRAM_CODE inline void decode_block(const YUV_Struct &yuv_data, u16* dst)
+IWRAM_CODE inline void decode_block(const YUV_Struct &yuv_data, u16* dst, u8 bayer_idx)
 {
     const s8 &d_r = yuv_data.d_r;
     const s8 &d_g = yuv_data.d_g;
@@ -121,9 +137,9 @@ IWRAM_CODE inline void decode_block(const YUV_Struct &yuv_data, u16* dst)
 
     u32* dst_row = (u32*)dst;
     *dst_row = yuv_to_rgb555_2pix(
-        yuv_data.y[0], d_r, d_g, d_b);
+        yuv_data.y[0], d_r, d_g, d_b, bayer_bias_4_2x2[bayer_idx]);
     *(dst_row + SCREEN_WIDTH/2) = yuv_to_rgb555_2pix(
-        yuv_data.y[1], d_r, d_g, d_b);
+        yuv_data.y[1], d_r, d_g, d_b,bayer_bias_4_2x2[bayer_idx]+2);
 }
 
 // 解码色块（2x2上采样到4x4）
@@ -143,41 +159,38 @@ IWRAM_CODE inline void decode_color_block(const YUV_Struct &yuv_data, u16* dst)
     u8 y_33[2] = {yuv_data.y[1][0], yuv_data.y[1][0]}; // 3,3
     u8 y_44[2] = {yuv_data.y[1][1], yuv_data.y[1][1]}; // 4,4
     
-    // 生成4个2像素组合
-    u32 pix_11 = yuv_to_rgb555_2pix(y_11, d_r, d_g, d_b);
-    u32 pix_22 = yuv_to_rgb555_2pix(y_22, d_r, d_g, d_b);
-    u32 pix_33 = yuv_to_rgb555_2pix(y_33, d_r, d_g, d_b);
-    u32 pix_44 = yuv_to_rgb555_2pix(y_44, d_r, d_g, d_b);
+    // u32 pix_33 = yuv_to_rgb555_2pix(y_33, d_r, d_g, d_b,bayer_bias_4_2x2[2]);
+    // u32 pix_44 = yuv_to_rgb555_2pix(y_44, d_r, d_g, d_b,bayer_bias_4_2x2[3]);
 
     u32* dst_row = (u32*)dst;
     
     // 第一行：1122
-    *dst_row = pix_11;
-    *(dst_row + 1) = pix_22;
+    *dst_row = yuv_to_rgb555_2pix(y_11, d_r, d_g, d_b,bayer_bias_4_2x2[0]);;
+    *(dst_row + 1) = yuv_to_rgb555_2pix(y_22, d_r, d_g, d_b,bayer_bias_4_2x2[1]);
     
     // 第二行：1122
     dst_row += SCREEN_WIDTH/2;
-    *dst_row = pix_11;
-    *(dst_row + 1) = pix_22;
+    *dst_row = yuv_to_rgb555_2pix(y_11, d_r, d_g, d_b,bayer_bias_4_2x2[2]);;
+    *(dst_row + 1) = yuv_to_rgb555_2pix(y_22, d_r, d_g, d_b,bayer_bias_4_2x2[3]);
     
     // 第三行：3344
     dst_row += SCREEN_WIDTH/2;
-    *dst_row = pix_33;
-    *(dst_row + 1) = pix_44;
+    *dst_row = yuv_to_rgb555_2pix(y_33, d_r, d_g, d_b,bayer_bias_4_2x2[0]);
+    *(dst_row + 1) = yuv_to_rgb555_2pix(y_44, d_r, d_g, d_b,bayer_bias_4_2x2[1]);
     
     // 第四行：3344
     dst_row += SCREEN_WIDTH/2;
-    *dst_row = pix_33;
-    *(dst_row + 1) = pix_44;
+    *dst_row = yuv_to_rgb555_2pix(y_33, d_r, d_g, d_b,bayer_bias_4_2x2[2]);
+    *(dst_row + 1) = yuv_to_rgb555_2pix(y_44, d_r, d_g, d_b,bayer_bias_4_2x2[3]);
 }
 
 // 通用的4x4大块解码函数（纹理块）
 IWRAM_CODE void decode_big_block(const YUV_Struct* codebook, const u8 quant_indices[4], u16* big_block_dst)
 {
-    decode_block(codebook[quant_indices[0]], big_block_dst);
-    decode_block(codebook[quant_indices[1]], big_block_dst + 2);
-    decode_block(codebook[quant_indices[2]], big_block_dst + SCREEN_WIDTH * 2);
-    decode_block(codebook[quant_indices[3]], big_block_dst + SCREEN_WIDTH * 2 + 2);
+    decode_block(codebook[quant_indices[0]], big_block_dst ,0);
+    decode_block(codebook[quant_indices[1]], big_block_dst + 2,1);
+    decode_block(codebook[quant_indices[2]], big_block_dst + SCREEN_WIDTH * 2,2);
+    decode_block(codebook[quant_indices[3]], big_block_dst + SCREEN_WIDTH * 2 + 2,3);
 }
 
 // DMA拷贝码本的辅助函数
