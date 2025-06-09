@@ -459,5 +459,21 @@ int main()
         if(frame >= VIDEO_FRAME_COUNT) {
             frame = 0;
         }
+        scanKeys();
+        u16 keys = keysDown();
+        
+        if (keys & KEY_START) {
+            // 暂停功能
+            while (!(keysDown() & KEY_START)) {
+                scanKeys();
+                VBlankIntrWait();
+            }
+        }
+        
+        if (keys & KEY_A) {
+            // 快进：跳过5帧
+            frame += 5;
+            if (frame >= VIDEO_FRAME_COUNT) frame = 0;
+        }
     }
 }
