@@ -325,43 +325,23 @@ IWRAM_CODE void decode_strip_p_frame_unified_with_big_block(int strip_idx, const
     u8 zone_idx = 0;
     while (zone_bitmap) {
         if (zone_bitmap & 1) {
-            // 读取纹理块更新数量
+            // 读取三种类型的更新数量
             u8 detail_blocks_to_update = *src++;
-            
-            // 读取色块更新数量
             u8 color_blocks_to_update = *src++;
+            u8 big_block_to_update = *src++;
             
             // 计算区域在条带中的起始大块行
             u16 zone_start_big_by = zone_idx * ZONE_HEIGHT_BIG_BLOCKS;
             
-            // 处理纹理块更新
+            // 处理纹理块更新（小块模式，4个索引）
             for (u8 i = 0; i < detail_blocks_to_update; i++) {
                 u8 zone_relative_idx = *src++;
                 
-                // 读取第一个字节判断编码类型
-                u8 first_byte = *src++;
-                
                 u8 quant_indices[4];
-                
-                if (first_byte == COMPLEX_TEXTURE_MARKER) {
-                    // 大块索引模式：读取1个大块索引
-                    u8 big_block_idx_val = *src++;
-                    if (big_block_idx_val < EFFECTIVE_BIG_BLOCK_CODEBOOK_SIZE) {
-                        quant_indices[0] = big_block_codebook[big_block_idx_val][0];
-                        quant_indices[1] = big_block_codebook[big_block_idx_val][1];
-                        quant_indices[2] = big_block_codebook[big_block_idx_val][2];
-                        quant_indices[3] = big_block_codebook[big_block_idx_val][3];
-                    } else {
-                        // 错误情况，使用默认值
-                        quant_indices[0] = quant_indices[1] = quant_indices[2] = quant_indices[3] = 0;
-                    }
-                } else {
-                    // 默认小块模式：当前字节是第一个索引，继续读取3个
-                    quant_indices[0] = first_byte;
-                    quant_indices[1] = *src++;
-                    quant_indices[2] = *src++;
-                    quant_indices[3] = *src++;
-                }
+                quant_indices[0] = *src++;
+                quant_indices[1] = *src++;
+                quant_indices[2] = *src++;
+                quant_indices[3] = *src++;
                 
                 // 将区域相对坐标转换为条带内的绝对坐标
                 u16 relative_big_by = zone_relative_idx / strip_big_blocks_w;
@@ -373,17 +353,9 @@ IWRAM_CODE void decode_strip_p_frame_unified_with_big_block(int strip_idx, const
                 decode_big_block(unified_codebook, quant_indices, big_block_dst);
             }
             
-            // 处理色块更新
+            // 处理色块更新（1个统一码本索引）
             for (u8 i = 0; i < color_blocks_to_update; i++) {
                 u8 zone_relative_idx = *src++;
-                
-                // 跳过COLOR_BLOCK_MARKER（已在编码时写入）
-                u8 marker = *src++;
-                if (marker != COLOR_BLOCK_MARKER) {
-                    // 错误处理：如果不是预期的标记，回退一步
-                    src--;
-                }
-                
                 u8 unified_idx = *src++;
                 
                 // 将区域相对坐标转换为条带内的绝对坐标
@@ -394,6 +366,33 @@ IWRAM_CODE void decode_strip_p_frame_unified_with_big_block(int strip_idx, const
                 
                 u16* big_block_dst = dst + strip_base_offset + big_block_relative_offsets[big_block_idx];
                 decode_color_block(unified_codebook[unified_idx], big_block_dst);
+            }
+            
+            // 处理大块索引更新（1个大块索引）
+            for (u8 i = 0; i < big_block_to_update; i++) {
+                u8 zone_relative_idx = *src++;
+                u8 big_block_idx_val = *src++;
+                
+                u8 quant_indices[4];
+                if (big_block_idx_val < EFFECTIVE_BIG_BLOCK_CODEBOOK_SIZE) {
+                    // 从大块索引码表获取4个统一码本索引
+                    quant_indices[0] = big_block_codebook[big_block_idx_val][0];
+                    quant_indices[1] = big_block_codebook[big_block_idx_val][1];
+                    quant_indices[2] = big_block_codebook[big_block_idx_val][2];
+                    quant_indices[3] = big_block_codebook[big_block_idx_val][3];
+                } else {
+                    // 错误情况，使用默认处理
+                    quant_indices[0] = quant_indices[1] = quant_indices[2] = quant_indices[3] = 0;
+                }
+                
+                // 将区域相对坐标转换为条带内的绝对坐标
+                u16 relative_big_by = zone_relative_idx / strip_big_blocks_w;
+                u16 relative_big_bx = zone_relative_idx % strip_big_blocks_w;
+                u16 absolute_big_by = zone_start_big_by + relative_big_by;
+                u16 big_block_idx = absolute_big_by * strip_big_blocks_w + relative_big_bx;
+                
+                u16* big_block_dst = dst + strip_base_offset + big_block_relative_offsets[big_block_idx];
+                decode_big_block(unified_codebook, quant_indices, big_block_dst);
             }
         }
         zone_bitmap >>= 1;

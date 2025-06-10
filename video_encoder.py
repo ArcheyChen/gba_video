@@ -858,7 +858,7 @@ def encode_strip_differential_unified_with_big_block(current_blocks: np.ndarray,
                                                    unified_codebook: np.ndarray, big_block_codebook: np.ndarray,
                                                    block_types: dict, big_block_usage: list,
                                                    diff_threshold: float, force_i_threshold: float = 0.7) -> tuple:
-    """差分编码当前条带（统一码本 + 大块索引）"""
+    """差分编码当前条带（统一码本 + 大块索引）- P帧使用三种类型拆分"""
     if prev_blocks is None or current_blocks.shape != prev_blocks.shape:
         i_frame_data = encode_strip_i_frame_unified_with_big_block(
             current_blocks, unified_codebook, big_block_codebook, block_types, big_block_usage)
@@ -888,9 +888,10 @@ def encode_strip_differential_unified_with_big_block(current_blocks: np.ndarray,
     if zones_count > 8:
         zones_count = 8
     
-    # 按区域组织更新
-    zone_detail_updates = [[] for _ in range(zones_count)]
-    zone_color_updates = [[] for _ in range(zones_count)]
+    # 按区域组织更新 - P帧拆分为三种类型
+    zone_detail_updates = [[] for _ in range(zones_count)]  # 纹理块（小块模式）
+    zone_color_updates = [[] for _ in range(zones_count)]   # 色块
+    zone_big_block_updates = [[] for _ in range(zones_count)]  # 大块索引模式
     total_updated_blocks = 0
     
     # 重建大块使用信息的映射
@@ -951,13 +952,13 @@ def encode_strip_differential_unified_with_big_block(current_blocks: np.ndarray,
                             use_big_block, best_big_idx, original_indices = big_block_usage_map[(big_by, big_bx)]
                             
                             if use_big_block:
-                                # 使用大块索引
-                                zone_detail_updates[zone_idx].append((zone_relative_idx, 'big_block', best_big_idx))
+                                # 使用大块索引模式
+                                zone_big_block_updates[zone_idx].append((zone_relative_idx, best_big_idx))
                             else:
                                 # 使用小块模式
-                                zone_detail_updates[zone_idx].append((zone_relative_idx, 'small_blocks', original_indices))
+                                zone_detail_updates[zone_idx].append((zone_relative_idx, original_indices))
                         else:
-                            # 兜底：直接量化
+                            # 兜底：直接量化为小块模式
                             indices = []
                             for by, bx in positions:
                                 if by < blocks_h and bx < blocks_w:
@@ -966,7 +967,7 @@ def encode_strip_differential_unified_with_big_block(current_blocks: np.ndarray,
                                     indices.append(unified_idx)
                                 else:
                                     indices.append(0)
-                            zone_detail_updates[zone_idx].append((zone_relative_idx, 'small_blocks', indices))
+                            zone_detail_updates[zone_idx].append((zone_relative_idx, indices))
     
     # 判断是否需要I帧
     update_ratio = total_updated_blocks / total_blocks
@@ -983,46 +984,50 @@ def encode_strip_differential_unified_with_big_block(current_blocks: np.ndarray,
     used_zones = 0
     total_color_updates = 0
     total_detail_updates = 0
+    total_big_block_updates = 0
     
     # 生成区域bitmap
     zone_bitmap = 0
     for zone_idx in range(zones_count):
-        if zone_detail_updates[zone_idx] or zone_color_updates[zone_idx]:
+        if zone_detail_updates[zone_idx] or zone_color_updates[zone_idx] or zone_big_block_updates[zone_idx]:
             zone_bitmap |= (1 << zone_idx)
             used_zones += 1
             total_color_updates += len(zone_color_updates[zone_idx])
             total_detail_updates += len(zone_detail_updates[zone_idx])
+            total_big_block_updates += len(zone_big_block_updates[zone_idx])
     
     data.append(zone_bitmap)
     
-    # 按区域编码更新
+    # 按区域编码更新 - P帧三种类型分别处理
     for zone_idx in range(zones_count):
         if zone_bitmap & (1 << zone_idx):
             detail_updates = zone_detail_updates[zone_idx]
             color_updates = zone_color_updates[zone_idx]
+            big_block_updates = zone_big_block_updates[zone_idx]
             
+            # 存储三种类型的更新数量
             data.append(len(detail_updates))
             data.append(len(color_updates))
+            data.append(len(big_block_updates))
             
-            # 存储纹理块更新
-            for relative_idx, update_type, *indices in detail_updates:
+            # 存储纹理块更新（小块模式：1字节位置 + 4字节索引）
+            for relative_idx, indices in detail_updates:
                 data.append(relative_idx)
-                if update_type == 'big_block':
-                    # 大块索引模式：FE标记 + 1字节大块索引
-                    data.append(COMPLEX_TEXTURE_MARKER)
-                    data.append(indices[0])
-                else:  # update_type == 'small_blocks'
-                    # 小块模式：直接4个统一码本索引
-                    for idx in indices[0]:
-                        data.append(idx)
+                for idx in indices:
+                    data.append(idx)
             
-            # 存储色块更新
+            # 存储色块更新（1字节位置 + 1字节统一码本索引）
             for relative_idx, unified_idx in color_updates:
                 data.append(relative_idx)
-                data.append(COLOR_BLOCK_MARKER)
                 data.append(unified_idx)
+            
+            # 存储大块索引更新（1字节位置 + 1字节大块索引）
+            for relative_idx, big_block_idx in big_block_updates:
+                data.append(relative_idx)
+                data.append(big_block_idx)
     
-    return bytes(data), False, used_zones, total_color_updates, total_detail_updates
+    total_updates = total_color_updates + total_detail_updates + total_big_block_updates
+    return bytes(data), False, used_zones, total_color_updates, total_updates
 
 def generate_gop_unified_codebooks_with_big_block(frames: list, strip_count: int, i_frame_interval: int,
                                                  variance_threshold: float, 
@@ -1175,15 +1180,15 @@ class EncodingStats:
         self.strip_stats[strip_idx]['i_bytes'] += size_bytes
     
     def add_p_frame(self, strip_idx, size_bytes, updates_count, zone_count, 
-                   color_updates=0, detail_updates=0):
+                   color_updates=0, detail_updates=0, big_block_updates=0):
         self.total_frames_processed += 1
         self.total_p_frames += 1
         self.total_p_frame_bytes += size_bytes
         self.p_frame_updates.append(updates_count)
         self.zone_usage[zone_count] += 1
         
-        # P帧开销：帧类型(1) + bitmap(1) + 每个区域的计数(2*zones)
-        overhead = 2 + zone_count * 2  # 大致估算
+        # P帧开销：帧类型(1) + bitmap(1) + 每个区域的计数(3*zones)
+        overhead = 2 + zone_count * 3  # 修正为3个计数
         self.total_p_overhead_bytes += overhead
         
         self.color_update_count += color_updates
@@ -1440,7 +1445,7 @@ def main():
                         index_size=max(0, index_size)
                     )
                 else:
-                    total_updates = color_updates + detail_updates
+                    total_updates = detail_updates  # detail_updates现在包含所有更新
                     
                     encoding_stats.add_p_frame(
                         strip_idx, len(strip_data), total_updates, used_zones,
