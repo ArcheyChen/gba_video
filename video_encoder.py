@@ -72,12 +72,9 @@ def pack_yuv420_strip(frame_bgr: np.ndarray, strip_y: int, strip_height: int) ->
     R = strip_bgr[:, :, 2].astype(np.float32)
 
     Y  = (R*Y_COEFF[0]  + G*Y_COEFF[1]  + B*Y_COEFF[2]).round()
-    Cb = (R*CB_COEFF[0] + G*CB_COEFF[1] + B*CB_COEFF[2]).round()
-    Cr = (R*CR_COEFF[0] + G*CR_COEFF[1] + B*CR_COEFF[2]).round()
+    Cb = (R*CB_COEFF[0] + G*CB_COEFF[1] + B*CB_COEFF[2])
+    Cr = (R*CR_COEFF[0] + G*CR_COEFF[1] + B*CR_COEFF[2])
 
-    Y  = np.clip(Y,  0, 255).astype(np.uint8)
-    Cb = np.clip(Cb, -128, 127).astype(np.int16)
-    Cr = np.clip(Cr, -128, 127).astype(np.int16)
 
     h, w = strip_bgr.shape[:2]
     blocks_h = h // BLOCK_H
@@ -87,13 +84,14 @@ def pack_yuv420_strip(frame_bgr: np.ndarray, strip_y: int, strip_height: int) ->
     Cb_blocks = Cb.reshape(blocks_h, BLOCK_H, blocks_w, BLOCK_W)
     Cr_blocks = Cr.reshape(blocks_h, BLOCK_H, blocks_w, BLOCK_W)
 
-    y_flat = (Y_blocks.transpose(0,2,1,3).reshape(blocks_h, blocks_w, 4) >> 1).astype(np.uint8)
-    cb_mean = np.clip(Cb_blocks.mean(axis=(1,3)).round(), -128, 127).astype(np.int16)
-    cr_mean = np.clip(Cr_blocks.mean(axis=(1,3)).round(), -128, 127).astype(np.int16)
+    y_flat = np.clip((Y_blocks.transpose(0,2,1,3).reshape(blocks_h, blocks_w, 4) / 2).round(), 0, 255).astype(np.uint8)
+
+    cb_mean = Cb_blocks.mean(axis=(1,3))
+    cr_mean = Cr_blocks.mean(axis=(1,3))
     
-    d_r = np.clip(cr_mean, -128, 127).astype(np.int8)
-    d_g = np.clip((-(cb_mean >> 1) - cr_mean) >> 1, -128, 127).astype(np.int8)
-    d_b = np.clip(cb_mean, -128, 127).astype(np.int8)
+    d_r = np.clip(cr_mean.round(), -128, 127).astype(np.int8)
+    d_g = np.clip(((-(cb_mean/2) - cr_mean) /2).round(), -128, 127).astype(np.int8)
+    d_b = np.clip(cb_mean.round(), -128, 127).astype(np.int8)
 
     block_array = np.zeros((blocks_h, blocks_w, BYTES_PER_BLOCK), dtype=np.uint8)
     block_array[..., 0:4] = y_flat
