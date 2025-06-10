@@ -13,6 +13,8 @@ from sklearn.cluster import MiniBatchKMeans
 from scipy.spatial.distance import cdist
 from collections import defaultdict
 import statistics
+from numba import jit, njit, types
+from numba.typed import List
 
 WIDTH, HEIGHT = 240, 160
 DEFAULT_STRIP_COUNT = 4
@@ -61,42 +63,74 @@ def calculate_strip_heights(height: int, strip_count: int) -> list:
     
     return strip_heights
 
-def pack_yuv420_strip(frame_bgr: np.ndarray, strip_y: int, strip_height: int) -> np.ndarray:
-    """向量化实现，把指定条带的 240×strip_height×3 BGR → YUV420"""
-    strip_bgr = frame_bgr[strip_y:strip_y + strip_height, :, :]
-    B = strip_bgr[:, :, 0].astype(np.float32)
-    G = strip_bgr[:, :, 1].astype(np.float32)
-    R = strip_bgr[:, :, 2].astype(np.float32)
+@njit
+def clip_value(value, min_val, max_val):
+    """Numba兼容的clip函数"""
+    if value < min_val:
+        return min_val
+    elif value > max_val:
+        return max_val
+    else:
+        return value
 
-    Y  = (R*Y_COEFF[0]  + G*Y_COEFF[1]  + B*Y_COEFF[2]).round()
-    Cb = (R*CB_COEFF[0] + G*CB_COEFF[1] + B*CB_COEFF[2])
-    Cr = (R*CR_COEFF[0] + G*CR_COEFF[1] + B*CR_COEFF[2])
-
-
-    h, w = strip_bgr.shape[:2]
-    blocks_h = h // BLOCK_H
-    blocks_w = w // BLOCK_W
-
-    Y_blocks  = Y.reshape(blocks_h, BLOCK_H, blocks_w, BLOCK_W)
-    Cb_blocks = Cb.reshape(blocks_h, BLOCK_H, blocks_w, BLOCK_W)
-    Cr_blocks = Cr.reshape(blocks_h, BLOCK_H, blocks_w, BLOCK_W)
-
-    y_flat = np.clip((Y_blocks.transpose(0,2,1,3).reshape(blocks_h, blocks_w, 4) / 2).round(), 0, 255).astype(np.uint8)
-
-    cb_mean = Cb_blocks.mean(axis=(1,3))
-    cr_mean = Cr_blocks.mean(axis=(1,3))
+@njit
+def pack_yuv420_strip_numba(bgr_strip, strip_height, width):
+    """Numba加速的YUV420转换"""
+    blocks_h = strip_height // BLOCK_H
+    blocks_w = width // BLOCK_W
     
-    d_r = np.clip(cr_mean.round(), -128, 127).astype(np.int8)
-    d_g = np.clip(((-(cb_mean/2) - cr_mean) /2).round(), -128, 127).astype(np.int8)
-    d_b = np.clip(cb_mean.round(), -128, 127).astype(np.int8)
-
     block_array = np.zeros((blocks_h, blocks_w, BYTES_PER_BLOCK), dtype=np.uint8)
-    block_array[..., 0:4] = y_flat
-    block_array[..., 4] = d_r.view(np.uint8)
-    block_array[..., 5] = d_g.view(np.uint8)
-    block_array[..., 6] = d_b.view(np.uint8)
+    
+    for by in range(blocks_h):
+        for bx in range(blocks_w):
+            # 提取2x2块
+            y_start = by * BLOCK_H
+            x_start = bx * BLOCK_W
+            
+            # BGR to YUV conversion for 2x2 block
+            cb_sum = 0.0
+            cr_sum = 0.0
+            y_values = np.zeros(4, dtype=np.uint8)
+            
+            idx = 0
+            for dy in range(BLOCK_H):
+                for dx in range(BLOCK_W):
+                    if y_start + dy < strip_height and x_start + dx < width:
+                        b = float(bgr_strip[y_start + dy, x_start + dx, 0])
+                        g = float(bgr_strip[y_start + dy, x_start + dx, 1])  
+                        r = float(bgr_strip[y_start + dy, x_start + dx, 2])
+                        
+                        y = r * 0.28571429 + g * 0.57142857 + b * 0.14285714
+                        cb = r * (-0.14285714) + g * (-0.28571429) + b * 0.42857143
+                        cr = r * 0.35714286 + g * (-0.28571429) + b * (-0.07142857)
+                        
+                        y_values[idx] = np.uint8(clip_value(y / 2.0, 0.0, 255.0))
+                        cb_sum += cb
+                        cr_sum += cr
+                        idx += 1
+            
+            # Store Y values
+            block_array[by, bx, 0:4] = y_values
+            
+            # Compute and store chroma
+            cb_mean = cb_sum / 4.0
+            cr_mean = cr_sum / 4.0
+            
+            d_r = clip_value(cr_mean, -128.0, 127.0)
+            d_g = clip_value((-(cb_mean/2.0) - cr_mean) / 2.0, -128.0, 127.0)  
+            d_b = clip_value(cb_mean, -128.0, 127.0)
+            
+            # 将有符号值转换为无符号字节存储
+            block_array[by, bx, 4] = np.uint8(np.int8(d_r).view(np.uint8))
+            block_array[by, bx, 5] = np.uint8(np.int8(d_g).view(np.uint8))
+            block_array[by, bx, 6] = np.uint8(np.int8(d_b).view(np.uint8))
     
     return block_array
+
+def pack_yuv420_strip(frame_bgr: np.ndarray, strip_y: int, strip_height: int) -> np.ndarray:
+    """使用Numba加速的YUV转换包装函数"""
+    strip_bgr = frame_bgr[strip_y:strip_y + strip_height, :, :]
+    return pack_yuv420_strip_numba(strip_bgr, strip_height, WIDTH)
 
 def calculate_block_variance(blocks_4x4: list) -> float:
     """计算4x4块的方差，用于判断是否为纯色块"""
@@ -108,10 +142,20 @@ def calculate_block_variance(blocks_4x4: list) -> float:
     y_array = np.array(y_values)
     return np.var(y_array)
 
+@njit
+def calculate_block_variance_numba(y_values):
+    """Numba加速的方差计算"""
+    mean_val = np.mean(y_values)
+    variance = 0.0
+    for val in y_values:
+        diff = val - mean_val
+        variance += diff * diff
+    return variance / len(y_values)
+
 def calculate_2x2_block_variance(block: np.ndarray) -> float:
     """计算单个2x2块的方差，用于判断是否为纯色"""
-    y_values = block[:4]  # 只取Y值
-    return np.var(y_values)
+    y_values = block[:4].astype(np.float64)
+    return calculate_block_variance_numba(y_values)
 
 def classify_4x4_blocks(blocks: np.ndarray, variance_threshold: float = 5.0) -> tuple:
     """将4x4块分类为大色块和纹理块"""
@@ -302,6 +346,31 @@ def generate_unified_codebook(all_blocks: list, codebook_size: int = DEFAULT_UNI
     
     return full_codebook
 
+@njit
+def quantize_blocks_distance_numba(blocks_for_clustering, codebook_for_clustering):
+    """Numba加速的块量化距离计算"""
+    n_blocks = blocks_for_clustering.shape[0]
+    n_codebook = codebook_for_clustering.shape[0]
+    indices = np.zeros(n_blocks, dtype=np.uint8)
+    
+    for i in range(n_blocks):
+        min_dist = np.inf
+        best_idx = 0
+        
+        for j in range(n_codebook):
+            dist = 0.0
+            for k in range(BYTES_PER_BLOCK):
+                diff = blocks_for_clustering[i, k] - codebook_for_clustering[j, k]
+                dist += diff * diff
+            
+            if dist < min_dist:
+                min_dist = dist
+                best_idx = j
+        
+        indices[i] = best_idx
+    
+    return indices
+
 def quantize_blocks_unified(blocks_data: np.ndarray, codebook: np.ndarray) -> np.ndarray:
     """使用统一码表对块进行量化（避免产生0xFF）"""
     if len(blocks_data) == 0:
@@ -313,41 +382,10 @@ def quantize_blocks_unified(blocks_data: np.ndarray, codebook: np.ndarray) -> np
     blocks_for_clustering = convert_blocks_for_clustering(blocks_data)
     codebook_for_clustering = convert_blocks_for_clustering(effective_codebook)
     
-    blocks_expanded = blocks_for_clustering[:, np.newaxis, :]
-    codebook_expanded = codebook_for_clustering[np.newaxis, :, :]
-    
-    diff = blocks_expanded - codebook_expanded
-    squared_distances = np.sum(diff * diff, axis=2)
-    indices = np.argmin(squared_distances, axis=1).astype(np.uint8)
+    # 使用Numba加速的距离计算
+    indices = quantize_blocks_distance_numba(blocks_for_clustering, codebook_for_clustering)
     
     return indices
-
-def convert_blocks_for_clustering(blocks_data: np.ndarray) -> np.ndarray:
-    """将块数据转换为正确的聚类格式"""
-    if len(blocks_data) == 0:
-        return blocks_data.astype(np.float32)
-    
-    if blocks_data.ndim > 2:
-        blocks_data = blocks_data.reshape(-1, BYTES_PER_BLOCK)
-    
-    blocks_float = blocks_data.astype(np.float32)
-    
-    for i in range(4, BYTES_PER_BLOCK):
-        blocks_float[:, i] = blocks_data[:, i].view(np.int8).astype(np.float32)
-    
-    return blocks_float
-
-def convert_codebook_from_clustering(codebook_float: np.ndarray) -> np.ndarray:
-    """将聚类结果转换回正确的块格式"""
-    codebook = np.zeros_like(codebook_float, dtype=np.uint8)
-    
-    codebook[:, 0:4] = np.clip(codebook_float[:, 0:4].round(), 0, 255).astype(np.uint8)
-    
-    for i in range(4, BYTES_PER_BLOCK):
-        clipped_values = np.clip(codebook_float[:, i].round(), -128, 127).astype(np.int8)
-        codebook[:, i] = clipped_values.view(np.uint8)
-    
-    return codebook
 
 def encode_strip_i_frame_unified(blocks: np.ndarray, unified_codebook: np.ndarray, 
                                 block_types: dict) -> bytes:
@@ -418,15 +456,10 @@ def encode_strip_differential_unified(current_blocks: np.ndarray, prev_blocks: n
     if total_blocks == 0:
         return b'', True, 0, 0, 0
     
-    # 计算块差异
+    # 使用Numba加速的块差异计算
     current_flat = current_blocks.reshape(-1, BYTES_PER_BLOCK)
     prev_flat = prev_blocks.reshape(-1, BYTES_PER_BLOCK)
-    
-    y_current = current_flat[:, :4].astype(np.int16)
-    y_prev = prev_flat[:, :4].astype(np.int16)
-    y_diff = np.abs(y_current - y_prev)
-    block_diffs_flat = y_diff.mean(axis=1)
-    block_diffs = block_diffs_flat.reshape(blocks_h, blocks_w)
+    block_diffs = compute_block_differences_numba(current_flat, prev_flat, blocks_h, blocks_w)
     
     big_blocks_h = blocks_h // 2
     big_blocks_w = blocks_w // 2
@@ -540,9 +573,57 @@ def encode_strip_differential_unified(current_blocks: np.ndarray, prev_blocks: n
     
     return bytes(data), False, used_zones, total_color_updates, total_detail_updates
 
+@njit
+def compute_block_differences_numba(current_flat, prev_flat, blocks_h, blocks_w):
+    """Numba加速的块差异计算"""
+    block_diffs = np.zeros((blocks_h, blocks_w), dtype=np.float64)
+    
+    for i in range(blocks_h * blocks_w):
+        y_diff_sum = 0.0
+        for j in range(4):  # 只计算Y分量差异
+            current_val = int(current_flat[i, j])
+            prev_val = int(prev_flat[i, j])
+            if current_val >= prev_val:
+                diff = current_val - prev_val
+            else:
+                diff = prev_val - current_val
+            y_diff_sum += diff
+        block_diffs[i // blocks_w, i % blocks_w] = y_diff_sum / 4.0
+    
+    return block_diffs
+
+@njit
+def identify_updated_blocks_numba(block_diffs, diff_threshold, blocks_h, blocks_w):
+    """Numba加速的更新块识别"""
+    big_blocks_h = blocks_h // 2
+    big_blocks_w = blocks_w // 2
+    updated_positions = []
+    
+    for big_by in range(big_blocks_h):
+        for big_bx in range(big_blocks_w):
+            needs_update = False
+            
+            # 检查4个2x2子块的位置
+            for sub_by in range(2):
+                for sub_bx in range(2):
+                    by = big_by * 2 + sub_by
+                    bx = big_bx * 2 + sub_bx
+                    
+                    if by < blocks_h and bx < blocks_w:
+                        if block_diffs[by, bx] > diff_threshold:
+                            needs_update = True
+                            break
+                if needs_update:
+                    break
+            
+            if needs_update:
+                updated_positions.append((big_by, big_bx))
+    
+    return updated_positions
+
 def identify_updated_big_blocks(current_blocks: np.ndarray, prev_blocks: np.ndarray,
                                diff_threshold: float) -> set:
-    """识别需要更新的4x4大块位置"""
+    """识别需要更新的4x4大块位置 - Numba加速版本"""
     if prev_blocks is None or current_blocks.shape != prev_blocks.shape:
         # 如果没有前一帧，所有大块都需要更新
         blocks_h, blocks_w = current_blocks.shape[:2]
@@ -551,41 +632,43 @@ def identify_updated_big_blocks(current_blocks: np.ndarray, prev_blocks: np.ndar
         return {(big_by, big_bx) for big_by in range(big_blocks_h) for big_bx in range(big_blocks_w)}
     
     blocks_h, blocks_w = current_blocks.shape[:2]
-    big_blocks_h = blocks_h // 2
-    big_blocks_w = blocks_w // 2
     
-    # 计算块差异
+    # 使用Numba加速的块差异计算
     current_flat = current_blocks.reshape(-1, BYTES_PER_BLOCK)
     prev_flat = prev_blocks.reshape(-1, BYTES_PER_BLOCK)
+    block_diffs = compute_block_differences_numba(current_flat, prev_flat, blocks_h, blocks_w)
     
-    y_current = current_flat[:, :4].astype(np.int16)
-    y_prev = prev_flat[:, :4].astype(np.int16)
-    y_diff = np.abs(y_current - y_prev)
-    block_diffs_flat = y_diff.mean(axis=1)
-    block_diffs = block_diffs_flat.reshape(blocks_h, blocks_w)
+    # 使用Numba加速的更新块识别
+    updated_list = identify_updated_blocks_numba(block_diffs, diff_threshold, blocks_h, blocks_w)
     
-    updated_big_blocks = set()
+    return set(updated_list)
+
+def convert_blocks_for_clustering(blocks_data: np.ndarray) -> np.ndarray:
+    """将块数据转换为正确的聚类格式"""
+    if len(blocks_data) == 0:
+        return blocks_data.astype(np.float32)
     
-    for big_by in range(big_blocks_h):
-        for big_bx in range(big_blocks_w):
-            needs_update = False
-            positions = [
-                (big_by * 2, big_bx * 2),
-                (big_by * 2, big_bx * 2 + 1),
-                (big_by * 2 + 1, big_bx * 2),
-                (big_by * 2 + 1, big_bx * 2 + 1)
-            ]
-            
-            for by, bx in positions:
-                if by < blocks_h and bx < blocks_w:
-                    if block_diffs[by, bx] > diff_threshold:
-                        needs_update = True
-                        break
-            
-            if needs_update:
-                updated_big_blocks.add((big_by, big_bx))
+    if blocks_data.ndim > 2:
+        blocks_data = blocks_data.reshape(-1, BYTES_PER_BLOCK)
     
-    return updated_big_blocks
+    blocks_float = blocks_data.astype(np.float32)
+    
+    for i in range(4, BYTES_PER_BLOCK):
+        blocks_float[:, i] = blocks_data[:, i].view(np.int8).astype(np.float32)
+    
+    return blocks_float
+
+def convert_codebook_from_clustering(codebook_float: np.ndarray) -> np.ndarray:
+    """将聚类结果转换回正确的块格式"""
+    codebook = np.zeros_like(codebook_float, dtype=np.uint8)
+    
+    codebook[:, 0:4] = np.clip(codebook_float[:, 0:4].round(), 0, 255).astype(np.uint8)
+    
+    for i in range(4, BYTES_PER_BLOCK):
+        clipped_values = np.clip(codebook_float[:, i].round(), -128, 127).astype(np.int8)
+        codebook[:, i] = clipped_values.view(np.uint8)
+    
+    return codebook
 
 def extract_effective_blocks_from_big_blocks(blocks: np.ndarray, big_block_positions: set,
                                            variance_threshold: float = 5.0) -> list:
@@ -741,6 +824,8 @@ def generate_gop_unified_codebooks(frames: list, strip_count: int, i_frame_inter
                   f"总训练块{len(effective_blocks)}个")
     
     return gop_codebooks
+
+# ...existing code...
 
 class EncodingStats:
     """编码统计类"""
