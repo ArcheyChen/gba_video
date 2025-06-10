@@ -614,7 +614,7 @@ def generate_big_block_codebook(detail_big_blocks: list, unified_codebook: np.nd
     from collections import Counter
     tuple_counter = Counter()
     big_block_tuples = []
-    big_block_vectors = []  # 在YUV空间的向量表示
+    # big_block_vectors = []  # 在YUV空间的向量表示
     
     for big_block_data in detail_big_blocks:
         # 量化为统一码本索引
@@ -623,36 +623,36 @@ def generate_big_block_codebook(detail_big_blocks: list, unified_codebook: np.nd
         tuple_counter[tuple_key] += 1
         big_block_tuples.append(indices)
         
-        # Step 2: 投影到YUV连续空间（用于误差计算）
-        yuv_vector = []
-        for idx in indices:
-            block = unified_codebook[idx]
-            # 将7字节块转换为YUV连续值
-            y_values = block[:4].astype(np.float32) * 2  # 恢复Y值（之前>>1了）
-            d_r = block[4].view(np.int8).astype(np.float32)
-            d_g = block[5].view(np.int8).astype(np.float32)  
-            d_b = block[6].view(np.int8).astype(np.float32)
+    #     # Step 2: 投影到YUV连续空间（用于误差计算）
+    #     yuv_vector = []
+    #     for idx in indices:
+    #         block = unified_codebook[idx]
+    #         # 将7字节块转换为YUV连续值
+    #         y_values = block[:4].astype(np.float32) * 2  # 恢复Y值（之前>>1了）
+    #         d_r = block[4].view(np.int8).astype(np.float32)
+    #         d_g = block[5].view(np.int8).astype(np.float32)  
+    #         d_b = block[6].view(np.int8).astype(np.float32)
             
-            # 重建Cb, Cr
-            cb = d_b
-            cr = d_r
-            # d_g = (-(cb>>1) - cr) >> 1，反推：
-            # cb_half = cb >> 1 = cb // 2
-            # cr_plus_cb_half = cr + cb_half
-            # d_g = -cr_plus_cb_half >> 1
-            # 所以：cr_plus_cb_half = -d_g << 1 = -d_g * 2
-            # 但这样反推可能有精度损失，我们直接用d_r, d_g, d_b作为色度分量
+    #         # 重建Cb, Cr
+    #         cb = d_b
+    #         cr = d_r
+    #         # d_g = (-(cb>>1) - cr) >> 1，反推：
+    #         # cb_half = cb >> 1 = cb // 2
+    #         # cr_plus_cb_half = cr + cb_half
+    #         # d_g = -cr_plus_cb_half >> 1
+    #         # 所以：cr_plus_cb_half = -d_g << 1 = -d_g * 2
+    #         # 但这样反推可能有精度损失，我们直接用d_r, d_g, d_b作为色度分量
             
-            # 构建12维向量：4个Y值 + 4个Cb值 + 4个Cr值
-            # 为简化，我们对每个2x2块用相同的Cb,Cr
-            block_vector = np.concatenate([
-                y_values,  # 4个Y值
-                np.full(4, cb, dtype=np.float32),  # 4个Cb值
-                np.full(4, cr, dtype=np.float32)   # 4个Cr值
-            ])
-            yuv_vector.extend(block_vector)
+    #         # 构建12维向量：4个Y值 + 4个Cb值 + 4个Cr值
+    #         # 为简化，我们对每个2x2块用相同的Cb,Cr
+    #         block_vector = np.concatenate([
+    #             y_values,  # 4个Y值
+    #             np.full(4, cb, dtype=np.float32),  # 4个Cb值
+    #             np.full(4, cr, dtype=np.float32)   # 4个Cr值
+    #         ])
+    #         yuv_vector.extend(block_vector)
         
-        big_block_vectors.append(np.array(yuv_vector))
+    #     big_block_vectors.append(np.array(yuv_vector))
     
     # Step 3: 选择Top-K个最频繁的4-tuple作为码字
     most_common = tuple_counter.most_common(EFFECTIVE_BIG_BLOCK_CODEBOOK_SIZE)
@@ -674,37 +674,39 @@ def generate_big_block_codebook(detail_big_blocks: list, unified_codebook: np.nd
     # Step 4: 为每个大块计算是否使用大块索引
     big_block_usage = []
     
-    for i, (indices, big_vector) in enumerate(zip(big_block_tuples, big_block_vectors)):
+    # for i, (indices, big_vector) in enumerate(zip(big_block_tuples, big_block_vectors)):
+    for i, indices in enumerate(big_block_tuples):
         tuple_key = tuple(indices)
         
         if tuple_key in tuple_to_index:
             # 命中码表，计算YUV空间误差
             big_idx = tuple_to_index[tuple_key]
             
-            # 重建码表对应的YUV向量
-            reconstructed_vector = []
-            for idx in big_block_codebook[big_idx]:
-                block = unified_codebook[idx]
-                y_values = block[:4].astype(np.float32) * 2
-                d_r = block[4].view(np.int8).astype(np.float32)
-                d_g = block[5].view(np.int8).astype(np.float32)
-                d_b = block[6].view(np.int8).astype(np.float32)
+            # # 重建码表对应的YUV向量
+            # reconstructed_vector = []
+            # for idx in big_block_codebook[big_idx]:
+            #     block = unified_codebook[idx]
+            #     y_values = block[:4].astype(np.float32) * 2
+            #     d_r = block[4].view(np.int8).astype(np.float32)
+            #     d_g = block[5].view(np.int8).astype(np.float32)
+            #     d_b = block[6].view(np.int8).astype(np.float32)
                 
-                cb = d_b
-                cr = d_r
+            #     cb = d_b
+            #     cr = d_r
                 
-                block_vector = np.concatenate([
-                    y_values,
-                    np.full(4, cb, dtype=np.float32),
-                    np.full(4, cr, dtype=np.float32)
-                ])
-                reconstructed_vector.extend(block_vector)
+            #     block_vector = np.concatenate([
+            #         y_values,
+            #         np.full(4, cb, dtype=np.float32),
+            #         np.full(4, cr, dtype=np.float32)
+            #     ])
+            #     reconstructed_vector.extend(block_vector)
             
-            reconstructed_vector = np.array(reconstructed_vector)
+            # reconstructed_vector = np.array(reconstructed_vector)
             
-            # 计算L2误差
-            error = np.sum((big_vector - reconstructed_vector)**2)
-            use_big_block = error <= error_threshold
+            # # 计算L2误差
+            # error = np.sum((big_vector - reconstructed_vector)**2)
+            # use_big_block = error <= error_threshold
+            use_big_block = True  # 直接使用大块索引
             big_block_usage.append((use_big_block, big_idx, indices))
         else:
             # 未命中码表，使用原始索引
@@ -862,13 +864,13 @@ def encode_strip_differential_unified_with_big_block(current_blocks: np.ndarray,
     if prev_blocks is None or current_blocks.shape != prev_blocks.shape:
         i_frame_data = encode_strip_i_frame_unified_with_big_block(
             current_blocks, unified_codebook, big_block_codebook, block_types, big_block_usage)
-        return i_frame_data, True, 0, 0, 0
+        return i_frame_data, True, 0, 0, 0, 0  # 添加大块更新数量参数
     
     blocks_h, blocks_w = current_blocks.shape[:2]
     total_blocks = blocks_h * blocks_w
     
     if total_blocks == 0:
-        return b'', True, 0, 0, 0
+        return b'', True, 0, 0, 0, 0  # 添加大块更新数量参数
     
     # 计算块差异
     current_flat = current_blocks.reshape(-1, BYTES_PER_BLOCK)
@@ -974,7 +976,7 @@ def encode_strip_differential_unified_with_big_block(current_blocks: np.ndarray,
     if update_ratio > force_i_threshold:
         i_frame_data = encode_strip_i_frame_unified_with_big_block(
             current_blocks, unified_codebook, big_block_codebook, block_types, big_block_usage)
-        return i_frame_data, True, 0, 0, 0
+        return i_frame_data, True, 0, 0, 0, 0  # 添加大块更新数量参数
     
     # 编码P帧
     data = bytearray()
@@ -1027,7 +1029,7 @@ def encode_strip_differential_unified_with_big_block(current_blocks: np.ndarray,
                 data.append(big_block_idx)
     
     total_updates = total_color_updates + total_detail_updates + total_big_block_updates
-    return bytes(data), False, used_zones, total_color_updates, total_updates
+    return bytes(data), False, used_zones, total_color_updates, total_detail_updates, total_big_block_updates
 
 def generate_gop_unified_codebooks_with_big_block(frames: list, strip_count: int, i_frame_interval: int,
                                                  variance_threshold: float, 
@@ -1157,6 +1159,7 @@ class EncodingStats:
         self.detail_block_bytes = 0
         self.color_update_count = 0
         self.detail_update_count = 0
+        self.big_block_update_count = 0  # 新增：大块更新统计
         
         # 条带统计
         self.strip_stats = defaultdict(lambda: {
@@ -1193,6 +1196,7 @@ class EncodingStats:
         
         self.color_update_count += color_updates
         self.detail_update_count += detail_updates
+        self.big_block_update_count += big_block_updates  # 新增统计
         
         self.strip_stats[strip_idx]['p_frames'] += 1
         self.strip_stats[strip_idx]['p_bytes'] += size_bytes
@@ -1265,6 +1269,13 @@ class EncodingStats:
             print(f"   最小更新块数: {min_updates}")
             print(f"   色块更新总数: {self.color_update_count:,}")
             print(f"   纹理块更新总数: {self.detail_update_count:,}")
+            print(f"   大块索引更新总数: {self.big_block_update_count:,}")
+            
+            # 计算大块索引使用比例
+            total_updates = self.color_update_count + self.detail_update_count + self.big_block_update_count
+            if total_updates > 0:
+                big_block_ratio = self.big_block_update_count / total_updates * 100
+                print(f"   大块索引使用率: {big_block_ratio:.1f}%")
         
         # 区域使用统计
         if self.zone_usage:
@@ -1428,7 +1439,7 @@ def main():
                     index_size=max(0, index_size)
                 )
             else:
-                strip_data, is_i_frame, used_zones, color_updates, detail_updates = encode_strip_differential_unified_with_big_block(
+                strip_data, is_i_frame, used_zones, color_updates, detail_updates, big_block_updates = encode_strip_differential_unified_with_big_block(
                     current_strip, prev_strips[strip_idx],
                     unified_codebook, big_block_codebook, block_types, big_block_usage,
                     args.diff_threshold, args.force_i_threshold
@@ -1445,11 +1456,11 @@ def main():
                         index_size=max(0, index_size)
                     )
                 else:
-                    total_updates = detail_updates  # detail_updates现在包含所有更新
+                    total_updates = color_updates + detail_updates + big_block_updates
                     
                     encoding_stats.add_p_frame(
                         strip_idx, len(strip_data), total_updates, used_zones,
-                        color_updates, detail_updates
+                        color_updates, detail_updates, big_block_updates
                     )
             
             frame_data.extend(struct.pack('<H', len(strip_data)))
