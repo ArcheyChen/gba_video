@@ -540,11 +540,112 @@ def encode_strip_differential_unified(current_blocks: np.ndarray, prev_blocks: n
     
     return bytes(data), False, used_zones, total_color_updates, total_detail_updates
 
+def identify_updated_big_blocks(current_blocks: np.ndarray, prev_blocks: np.ndarray,
+                               diff_threshold: float) -> set:
+    """识别需要更新的4x4大块位置"""
+    if prev_blocks is None or current_blocks.shape != prev_blocks.shape:
+        # 如果没有前一帧，所有大块都需要更新
+        blocks_h, blocks_w = current_blocks.shape[:2]
+        big_blocks_h = blocks_h // 2
+        big_blocks_w = blocks_w // 2
+        return {(big_by, big_bx) for big_by in range(big_blocks_h) for big_bx in range(big_blocks_w)}
+    
+    blocks_h, blocks_w = current_blocks.shape[:2]
+    big_blocks_h = blocks_h // 2
+    big_blocks_w = blocks_w // 2
+    
+    # 计算块差异
+    current_flat = current_blocks.reshape(-1, BYTES_PER_BLOCK)
+    prev_flat = prev_blocks.reshape(-1, BYTES_PER_BLOCK)
+    
+    y_current = current_flat[:, :4].astype(np.int16)
+    y_prev = prev_flat[:, :4].astype(np.int16)
+    y_diff = np.abs(y_current - y_prev)
+    block_diffs_flat = y_diff.mean(axis=1)
+    block_diffs = block_diffs_flat.reshape(blocks_h, blocks_w)
+    
+    updated_big_blocks = set()
+    
+    for big_by in range(big_blocks_h):
+        for big_bx in range(big_blocks_w):
+            needs_update = False
+            positions = [
+                (big_by * 2, big_bx * 2),
+                (big_by * 2, big_bx * 2 + 1),
+                (big_by * 2 + 1, big_bx * 2),
+                (big_by * 2 + 1, big_bx * 2 + 1)
+            ]
+            
+            for by, bx in positions:
+                if by < blocks_h and bx < blocks_w:
+                    if block_diffs[by, bx] > diff_threshold:
+                        needs_update = True
+                        break
+            
+            if needs_update:
+                updated_big_blocks.add((big_by, big_bx))
+    
+    return updated_big_blocks
+
+def extract_effective_blocks_from_big_blocks(blocks: np.ndarray, big_block_positions: set,
+                                           variance_threshold: float = 5.0) -> list:
+    """从指定的4x4大块位置提取有效的2x2块"""
+    blocks_h, blocks_w = blocks.shape[:2]
+    effective_blocks = []
+    
+    for big_by, big_bx in big_block_positions:
+        # 收集4x4大块内的4个2x2小块
+        blocks_4x4 = []
+        for sub_by in range(2):
+            for sub_bx in range(2):
+                by = big_by * 2 + sub_by
+                bx = big_bx * 2 + sub_bx
+                if by < blocks_h and bx < blocks_w:
+                    blocks_4x4.append(blocks[by, bx])
+                else:
+                    blocks_4x4.append(np.zeros(BYTES_PER_BLOCK, dtype=np.uint8))
+        
+        # 检查是否为色块（所有2x2子块内部一致）
+        all_2x2_blocks_are_uniform = True
+        for block in blocks_4x4:
+            if calculate_2x2_block_variance(block) > variance_threshold:
+                all_2x2_blocks_are_uniform = False
+                break
+        
+        if all_2x2_blocks_are_uniform:
+            # 色块：生成下采样的2x2块
+            downsampled_block = np.zeros(BYTES_PER_BLOCK, dtype=np.uint8)
+            
+            y_values = []
+            d_r_values = []
+            d_g_values = []
+            d_b_values = []
+            
+            for block in blocks_4x4:
+                avg_y = np.mean(block[:4])
+                y_values.append(int(avg_y))
+                d_r_values.append(block[4].view(np.int8))
+                d_g_values.append(block[5].view(np.int8))
+                d_b_values.append(block[6].view(np.int8))
+            
+            downsampled_block[:4] = np.array(y_values, dtype=np.uint8)
+            downsampled_block[4] = np.clip(np.mean(d_r_values), -128, 127).astype(np.int8).view(np.uint8)
+            downsampled_block[5] = np.clip(np.mean(d_g_values), -128, 127).astype(np.int8).view(np.uint8)
+            downsampled_block[6] = np.clip(np.mean(d_b_values), -128, 127).astype(np.int8).view(np.uint8)
+            
+            effective_blocks.append(downsampled_block)
+        else:
+            # 纹理块：添加所有4个2x2块
+            effective_blocks.extend(blocks_4x4)
+    
+    return effective_blocks
+
 def generate_gop_unified_codebooks(frames: list, strip_count: int, i_frame_interval: int,
-                                  variance_threshold: float, codebook_size: int = DEFAULT_UNIFIED_CODEBOOK_SIZE,
-                                  kmeans_max_iter: int = 100) -> dict:
-    """为每个GOP生成统一码本"""
-    print("正在为每个GOP生成统一码本...")
+                                  variance_threshold: float, diff_threshold: float,
+                                  codebook_size: int = DEFAULT_UNIFIED_CODEBOOK_SIZE,
+                                  kmeans_max_iter: int = 100, i_frame_weight: int = 3) -> dict:
+    """为每个GOP生成统一码本（只使用有效块，I帧块加权）"""
+    print("正在为每个GOP生成统一码本（基于有效块，I帧加权）...")
     
     gop_codebooks = {}
     
@@ -564,36 +665,80 @@ def generate_gop_unified_codebooks(frames: list, strip_count: int, i_frame_inter
         gop_codebooks[gop_start] = []
         
         for strip_idx in range(strip_count):
-            all_blocks = []
+            effective_blocks = []
             block_types_list = []
+            
+            # 统计信息（汇总整个GOP）
+            total_i_big_blocks = 0
+            total_p_big_blocks = 0
+            total_i_2x2_blocks = 0
+            total_p_2x2_blocks = 0
+            
+            # 处理GOP中的每一帧
+            prev_strip_blocks = None
             
             for frame_idx in range(gop_start, gop_end):
                 strip_blocks = frames[frame_idx][strip_idx]
-                if strip_blocks.size > 0:
-                    frame_blocks, block_types = classify_4x4_blocks_unified(strip_blocks, variance_threshold)
-                    all_blocks.extend(frame_blocks)
-                    block_types_list.append((frame_idx, block_types))
+                if strip_blocks.size == 0:
+                    continue
+                
+                # 确定帧类型和需要更新的大块
+                is_i_frame = (frame_idx == gop_start)  # GOP第一帧是I帧
+                
+                if is_i_frame:
+                    # I帧：所有大块都有效
+                    blocks_h, blocks_w = strip_blocks.shape[:2]
+                    big_blocks_h = blocks_h // 2
+                    big_blocks_w = blocks_w // 2
+                    updated_big_blocks = {(big_by, big_bx) for big_by in range(big_blocks_h) for big_bx in range(big_blocks_w)}
+                else:
+                    # P帧：只有更新的大块有效
+                    updated_big_blocks = identify_updated_big_blocks(strip_blocks, prev_strip_blocks, diff_threshold)
+                
+                # 从有效大块中提取2x2块
+                frame_effective_blocks = extract_effective_blocks_from_big_blocks(
+                    strip_blocks, updated_big_blocks, variance_threshold)
+                
+                # I帧块加权：复制多次以增加在聚类中的影响力
+                if is_i_frame:
+                    weighted_blocks = frame_effective_blocks * i_frame_weight  # 复制i_frame_weight次
+                    effective_blocks.extend(weighted_blocks)
+                    total_i_big_blocks += len(updated_big_blocks)
+                    total_i_2x2_blocks += len(frame_effective_blocks) * i_frame_weight
+                else:
+                    effective_blocks.extend(frame_effective_blocks)
+                    total_p_big_blocks += len(updated_big_blocks)
+                    total_p_2x2_blocks += len(frame_effective_blocks)
+                
+                # 生成完整的block_types用于编码（所有大块，不只是有效的）
+                frame_blocks, block_types = classify_4x4_blocks_unified(strip_blocks, variance_threshold)
+                block_types_list.append((frame_idx, block_types))
+                
+                prev_strip_blocks = strip_blocks.copy()
             
-            # 生成统一码本
-            unified_codebook = generate_unified_codebook(all_blocks, codebook_size, kmeans_max_iter)
+            # 使用有效块生成统一码本
+            unified_codebook = generate_unified_codebook(effective_blocks, codebook_size, kmeans_max_iter)
             
             gop_codebooks[gop_start].append({
                 'unified_codebook': unified_codebook,
                 'block_types_list': block_types_list,
-                'total_blocks_count': len(all_blocks)
+                'total_blocks_count': len(effective_blocks)
             })
             
-            # 统计色块和纹理块数量
-            color_count = 0
-            detail_count = 0
+            # 统计色块和纹理块数量（基于完整分类，不只是有效块）
+            total_color_count = 0
+            total_detail_count = 0
             for _, block_types in block_types_list:
                 for (big_by, big_bx), (block_type, _) in block_types.items():
                     if block_type == 'color':
-                        color_count += 1
+                        total_color_count += 1
                     else:
-                        detail_count += 1
+                        total_detail_count += 1
             
-            print(f"    条带{strip_idx}: 总块数{len(all_blocks)}, 色块{color_count}, 纹理块{detail_count}")
+            # 汇总输出一个条带的统计信息
+            print(f"    条带{strip_idx}: I帧{total_i_big_blocks}大块({total_i_2x2_blocks}块×{i_frame_weight}权重), "
+                  f"P帧{total_p_big_blocks}大块({total_p_2x2_blocks}块), "
+                  f"总训练块{len(effective_blocks)}个")
     
     return gop_codebooks
 
@@ -778,6 +923,8 @@ def main():
                    help=f"统一码本大小（默认{DEFAULT_UNIFIED_CODEBOOK_SIZE}）")
     pa.add_argument("--kmeans-max-iter", type=int, default=200)
     pa.add_argument("--threads", type=int, default=None)
+    pa.add_argument("--i-frame-weight", type=int, default=3,
+                   help="I帧块在聚类中的权重倍数（默认3）")
     args = pa.parse_args()
 
     cap = cv2.VideoCapture(args.input)
@@ -835,10 +982,11 @@ def main():
 
     print(f"总共提取了 {len(frames)} 帧")
 
-    # 生成统一码本
+    # 生成统一码本（传入diff_threshold和i_frame_weight参数）
     gop_codebooks = generate_gop_unified_codebooks(
         frames, args.strip_count, args.i_frame_interval, 
-        args.variance_threshold, args.codebook_size, args.kmeans_max_iter
+        args.variance_threshold, args.diff_threshold, args.codebook_size, 
+        args.kmeans_max_iter, args.i_frame_weight
     )
 
     # 编码所有帧
