@@ -16,7 +16,7 @@ WIDTH, HEIGHT = 240, 160
 DEFAULT_STRIP_COUNT = 4
 DEFAULT_UNIFIED_CODEBOOK_SIZE = 256   # 统一码本大小
 EFFECTIVE_UNIFIED_CODEBOOK_SIZE = 255  # 有效码本大小（0xFF保留）
-DEFAULT_BIG_BLOCK_CODEBOOK_SIZE = 64  # 4x4大块码表大小
+DEFAULT_BIG_BLOCK_CODEBOOK_SIZE = 128  # 4x4大块码表大小
 
 # 标记常量
 BIG_BLOCK_MARKER = 0xFF
@@ -561,8 +561,8 @@ def encode_strip_p_frame_with_big_blocks(current_blocks: np.ndarray, prev_blocks
     
     # 计算区域数量
     zones_count = (big_blocks_h + ZONE_HEIGHT_BIG_BLOCKS - 1) // ZONE_HEIGHT_BIG_BLOCKS
-    if zones_count > 8:
-        zones_count = 8
+    # if zones_count > 8:
+    #     zones_count = 8
     
     # 按区域组织更新
     zone_detail_updates = [[] for _ in range(zones_count)]
@@ -615,7 +615,8 @@ def encode_strip_p_frame_with_big_blocks(current_blocks: np.ndarray, prev_blocks
             total_detail_updates += len(zone_detail_updates[zone_idx])
             total_big_block_updates += len(zone_big_block_updates[zone_idx])
     
-    data.append(zone_bitmap)
+    # data.append(zone_bitmap)
+    data.extend(struct.pack('<H', zone_bitmap))
     
     # 按区域编码更新（现在只有2种类型）
     for zone_idx in range(zones_count):
@@ -850,7 +851,7 @@ class EncodingStats:
         self.zone_usage[zone_count] += 1
         
         # P帧开销：帧类型(1) + bitmap(1) + 每个区域的计数(2*zones)
-        overhead = 2 + zone_count * 2  # 现在只有2种块类型
+        overhead = 3 + zone_count * 2  # 现在只有2种块类型
         self.total_p_overhead_bytes += overhead
         
         # 详细更新统计

@@ -84,7 +84,7 @@ struct StripInfo {
 };
 
 IWRAM_DATA StripInfo strip_info[VIDEO_STRIP_COUNT];
-IWRAM_DATA u16 big_block_relative_offsets[240/4*80/4];
+IWRAM_DATA u16 big_block_relative_offsets[VIDEO_WIDTH * VIDEO_HEIGHT / 4 /4];  // 预计算的4x4大块相对偏移
 
 void init_strip_info(){
     u16 current_y = 0;
@@ -303,8 +303,9 @@ IWRAM_CODE void decode_strip_p_frame_with_big_blocks(int strip_idx, const u8* sr
     u16 strip_base_offset = strip_info[strip_idx].buffer_offset;
     
     // 读取区域bitmap
-    u8 zone_bitmap = *src++;
-    
+    // u8 zone_bitmap = *src++;
+    u16 zone_bitmap = *src++ | (*src++ << 8); // 使用u16以支持更多区域
+
     auto &big_block_codebook = strip_big_block_codebooks[strip_idx];
     auto &small_block_codebook = strip_small_block_codebooks[strip_idx];
     
