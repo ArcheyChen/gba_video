@@ -16,7 +16,7 @@ constexpr int PIXELS_PER_FRAME = SCREEN_WIDTH * SCREEN_HEIGHT;
 // 新增常量定义
 #define ZONE_HEIGHT_PIXELS 16  // 每个区域的像素高度
 #define ZONE_HEIGHT_BIG_BLOCKS (ZONE_HEIGHT_PIXELS / 4)  // 每个区域的4x4大块行数 (16像素/4 = 4行)
-#define BIG_BLOCK_MARKER 0xFE  // 4x4大块标记
+#define BIG_BLOCK_MARKER 0xFF  // 4x4大块标记
 #define BYTES_PER_BIG_BLOCK 28  // 16Y + 4*(d_r + d_g + d_b)
 
 // EWRAM 单缓冲
@@ -32,10 +32,6 @@ struct YUV_Struct{
 } __attribute__((packed));
 
 struct BigYUV_Struct{
-    // u8 y[16];     // 16个Y值
-    // s8 d_r[4];    // 4个d_r值
-    // s8 d_g[4];    // 4个d_g值  
-    // s8 d_b[4];    // 4个d_b值
     YUV_Struct y[4];  // 4个2x2小块，每个小块包含2x2的Y值和色度差
 } __attribute__((packed));
 

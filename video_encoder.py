@@ -15,12 +15,11 @@ from dither_opt import apply_dither_optimized
 WIDTH, HEIGHT = 240, 160
 DEFAULT_STRIP_COUNT = 4
 DEFAULT_UNIFIED_CODEBOOK_SIZE = 256   # 统一码本大小
-EFFECTIVE_UNIFIED_CODEBOOK_SIZE = 254  # 有效码本大小（0xFF保留）
-DEFAULT_BIG_BLOCK_CODEBOOK_SIZE = 256  # 4x4大块码表大小
+EFFECTIVE_UNIFIED_CODEBOOK_SIZE = 255  # 有效码本大小（0xFF保留）
+DEFAULT_BIG_BLOCK_CODEBOOK_SIZE = 64  # 4x4大块码表大小
 
 # 标记常量
-# COLOR_BLOCK_MARKER = 0xFF
-BIG_BLOCK_MARKER = 0xFE
+BIG_BLOCK_MARKER = 0xFF
 
 Y_COEFF  = np.array([0.28571429,  0.57142857,  0.14285714])
 CB_COEFF = np.array([-0.14285714, -0.28571429,  0.42857143])
@@ -282,10 +281,18 @@ def calculate_distortion_sad(original_blocks: list, reconstructed_blocks: list) 
     
     total_sad = 0.0
     for orig, recon in zip(original_blocks, reconstructed_blocks):
-        # 只计算Y分量的SAD
-        y_orig = orig[:4].astype(np.float32)
-        y_recon = recon[:4].astype(np.float32)
-        total_sad += np.sum(np.abs(y_orig - y_recon))
+        # Y分量的SAD（需要乘2还原）
+        y_orig = orig[:4].astype(np.float32) * 2.0  # 还原Y分量
+        y_recon = recon[:4].astype(np.float32) * 2.0  # 还原Y分量
+        y_sad = np.sum(np.abs(y_orig - y_recon))
+        
+        # CrCb分量的SAD（有符号数转换）
+        chroma_orig = orig[4:7].view(np.int8).astype(np.float32)  # d_r, d_g, d_b
+        chroma_recon = recon[4:7].view(np.int8).astype(np.float32)
+        chroma_sad = np.sum(np.abs(chroma_orig - chroma_recon))
+        
+        # 可以调整权重，这里Y和色度等权重
+        total_sad += y_sad + chroma_sad
     
     return total_sad / len(original_blocks)  # 平均SAD
 
@@ -304,7 +311,7 @@ def calculate_distortion_mse(original_blocks: list, reconstructed_blocks: list) 
     return total_mse / (len(original_blocks) * 4)  # 平均MSE
 
 # 默认使用SAD
-calculate_distortion = calculate_distortion_mse
+calculate_distortion = calculate_distortion_sad
 
 def classify_4x4_blocks_with_big_codebook(blocks: np.ndarray, big_block_codebook: np.ndarray,
                                         variance_threshold: float = 5.0, 
