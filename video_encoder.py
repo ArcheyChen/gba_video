@@ -638,7 +638,7 @@ def encode_strip_p_frame_with_big_blocks(current_blocks: np.ndarray, prev_blocks
                 data.append(big_idx)
     
     total_updates = total_detail_updates + total_big_block_updates
-    return bytes(data), False, used_zones, 0, total_detail_updates
+    return bytes(data), False, used_zones, total_big_block_updates, total_detail_updates
 
 def pack_big_block_from_2x2_blocks(blocks_2x2: list) -> np.ndarray:
     """将4个2x2块组合成一个4x4大块 - 适配新的BigYUV_Struct结构"""
@@ -669,7 +669,7 @@ def quantize_blocks_unified(blocks_data: np.ndarray, codebook: np.ndarray) -> np
     if len(blocks_data) == 0:
         return np.array([], dtype=np.uint8)
     
-    # 只使用前254项进行量化
+    # 只使用前若干项进行量化，因为最后几项用于特殊标记
     effective_codebook = codebook[:EFFECTIVE_UNIFIED_CODEBOOK_SIZE]
     
     blocks_for_clustering = convert_blocks_for_clustering(blocks_data)
@@ -693,9 +693,16 @@ def quantize_blocks_distance_numba(blocks_for_clustering, codebook_for_clusterin
         
         for j in range(n_codebook):
             dist = 0.0
-            for k in range(BYTES_PER_BLOCK):
+            # Y分量（前4个字节）使用2倍权重，计算SAD
+            for k in range(4):
                 diff = blocks_for_clustering[i, k] - codebook_for_clustering[j, k]
-                dist += diff * diff
+                dist += 2.0 * abs(diff)
+            
+            # 色度分量（后3个字节）使用1倍权重，计算SAD
+            # 注意：这里的数据已经在convert_blocks_for_clustering中转换为有符号数
+            for k in range(4, BYTES_PER_BLOCK):
+                diff = blocks_for_clustering[i, k] - codebook_for_clustering[j, k]
+                dist += abs(diff)
             
             if dist < min_dist:
                 min_dist = dist
@@ -835,7 +842,7 @@ class EncodingStats:
         self.strip_stats[strip_idx]['i_bytes'] += size_bytes
     
     def add_p_frame(self, strip_idx, size_bytes, updates_count, zone_count, 
-                   color_updates=0, detail_updates=0):
+               big_block_updates=0, detail_updates=0):  # 修改参数名和顺序
         self.total_frames_processed += 1
         self.total_p_frames += 1
         self.total_p_frame_bytes += size_bytes
@@ -848,8 +855,7 @@ class EncodingStats:
         
         # 详细更新统计
         self.detail_update_count += detail_updates
-        big_block_updates = updates_count - detail_updates
-        self.big_block_update_count += big_block_updates
+        self.big_block_update_count += big_block_updates  # 直接使用传入的值
         
         # 计算更新数据字节数
         detail_bytes = detail_updates * 5  # 1字节位置 + 4字节索引
@@ -1097,7 +1103,7 @@ def main():
                     index_size=max(0, index_size)
                 )
             else:
-                strip_data, is_i_frame, used_zones, color_updates, detail_updates = encode_strip_p_frame_with_big_blocks(
+                strip_data, is_i_frame, used_zones, big_block_updates, detail_updates = encode_strip_p_frame_with_big_blocks(
                     current_strip, prev_strips[strip_idx],
                     big_block_codebook, small_block_codebook, block_types, big_block_indices,
                     args.diff_threshold, args.force_i_threshold, args.variance_threshold, args.distortion_threshold
@@ -1115,11 +1121,11 @@ def main():
                         index_size=max(0, index_size)
                     )
                 else:
-                    total_updates = color_updates + detail_updates
+                    total_updates = big_block_updates + detail_updates
                     
                     encoding_stats.add_p_frame(
                         strip_idx, len(strip_data), total_updates, used_zones,
-                        color_updates, detail_updates
+                        big_block_updates, detail_updates
                     )
             
             frame_data.extend(struct.pack('<H', len(strip_data)))
