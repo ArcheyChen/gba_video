@@ -16,7 +16,6 @@ constexpr int PIXELS_PER_FRAME = SCREEN_WIDTH * SCREEN_HEIGHT;
 // 新增常量定义
 #define ZONE_HEIGHT_PIXELS 16  // 每个区域的像素高度
 #define ZONE_HEIGHT_BIG_BLOCKS (ZONE_HEIGHT_PIXELS / 4)  // 每个区域的4x4大块行数 (16像素/4 = 4行)
-#define BIG_BLOCK_MARKER 0xFF  // 4x4大块标记
 #define BYTES_PER_BIG_BLOCK 28  // 16Y + 4*(d_r + d_g + d_b)
 
 // EWRAM 单缓冲

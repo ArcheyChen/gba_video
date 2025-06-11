@@ -1158,14 +1158,15 @@ def write_header(path_h: pathlib.Path, frame_cnt: int, total_bytes: int, strip_c
             #define VIDEO_STRIP_COUNT   {strip_count}
             #define BIG_BLOCK_CODEBOOK_SIZE {big_block_codebook_size}
             #define SMALL_BLOCK_CODEBOOK_SIZE {small_block_codebook_size}
-            #define EFFECTIVE_UNIFIED_CODEBOOK_SIZE {EFFECTIVE_UNIFIED_CODEBOOK_SIZE}
+            #define EFFECTIVE_UNIFIED_CODEBOOK_SIZE 
+            # {EFFECTIVE_UNIFIED_CODEBOOK_SIZE}
+
+            #define BIG_BLOCK_MARKER {BIG_BLOCK_MARKER}
             
             // 帧类型定义
             #define FRAME_TYPE_I        0x00
             #define FRAME_TYPE_P        0x01
             
-            // 特殊标记（删除色块标记）
-            #define BIG_BLOCK_MARKER    0xFE
             
             // 块参数
             #define BLOCK_WIDTH         2
