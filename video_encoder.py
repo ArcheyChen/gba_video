@@ -304,7 +304,7 @@ def calculate_distortion_mse(original_blocks: list, reconstructed_blocks: list) 
     return total_mse / (len(original_blocks) * 4)  # 平均MSE
 
 # 默认使用SAD
-calculate_distortion = calculate_distortion_sad
+calculate_distortion = calculate_distortion_mse
 
 def classify_4x4_blocks_with_big_codebook(blocks: np.ndarray, big_block_codebook: np.ndarray,
                                         variance_threshold: float = 5.0, 
@@ -320,10 +320,10 @@ def classify_4x4_blocks_with_big_codebook(blocks: np.ndarray, big_block_codebook
     
     for big_by in range(big_blocks_h):
         for big_bx in range(big_blocks_w):
-            # 收集4x4大块内的4个2x2小块
+            # 收集4x4大块内的4个2x2小块 - 按行优先顺序
             blocks_4x4 = []
-            for sub_by in range(2):
-                for sub_bx in range(2):
+            for sub_by in range(2):  # 行：上、下
+                for sub_bx in range(2):  # 列：左、右
                     by = big_by * 2 + sub_by
                     bx = big_bx * 2 + sub_bx
                     if by < blocks_h and bx < blocks_w:
@@ -358,7 +358,7 @@ def classify_4x4_blocks_with_big_codebook(blocks: np.ndarray, big_block_codebook
 def encode_strip_i_frame_with_big_blocks(blocks: np.ndarray, big_block_codebook: np.ndarray,
                                        small_block_codebook: np.ndarray, block_types: dict,
                                        big_block_indices: dict) -> bytes:
-    """编码I帧条带（删除色块支持）"""
+    """编码I帧条带"""
     data = bytearray()
     data.append(FRAME_TYPE_I)
     
@@ -386,7 +386,7 @@ def encode_strip_i_frame_with_big_blocks(blocks: np.ndarray, big_block_codebook:
                         data.append(big_idx)
                         
                     else:  # small_blocks
-                        # 纹理块：4个小块码表索引
+                        # 纹理块：4个小块码表索引，按行优先顺序
                         for sub_by in range(2):
                             for sub_bx in range(2):
                                 by = big_by * 2 + sub_by
@@ -634,36 +634,25 @@ def encode_strip_p_frame_with_big_blocks(current_blocks: np.ndarray, prev_blocks
     return bytes(data), False, used_zones, 0, total_detail_updates
 
 def pack_big_block_from_2x2_blocks(blocks_2x2: list) -> np.ndarray:
-    """将4个2x2块组合成一个4x4大块"""
+    """将4个2x2块组合成一个4x4大块 - 适配新的BigYUV_Struct结构"""
     big_block = np.zeros(BYTES_PER_BIG_BLOCK, dtype=np.uint8)
     
-    # 存储16个Y值和4组色度信息
-    y_offset = 0
-    chroma_offset = 16
-    
+    # 直接按行优先顺序存储4个YUV_Struct
+    # blocks_2x2的顺序应该是：[左上, 右上, 左下, 右下]
     for i, block in enumerate(blocks_2x2):
-        # 复制4个Y值
-        big_block[y_offset:y_offset+4] = block[:4]
-        y_offset += 4
-        
-        # 复制色度信息
-        big_block[chroma_offset:chroma_offset+3] = block[4:7]
-        chroma_offset += 3
+        if len(block) >= BYTES_PER_BLOCK:
+            start_offset = i * BYTES_PER_BLOCK
+            big_block[start_offset:start_offset + BYTES_PER_BLOCK] = block[:BYTES_PER_BLOCK]
     
     return big_block
 
 def unpack_big_block_to_2x2_blocks(big_block: np.ndarray) -> list:
-    """将4x4大块拆分成4个2x2块"""
+    """将4x4大块拆分成4个2x2块 - 适配新的BigYUV_Struct结构"""
     blocks_2x2 = []
     
     for i in range(4):
-        block = np.zeros(BYTES_PER_BLOCK, dtype=np.uint8)
-        # 复制Y值
-        y_start = i * 4
-        block[:4] = big_block[y_start:y_start+4]
-        # 复制色度信息
-        chroma_start = 16 + i * 3
-        block[4:7] = big_block[chroma_start:chroma_start+3]
+        start_offset = i * BYTES_PER_BLOCK
+        block = big_block[start_offset:start_offset + BYTES_PER_BLOCK].copy()
         blocks_2x2.append(block)
     
     return blocks_2x2

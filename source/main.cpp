@@ -32,10 +32,11 @@ struct YUV_Struct{
 } __attribute__((packed));
 
 struct BigYUV_Struct{
-    u8 y[16];     // 16个Y值
-    s8 d_r[4];    // 4个d_r值
-    s8 d_g[4];    // 4个d_g值  
-    s8 d_b[4];    // 4个d_b值
+    // u8 y[16];     // 16个Y值
+    // s8 d_r[4];    // 4个d_r值
+    // s8 d_g[4];    // 4个d_g值  
+    // s8 d_b[4];    // 4个d_b值
+    YUV_Struct y[4];  // 4个2x2小块，每个小块包含2x2的Y值和色度差
 } __attribute__((packed));
 
 
@@ -233,40 +234,23 @@ IWRAM_CODE void copy_big_block_codebook(u8* dst_raw, const u8* src, BigYUV_Struc
 // 简化的4x4大块直接解码
 IWRAM_CODE void decode_big_block_direct(const BigYUV_Struct &big_yuv_data, u16* big_block_dst)
 {
-    // 直接从4x4大块数据解码，每个位置使用对应的Y值和色度组
-    for(int sub_by = 0; sub_by < 2; sub_by++) {
-        for(int sub_bx = 0; sub_bx < 2; sub_bx++) {
-            int chroma_idx = sub_by * 2 + sub_bx;  // 0,1,2,3对应4个色度组
-            
-            // 提取当前2x2区域的Y值和色度
-            u8 y_block[2][2];
-            for(int dy = 0; dy < 2; dy++) {
-                for(int dx = 0; dx < 2; dx++) {
-                    int y_idx = (sub_by * 2 + dy) * 4 + (sub_bx * 2 + dx);
-                    y_block[dy][dx] = big_yuv_data.y[y_idx];
-                }
-            }
-            
-            s8 d_r = big_yuv_data.d_r[chroma_idx];
-            s8 d_g = big_yuv_data.d_g[chroma_idx];
-            s8 d_b = big_yuv_data.d_b[chroma_idx];
-            
-            // 计算目标位置
-            u16* block_dst = big_block_dst + (sub_by * SCREEN_WIDTH * 2) + (sub_bx * 2);
-            
-            // 临时创建YUV结构用于解码
-            YUV_Struct temp_yuv;
-            temp_yuv.y[0][0] = y_block[0][0];
-            temp_yuv.y[0][1] = y_block[0][1];
-            temp_yuv.y[1][0] = y_block[1][0];
-            temp_yuv.y[1][1] = y_block[1][1];
-            temp_yuv.d_r = d_r;
-            temp_yuv.d_g = d_g;
-            temp_yuv.d_b = d_b;
-            
-            decode_block(temp_yuv, block_dst);
-        }
-    }
+    // 新结构：直接包含4个YUV_Struct，按行优先顺序
+    // big_yuv_data.y[0] = 左上 2x2块
+    // big_yuv_data.y[1] = 右上 2x2块  
+    // big_yuv_data.y[2] = 左下 2x2块
+    // big_yuv_data.y[3] = 右下 2x2块
+    
+    // 解码左上块 (0,0)
+    decode_block(big_yuv_data.y[0], big_block_dst);
+    
+    // 解码右上块 (0,2)
+    decode_block(big_yuv_data.y[1], big_block_dst + 2);
+    
+    // 解码左下块 (2,0)  
+    decode_block(big_yuv_data.y[2], big_block_dst + SCREEN_WIDTH * 2);
+    
+    // 解码右下块 (2,2)
+    decode_block(big_yuv_data.y[3], big_block_dst + SCREEN_WIDTH * 2 + 2);
 }
 
 IWRAM_CODE void decode_strip_i_frame_with_big_blocks(int strip_idx, const u8* src, u16* dst)
