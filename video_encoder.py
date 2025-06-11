@@ -1,10 +1,4 @@
 #!/usr/bin/env python3
-"""
-gba_encode.py  v7  ——  把视频/图片序列转成 GBA Mode3 YUV9 数据（支持条带帧间差分 + 统一码本向量量化）
-输出 video_data.c / video_data.h
-默认 5 s @ 30 fps，可用 --duration / --fps 修改，或使用 --full-duration 编码整个视频
-支持条带处理，每个条带独立进行I/P帧编码 + 统一码本压缩（有效255项，0xFF保留作为色块标记）
-"""
 
 import argparse, cv2, numpy as np, pathlib, textwrap
 import struct
@@ -15,6 +9,10 @@ from collections import defaultdict
 import statistics
 from numba import jit, njit, types
 from numba.typed import List
+
+from dither_opt import apply_dither_optimized
+
+# ...existing code...
 
 WIDTH, HEIGHT = 240, 160
 DEFAULT_STRIP_COUNT = 4
@@ -1010,6 +1008,9 @@ def main():
     pa.add_argument("--threads", type=int, default=None)
     pa.add_argument("--i-frame-weight", type=int, default=3,
                    help="I帧块在聚类中的权重倍数（默认3）")
+
+    pa.add_argument("--dither", action="store_true",
+                   help="启用Floyd-Steinberg抖动算法提升画质")
     args = pa.parse_args()
 
     cap = cv2.VideoCapture(args.input)
@@ -1031,7 +1032,8 @@ def main():
     strip_heights = calculate_strip_heights(HEIGHT, args.strip_count)
     print(f"条带配置: {args.strip_count} 个条带，高度分别为: {strip_heights}")
     print(f"码本配置: 统一码本{args.codebook_size}项")
-
+    if args.dither:
+        print(f"🎨 已启用抖动算法（蛇形扫描）")
     frames = []
     idx = 0
     print("正在提取帧...")
@@ -1042,6 +1044,8 @@ def main():
                 break
             if idx % every == 0:
                 frm = cv2.resize(frm, (WIDTH, HEIGHT), cv2.INTER_AREA)
+                if args.dither:
+                    frm = apply_dither_optimized(frm)
                 strip_y_list = []
                 y = 0
                 for strip_height in strip_heights:
