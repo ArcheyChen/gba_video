@@ -464,8 +464,6 @@ def encode_strip_differential_unified(current_blocks: np.ndarray, prev_blocks: n
     
     # 计算区域数量
     zones_count = (big_blocks_h + ZONE_HEIGHT_BIG_BLOCKS - 1) // ZONE_HEIGHT_BIG_BLOCKS
-    if zones_count > 8:
-        zones_count = 8
     
     # 按区域组织更新
     zone_detail_updates = [[] for _ in range(zones_count)]
@@ -547,7 +545,10 @@ def encode_strip_differential_unified(current_blocks: np.ndarray, prev_blocks: n
             total_color_updates += len(zone_color_updates[zone_idx])
             total_detail_updates += len(zone_detail_updates[zone_idx])
     
-    data.append(zone_bitmap)
+    # u16 bitmap
+    # data.append(zone_bitmap & 0xFF)  # 只存储低8位
+    # data.append((zone_bitmap >> 8) & 0xFF)  # 存储高8位\
+    data.extend(struct.pack('<H', zone_bitmap))
     
     # 按区域编码更新
     for zone_idx in range(zones_count):

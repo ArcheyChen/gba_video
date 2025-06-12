@@ -89,7 +89,7 @@ struct StripInfo {
 };
 
 IWRAM_DATA StripInfo strip_info[VIDEO_STRIP_COUNT];
-IWRAM_DATA u16 big_block_relative_offsets[240/4*80/4];
+IWRAM_DATA u16 big_block_relative_offsets[240/4*160/4];
 
 void init_strip_info(){
     u16 current_y = 0;
@@ -261,7 +261,9 @@ IWRAM_CODE void decode_strip_p_frame_unified(int strip_idx, const u8* src, u16* 
     u16 strip_base_offset = strip_info[strip_idx].buffer_offset;
     
     // 读取区域bitmap
-    u8 zone_bitmap = *src++;
+    // u8 zone_bitmap = *src++;
+    u16 zone_bitmap = src[0] | (src[1] << 8);
+    src += 2; // 跳过bitmap的两个字节
     
     auto &unified_codebook = strip_unified_codebooks[strip_idx];
     
