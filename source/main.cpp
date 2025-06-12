@@ -234,9 +234,8 @@ IWRAM_CODE void decode_strip_i_frame_with_8x8_super_blocks(int strip_idx, const 
     u16* strip_dst = dst + strip_base_offset;
     
     // 解码所有8x8超级块
+    u16 super_bx = 0, super_by = 0;
     for (int super_block_idx = 0; super_block_idx < tot_super_blocks; super_block_idx++) {
-        u16 super_bx = super_block_idx % strip_super_blocks_w;
-        u16 super_by = super_block_idx / strip_super_blocks_w;
         u16 block_offset = super_by * SUPER_BLOCK_SIZE * SCREEN_WIDTH + super_bx * SUPER_BLOCK_SIZE;
         u16* super_block_dst = strip_dst + block_offset;
         
@@ -259,6 +258,11 @@ IWRAM_CODE void decode_strip_i_frame_with_8x8_super_blocks(int strip_idx, const 
                 indices_2x2[i] = *src++;
             }
             decode_8x8_super_block_with_2x2(codebook_2x2, indices_2x2, super_block_dst);
+        }
+        super_bx++;
+        if (super_bx >= strip_super_blocks_w) {
+            super_bx = 0;
+            super_by++;
         }
     }
 }
@@ -302,11 +306,9 @@ IWRAM_CODE void decode_strip_p_frame_with_8x8_super_blocks(int strip_idx, const 
                 u16 relative_super_bx = zone_relative_idx % strip_super_blocks_w;
                 u16 absolute_super_by = zone_start_super_by + relative_super_by;
                 
-                if (absolute_super_by < strip_super_blocks_h && relative_super_bx < strip_super_blocks_w) {
-                    u16 block_offset = absolute_super_by * SUPER_BLOCK_SIZE * SCREEN_WIDTH + relative_super_bx * SUPER_BLOCK_SIZE;
-                    u16* super_block_dst = dst + strip_base_offset + block_offset;
-                    decode_8x8_super_block_with_2x2(codebook_2x2, indices_2x2, super_block_dst);
-                }
+                u16 block_offset = absolute_super_by * SUPER_BLOCK_SIZE * SCREEN_WIDTH + relative_super_bx * SUPER_BLOCK_SIZE;
+                u16* super_block_dst = dst + strip_base_offset + block_offset;
+                decode_8x8_super_block_with_2x2(codebook_2x2, indices_2x2, super_block_dst);
             }
             
             // 处理4x4块更新（4个4x4块码表索引）
@@ -322,11 +324,9 @@ IWRAM_CODE void decode_strip_p_frame_with_8x8_super_blocks(int strip_idx, const 
                 u16 relative_super_bx = zone_relative_idx % strip_super_blocks_w;
                 u16 absolute_super_by = zone_start_super_by + relative_super_by;
                 
-                if (absolute_super_by < strip_super_blocks_h && relative_super_bx < strip_super_blocks_w) {
-                    u16 block_offset = absolute_super_by * SUPER_BLOCK_SIZE * SCREEN_WIDTH + relative_super_bx * SUPER_BLOCK_SIZE;
-                    u16* super_block_dst = dst + strip_base_offset + block_offset;
-                    decode_8x8_super_block_with_4x4(codebook_4x4, indices_4x4, super_block_dst);
-                }
+                u16 block_offset = (absolute_super_by * SCREEN_WIDTH + relative_super_bx) * SUPER_BLOCK_SIZE;
+                u16* super_block_dst = dst + strip_base_offset + block_offset;
+                decode_8x8_super_block_with_4x4(codebook_4x4, indices_4x4, super_block_dst);
             }
         }
         zone_bitmap >>= 1;
