@@ -1,0 +1,27 @@
+
+import numpy as np
+
+WIDTH, HEIGHT = 240, 160
+DEFAULT_STRIP_COUNT = 4
+DEFAULT_UNIFIED_CODEBOOK_SIZE = 256   # 统一码本大小
+EFFECTIVE_UNIFIED_CODEBOOK_SIZE = 255  # 有效码本大小（0xFF保留）
+DEFAULT_4X4_CODEBOOK_SIZE = 128  # 4x4块码表大小
+
+# 标记常量
+BLOCK_4X4_MARKER = 0xFF
+
+Y_COEFF  = np.array([0.28571429,  0.57142857,  0.14285714])
+CB_COEFF = np.array([-0.14285714, -0.28571429,  0.42857143])
+CR_COEFF = np.array([ 0.35714286, -0.28571429, -0.07142857])
+BLOCK_W, BLOCK_H = 2, 2
+BYTES_PER_2X2_BLOCK  = 7  # 4Y + d_r + d_g + d_b
+BYTES_PER_4X4_BLOCK = 28  # 16Y + 4*(d_r + d_g + d_b)
+
+# 新增常量 - 改为8x8单位
+SUPER_BLOCK_SIZE = 8  # 8x8超级块
+ZONE_HEIGHT_PIXELS = 16  # 每个区域的像素高度
+ZONE_HEIGHT_SUPER_BLOCKS = ZONE_HEIGHT_PIXELS // SUPER_BLOCK_SIZE  # 每个区域的8x8超级块行数 (16像素 = 2行8x8超级块)
+
+# 帧类型标识
+FRAME_TYPE_I = 0x00  # I帧（关键帧）
+FRAME_TYPE_P = 0x01  # P帧（差分帧）
