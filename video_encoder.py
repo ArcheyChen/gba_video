@@ -14,9 +14,14 @@ from dither_opt import apply_dither_optimized
 from encode_stat import EncodingStats
 from pack_yuv_strip import pack_yuv420_strip
 from const_def import *
+from frame_encoder import *
+from block_classifier import *
+from block_quantizer import *
+from codebook_generator import *
+from file_writer import *
+
 # 全局统计对象
 encoding_stats = EncodingStats()
-
 
 def calculate_strip_heights(height: int, strip_count: int) -> list:
     """计算每个条带的高度，确保每个条带高度都是4的倍数"""
@@ -44,192 +49,7 @@ def calculate_strip_heights(height: int, strip_count: int) -> list:
     return strip_heights
 
 
-def generate_4x4_codebook(blocks_4x4: list, codebook_size: int = DEFAULT_4X4_CODEBOOK_SIZE, 
-                         max_iter: int = 100) -> np.ndarray:
-    """生成4x4块码表"""
-    if len(blocks_4x4) == 0:
-        return np.zeros((codebook_size, BYTES_PER_4X4_BLOCK), dtype=np.uint8)
-    
-    blocks_4x4_array = np.array(blocks_4x4)
-    if len(blocks_4x4_array) <= codebook_size:
-        # 数据量小于码表大小
-        codebook = np.zeros((codebook_size, BYTES_PER_4X4_BLOCK), dtype=np.uint8)
-        codebook[:len(blocks_4x4_array)] = blocks_4x4_array
-        if len(blocks_4x4_array) > 0:
-            for i in range(len(blocks_4x4_array), codebook_size):
-                codebook[i] = blocks_4x4_array[-1]
-        return codebook
-    
-    # 使用K-Means聚类
-    blocks_4x4_for_clustering = convert_4x4_blocks_for_clustering(blocks_4x4_array)
-    kmeans = MiniBatchKMeans(
-        n_clusters=codebook_size,
-        random_state=42,
-        batch_size=min(1000, len(blocks_4x4_array)),
-        max_iter=max_iter,
-        n_init=3
-    )
-    kmeans.fit(blocks_4x4_for_clustering)
-    codebook = convert_4x4_codebook_from_clustering(kmeans.cluster_centers_)
-    
-    return codebook
 
-def convert_4x4_blocks_for_clustering(blocks_4x4: np.ndarray) -> np.ndarray:
-    """将4x4块转换为聚类格式"""
-    if len(blocks_4x4) == 0:
-        return blocks_4x4.astype(np.float32)
-    
-    if blocks_4x4.ndim > 2:
-        blocks_4x4 = blocks_4x4.reshape(-1, BYTES_PER_4X4_BLOCK)
-    
-    blocks_4x4_float = blocks_4x4.astype(np.float32)
-    
-    # 色度分量需要转换为有符号数
-    for i in range(16, BYTES_PER_4X4_BLOCK):
-        blocks_4x4_float[:, i] = blocks_4x4[:, i].view(np.int8).astype(np.float32)
-    
-    return blocks_4x4_float
-
-def convert_4x4_codebook_from_clustering(codebook_float: np.ndarray) -> np.ndarray:
-    """将聚类结果转换回4x4块格式"""
-    codebook = np.zeros_like(codebook_float, dtype=np.uint8)
-    
-    # Y分量
-    codebook[:, 0:16] = np.clip(codebook_float[:, 0:16].round(), 0, 255).astype(np.uint8)
-    
-    # 色度分量
-    for i in range(16, BYTES_PER_4X4_BLOCK):
-        clipped_values = np.clip(codebook_float[:, i].round(), -128, 127).astype(np.int8)
-        codebook[:, i] = clipped_values.view(np.uint8)
-    
-    return codebook
-
-def quantize_4x4_blocks(blocks_4x4: list, codebook_4x4: np.ndarray) -> tuple:
-    """量化4x4块，返回索引和重建的块"""
-    if len(blocks_4x4) == 0:
-        return np.array([], dtype=np.uint8), []
-    
-    blocks_4x4_array = np.array(blocks_4x4)
-    blocks_4x4_for_clustering = convert_4x4_blocks_for_clustering(blocks_4x4_array)
-    codebook_4x4_for_clustering = convert_4x4_blocks_for_clustering(codebook_4x4)
-    
-    # 计算距离和找到最近的码字
-    distances = cdist(blocks_4x4_for_clustering, codebook_4x4_for_clustering, metric='euclidean')
-    indices = np.argmin(distances, axis=1).astype(np.uint8)
-    
-    # 重建块
-    reconstructed_4x4_blocks = [codebook_4x4[idx] for idx in indices]
-    
-    return indices, reconstructed_4x4_blocks
-
-def classify_8x8_super_blocks_with_4x4_codebook(blocks: np.ndarray, codebook_4x4: np.ndarray,
-                                              variance_threshold: float = 5.0, 
-                                              distortion_threshold: float = 10.0) -> tuple:
-    """使用4x4块码表对8x8超级块进行分类"""
-    blocks_h, blocks_w = blocks.shape[:2]
-    super_blocks_h = blocks_h // 4  # 8x8超级块 = 4个2x2块的行数
-    super_blocks_w = blocks_w // 4  # 8x8超级块 = 4个2x2块的列数
-    
-    block_4x4_indices = {}  # 使用4x4块码表的超级块
-    blocks_2x2 = []         # 需要用2x2块码表的块
-    block_types = {}        # 记录每个8x8超级块的类型
-    
-    for super_by in range(super_blocks_h):
-        for super_bx in range(super_blocks_w):
-            # 收集8x8超级块内的16个2x2块 - 按行优先顺序
-            blocks_8x8 = []
-            for sub_by in range(4):  # 4行2x2块
-                for sub_bx in range(4):  # 4列2x2块
-                    by = super_by * 4 + sub_by
-                    bx = super_bx * 4 + sub_bx
-                    if by < blocks_h and bx < blocks_w:
-                        blocks_8x8.append(blocks[by, bx])
-                    else:
-                        blocks_8x8.append(np.zeros(BYTES_PER_2X2_BLOCK, dtype=np.uint8))
-            
-            # 将16个2x2块重组为4个4x4块
-            blocks_4x4_in_super = []
-            for quad_idx in range(4):  # 4个4x4块
-                quad_by = quad_idx // 2
-                quad_bx = quad_idx % 2
-                blocks_2x2_in_4x4 = []
-                for sub_by in range(2):
-                    for sub_bx in range(2):
-                        block_idx = (quad_by * 2 + sub_by) * 4 + (quad_bx * 2 + sub_bx)
-                        blocks_2x2_in_4x4.append(blocks_8x8[block_idx])
-                block_4x4 = pack_4x4_block_from_2x2_blocks(blocks_2x2_in_4x4)
-                blocks_4x4_in_super.append(block_4x4)
-            
-            # 尝试用4x4块码表
-            indices, reconstructed = quantize_4x4_blocks(blocks_4x4_in_super, codebook_4x4)
-            
-            if len(reconstructed) > 0:
-                # 计算失真
-                reconstructed_2x2_blocks = []
-                for block_4x4 in reconstructed:
-                    reconstructed_2x2_blocks.extend(unpack_4x4_block_to_2x2_blocks(block_4x4))
-                distortion = calculate_distortion(blocks_8x8, reconstructed_2x2_blocks)
-                
-                if distortion <= distortion_threshold:
-                    # 失真可接受，使用4x4块码表
-                    block_4x4_indices[(super_by, super_bx)] = indices
-                    block_types[(super_by, super_bx)] = '4x4_blocks'
-                else:
-                    # 失真太大，使用2x2块码表
-                    blocks_2x2.extend(blocks_8x8)
-                    block_types[(super_by, super_bx)] = '2x2_blocks'
-            else:
-                # 量化失败，使用2x2块码表
-                blocks_2x2.extend(blocks_8x8)
-                block_types[(super_by, super_bx)] = '2x2_blocks'
-    
-    return block_4x4_indices, blocks_2x2, block_types
-
-def encode_strip_i_frame_with_4x4_blocks(blocks: np.ndarray, codebook_4x4: np.ndarray,
-                                        codebook_2x2: np.ndarray, block_types: dict,
-                                        block_4x4_indices: dict) -> bytes:
-    """编码I帧条带"""
-    data = bytearray()
-    data.append(FRAME_TYPE_I)
-    
-    if blocks.size > 0:
-        blocks_h, blocks_w = blocks.shape[:2]
-        super_blocks_h = blocks_h // 4
-        super_blocks_w = blocks_w // 4
-        
-        # 存储4x4块码表
-        data.extend(codebook_4x4.flatten().tobytes())
-        
-        # 存储2x2块码表
-        data.extend(codebook_2x2.flatten().tobytes())
-        
-        # 按8x8超级块的顺序编码
-        for super_by in range(super_blocks_h):
-            for super_bx in range(super_blocks_w):
-                if (super_by, super_bx) in block_types:
-                    block_type = block_types[(super_by, super_bx)]
-                    
-                    if block_type == '4x4_blocks':
-                        # 4x4块：0xFF + 4个4x4块码表索引
-                        data.append(BLOCK_4X4_MARKER)
-                        indices_4x4 = block_4x4_indices[(super_by, super_bx)]
-                        for idx in indices_4x4:
-                            data.append(idx)
-                        
-                    else:  # 2x2_blocks
-                        # 纹理块：16个2x2块码表索引，按行优先顺序
-                        for sub_by in range(4):
-                            for sub_bx in range(4):
-                                by = super_by * 4 + sub_by
-                                bx = super_bx * 4 + sub_bx
-                                if by < blocks_h and bx < blocks_w:
-                                    block = blocks[by, bx]
-                                    idx_2x2 = quantize_blocks_unified(block.reshape(1, -1), codebook_2x2)[0]
-                                    data.append(idx_2x2)
-                                else:
-                                    data.append(0)
-    
-    return bytes(data)
 
 def generate_gop_codebooks_with_4x4_blocks(frames: list, strip_count: int, i_frame_interval: int,
                                          variance_threshold: float, diff_threshold: float,
@@ -342,241 +162,11 @@ def generate_gop_codebooks_with_4x4_blocks(frames: list, strip_count: int, i_fra
     
     return gop_codebooks
 
-def pack_4x4_block_from_2x2_blocks(blocks_2x2: list) -> np.ndarray:
-    """将4个2x2块组合成一个4x4块"""
-    block_4x4 = np.zeros(BYTES_PER_4X4_BLOCK, dtype=np.uint8)
-    
-    # 直接按行优先顺序存储4个YUV_Struct
-    # blocks_2x2的顺序应该是：[左上, 右上, 左下, 右下]
-    for i, block in enumerate(blocks_2x2):
-        if len(block) >= BYTES_PER_2X2_BLOCK:
-            start_offset = i * BYTES_PER_2X2_BLOCK
-            block_4x4[start_offset:start_offset + BYTES_PER_2X2_BLOCK] = block[:BYTES_PER_2X2_BLOCK]
-    
-    return block_4x4
 
-def unpack_4x4_block_to_2x2_blocks(block_4x4: np.ndarray) -> list:
-    """将4x4块拆分成4个2x2块"""
-    blocks_2x2 = []
-    
-    for i in range(4):
-        start_offset = i * BYTES_PER_2X2_BLOCK
-        block = block_4x4[start_offset:start_offset + BYTES_PER_2X2_BLOCK].copy()
-        blocks_2x2.append(block)
-    
-    return blocks_2x2
 
-def identify_updated_8x8_super_blocks(current_blocks: np.ndarray, prev_blocks: np.ndarray,
-                                    diff_threshold: float) -> set:
-    """识别需要更新的8x8超级块位置"""
-    if prev_blocks is None or current_blocks.shape != prev_blocks.shape:
-        # 如果没有前一帧，所有超级块都需要更新
-        blocks_h, blocks_w = current_blocks.shape[:2]
-        super_blocks_h = blocks_h // 4
-        super_blocks_w = blocks_w // 4
-        return {(super_by, super_bx) for super_by in range(super_blocks_h) for super_bx in range(super_blocks_w)}
-    
-    blocks_h, blocks_w = current_blocks.shape[:2]
-    
-    # 使用Numba加速的块差异计算
-    current_flat = current_blocks.reshape(-1, BYTES_PER_2X2_BLOCK)
-    prev_flat = prev_blocks.reshape(-1, BYTES_PER_2X2_BLOCK)
-    block_diffs = compute_block_differences_numba(current_flat, prev_flat, blocks_h, blocks_w)
-    
-    # 使用Numba加速的更新块识别
-    updated_list = identify_updated_8x8_super_blocks_numba(block_diffs, diff_threshold, blocks_h, blocks_w)
-    
-    return set(updated_list)
 
-@njit
-def identify_updated_8x8_super_blocks_numba(block_diffs, diff_threshold, blocks_h, blocks_w):
-    """Numba加速的8x8超级块更新识别"""
-    super_blocks_h = blocks_h // 4
-    super_blocks_w = blocks_w // 4
-    updated_positions = []
-    
-    for super_by in range(super_blocks_h):
-        for super_bx in range(super_blocks_w):
-            needs_update = False
-            
-            # 检查16个2x2子块的位置
-            for sub_by in range(4):
-                for sub_bx in range(4):
-                    by = super_by * 4 + sub_by
-                    bx = super_bx * 4 + sub_bx
-                    
-                    if by < blocks_h and bx < blocks_w:
-                        if block_diffs[by, bx] > diff_threshold:
-                            needs_update = True
-                            break
-                if needs_update:
-                    break
-            
-            if needs_update:
-                updated_positions.append((super_by, super_bx))
-    
-    return updated_positions
 
-def encode_strip_p_frame_with_4x4_blocks(current_blocks: np.ndarray, prev_blocks: np.ndarray,
-                                        codebook_4x4: np.ndarray, codebook_2x2: np.ndarray,
-                                        block_types: dict, block_4x4_indices: dict,
-                                        diff_threshold: float, force_i_threshold: float = 0.7,
-                                        variance_threshold: float = 5.0, distortion_threshold: float = 10.0) -> tuple:
-    """编码P帧条带"""
-    if prev_blocks is None or current_blocks.shape != prev_blocks.shape:
-        i_frame_data = encode_strip_i_frame_with_4x4_blocks(
-            current_blocks, codebook_4x4, codebook_2x2, block_types, block_4x4_indices)
-        return i_frame_data, True, 0, 0, 0
-    
-    blocks_h, blocks_w = current_blocks.shape[:2]
-    total_blocks = blocks_h * blocks_w
-    
-    if total_blocks == 0:
-        return b'', True, 0, 0, 0
-    
-    # 识别需要更新的8x8超级块
-    updated_super_blocks = identify_updated_8x8_super_blocks(current_blocks, prev_blocks, diff_threshold)
-    
-    super_blocks_h = blocks_h // 4
-    super_blocks_w = blocks_w // 4
-    total_super_blocks = super_blocks_h * super_blocks_w
-    
-    # 判断是否需要I帧
-    update_ratio = len(updated_super_blocks) / total_super_blocks if total_super_blocks > 0 else 0
-    if update_ratio > force_i_threshold:
-        i_frame_data = encode_strip_i_frame_with_4x4_blocks(
-            current_blocks, codebook_4x4, codebook_2x2, block_types, block_4x4_indices)
-        return i_frame_data, True, 0, 0, 0
-    
-    # 计算区域数量 - 基于8x8超级块
-    zones_count = (super_blocks_h + ZONE_HEIGHT_SUPER_BLOCKS - 1) // ZONE_HEIGHT_SUPER_BLOCKS
-    
-    # 按区域组织更新
-    zone_4x4_updates = [[] for _ in range(zones_count)]
-    zone_2x2_updates = [[] for _ in range(zones_count)]
-    
-    for super_by, super_bx in updated_super_blocks:
-        # 计算属于哪个区域
-        zone_idx = min(super_by // ZONE_HEIGHT_SUPER_BLOCKS, zones_count - 1)
-        zone_relative_by = super_by % ZONE_HEIGHT_SUPER_BLOCKS
-        zone_relative_idx = zone_relative_by * super_blocks_w + super_bx
-        
-        if (super_by, super_bx) in block_types:
-            block_type = block_types[(super_by, super_bx)]
-            
-            if block_type == '4x4_blocks':
-                # 4x4块更新
-                indices_4x4 = block_4x4_indices[(super_by, super_bx)]
-                zone_4x4_updates[zone_idx].append((zone_relative_idx, indices_4x4))
-                
-            else:  # 2x2_blocks
-                # 2x2块更新
-                indices = []
-                for sub_by in range(4):
-                    for sub_bx in range(4):
-                        by = super_by * 4 + sub_by
-                        bx = super_bx * 4 + sub_bx
-                        if by < blocks_h and bx < blocks_w:
-                            block = current_blocks[by, bx]
-                            idx_2x2 = quantize_blocks_unified(block.reshape(1, -1), codebook_2x2)[0]
-                            indices.append(idx_2x2)
-                        else:
-                            indices.append(0)
-                zone_2x2_updates[zone_idx].append((zone_relative_idx, indices))
-    
-    # 编码P帧
-    data = bytearray()
-    data.append(FRAME_TYPE_P)
-    
-    # 统计使用的区域数量
-    used_zones = 0
-    total_4x4_updates = 0
-    total_2x2_updates = 0
-    
-    # 生成区域bitmap
-    zone_bitmap = 0
-    for zone_idx in range(zones_count):
-        if zone_4x4_updates[zone_idx] or zone_2x2_updates[zone_idx]:
-            zone_bitmap |= (1 << zone_idx)
-            used_zones += 1
-            total_4x4_updates += len(zone_4x4_updates[zone_idx])
-            total_2x2_updates += len(zone_2x2_updates[zone_idx])
-    
-    data.extend(struct.pack('<H', zone_bitmap))
-    
-    # 按区域编码更新（现在只有2种类型）
-    for zone_idx in range(zones_count):
-        if zone_bitmap & (1 << zone_idx):
-            updates_2x2 = zone_2x2_updates[zone_idx]
-            updates_4x4 = zone_4x4_updates[zone_idx]
-            
-            data.append(len(updates_2x2))
-            data.append(len(updates_4x4))
-            
-            # 存储纹理块更新
-            for relative_idx, indices in updates_2x2:
-                data.append(relative_idx)
-                for idx in indices:
-                    data.append(idx)
-            
-            # 存储4x4块更新
-            for relative_idx, indices_4x4 in updates_4x4:
-                data.append(relative_idx)
-                for idx in indices_4x4:
-                    data.append(idx)
-    
-    total_updates = total_4x4_updates + total_2x2_updates
-    return bytes(data), False, used_zones, total_4x4_updates, total_2x2_updates
 
-def classify_4x4_blocks_in_8x8_super_block(blocks_8x8: list, codebook_4x4: np.ndarray,
-                                          codebook_2x2: np.ndarray, distortion_threshold: float = 10.0) -> tuple:
-    """对8x8超级块内的4个4x4子块进行分类"""
-    block_4x4_usage = {}  # 记录哪些4x4子块使用4x4码表
-    
-    # 将16个2x2块重组为4个4x4块
-    blocks_4x4_in_super = []
-    for quad_idx in range(4):  # 4个4x4块
-        quad_by = quad_idx // 2
-        quad_bx = quad_idx % 2
-        blocks_2x2_in_4x4 = []
-        for sub_by in range(2):
-            for sub_bx in range(2):
-                block_idx = (quad_by * 2 + sub_by) * 4 + (quad_bx * 2 + sub_bx)
-                blocks_2x2_in_4x4.append(blocks_8x8[block_idx])
-        block_4x4 = pack_4x4_block_from_2x2_blocks(blocks_2x2_in_4x4)
-        blocks_4x4_in_super.append((quad_idx, block_4x4, blocks_2x2_in_4x4))
-    
-    # 对每个4x4块独立决定使用哪种码表
-    for quad_idx, block_4x4, blocks_2x2_in_4x4 in blocks_4x4_in_super:
-        # 尝试4x4码表
-        indices_4x4, reconstructed_4x4 = quantize_4x4_blocks([block_4x4], codebook_4x4)
-        if len(reconstructed_4x4) > 0:
-            reconstructed_2x2_from_4x4 = unpack_4x4_block_to_2x2_blocks(reconstructed_4x4[0])
-            distortion_4x4 = calculate_distortion(blocks_2x2_in_4x4, reconstructed_2x2_from_4x4)
-            
-            # 尝试2x2码表
-            indices_2x2 = []
-            reconstructed_2x2_from_2x2 = []
-            for block_2x2 in blocks_2x2_in_4x4:
-                idx = quantize_blocks_unified(block_2x2.reshape(1, -1), codebook_2x2)[0]
-                indices_2x2.append(idx)
-                reconstructed_2x2_from_2x2.append(codebook_2x2[idx])
-            distortion_2x2 = calculate_distortion(blocks_2x2_in_4x4, reconstructed_2x2_from_2x2)
-            
-            # 选择失真更小的方案
-            if distortion_4x4 <= distortion_2x2 and distortion_4x4 <= distortion_threshold:
-                block_4x4_usage[quad_idx] = ('4x4', indices_4x4[0])
-            else:
-                block_4x4_usage[quad_idx] = ('2x2', indices_2x2)
-        else:
-            # 4x4量化失败，使用2x2
-            indices_2x2 = []
-            for block_2x2 in blocks_2x2_in_4x4:
-                idx = quantize_blocks_unified(block_2x2.reshape(1, -1), codebook_2x2)[0]
-                indices_2x2.append(idx)
-            block_4x4_usage[quad_idx] = ('2x2', indices_2x2)
-    
-    return block_4x4_usage
 
 def identify_updated_4x4_blocks(current_blocks: np.ndarray, prev_blocks: np.ndarray,
                                diff_threshold: float) -> dict:
@@ -786,69 +376,6 @@ def encode_strip_p_frame_mixed(current_blocks: np.ndarray, prev_blocks: np.ndarr
     
     return bytes(data), False, used_zones, total_updates, 0
 
-def write_header(path_h: pathlib.Path, frame_cnt: int, total_bytes: int, strip_count: int, 
-                strip_heights: list, codebook_4x4_size: int, codebook_2x2_size: int):
-    guard = "VIDEO_DATA_H"
-    
-    with path_h.open("w", encoding="utf-8") as f:
-        f.write(textwrap.dedent(f"""\
-            #ifndef {guard}
-            #define {guard}
-
-            #define VIDEO_FRAME_COUNT   {frame_cnt}
-            #define VIDEO_WIDTH         {WIDTH}
-            #define VIDEO_HEIGHT        {HEIGHT}
-            #define VIDEO_TOTAL_BYTES   {total_bytes}
-            #define VIDEO_STRIP_COUNT   {strip_count}
-            #define CODEBOOK_4X4_SIZE {codebook_4x4_size}
-            #define CODEBOOK_2X2_SIZE {codebook_2x2_size}
-            #define EFFECTIVE_UNIFIED_CODEBOOK_SIZE {EFFECTIVE_UNIFIED_CODEBOOK_SIZE}
-
-            #define BLOCK_4X4_MARKER {BLOCK_4X4_MARKER}
-            #define BLOCK_SKIP_MARKER {BLOCK_SKIP_MARKER}
-            
-            // 帧类型定义
-            #define FRAME_TYPE_I        0x00
-            #define FRAME_TYPE_P        0x01
-            
-            // 块参数
-            #define BLOCK_WIDTH         2
-            #define BLOCK_HEIGHT        2
-            #define BYTES_PER_2X2_BLOCK     7
-            #define BYTES_PER_4X4_BLOCK 28
-            #define SUPER_BLOCK_SIZE    8
-
-            // 条带高度数组
-            extern const unsigned char strip_heights[VIDEO_STRIP_COUNT];
-            
-            extern const unsigned char video_data[VIDEO_TOTAL_BYTES];
-            extern const unsigned int frame_offsets[VIDEO_FRAME_COUNT];
-
-            #endif // {guard}
-            """))
-
-def write_source(path_c: pathlib.Path, data: bytes, frame_offsets: list, strip_heights: list):
-    with path_c.open("w", encoding="utf-8") as f:
-        f.write('#include "video_data.h"\n\n')
-        
-
-        
-        f.write("const unsigned char strip_heights[] = {\n")
-        f.write("    " + ', '.join(map(str, strip_heights)) + "\n")
-        f.write("};\n\n")
-        
-        f.write("const unsigned int frame_offsets[] = {\n")
-        for i in range(0, len(frame_offsets), 8):
-            chunk = ', '.join(f"{offset}" for offset in frame_offsets[i:i+8])
-            f.write("    " + chunk + ",\n")
-        f.write("};\n\n")
-        
-        f.write("const unsigned char video_data[] = {\n")
-        per_line = 16
-        for i in range(0, len(data), per_line):
-            chunk = ', '.join(f"0x{v:02X}" for v in data[i:i+per_line])
-            f.write("    " + chunk + ",\n")
-        f.write("};\n")
 
 def generate_codebook(blocks_data: np.ndarray, codebook_size: int, max_iter: int = 100) -> tuple:
     """使用K-Means聚类生成码表"""
@@ -889,20 +416,6 @@ def generate_codebook(blocks_data: np.ndarray, codebook_size: int, max_iter: int
     
     return codebook, codebook_size
 
-def convert_blocks_for_clustering(blocks_data: np.ndarray) -> np.ndarray:
-    """将块数据转换为正确的聚类格式"""
-    if len(blocks_data) == 0:
-        return blocks_data.astype(np.float32)
-    
-    if blocks_data.ndim > 2:
-        blocks_data = blocks_data.reshape(-1, BYTES_PER_2X2_BLOCK)
-    
-    blocks_float = blocks_data.astype(np.float32)
-    
-    for i in range(4, BYTES_PER_2X2_BLOCK):
-        blocks_float[:, i] = blocks_data[:, i].view(np.int8).astype(np.float32)
-    
-    return blocks_float
 
 def convert_codebook_from_clustering(codebook_float: np.ndarray) -> np.ndarray:
     """将聚类结果转换回正确的块格式"""
@@ -916,30 +429,7 @@ def convert_codebook_from_clustering(codebook_float: np.ndarray) -> np.ndarray:
     
     return codebook
 
-def calculate_distortion_sad(original_blocks: list, reconstructed_blocks: list) -> float:
-    """计算失真度量 - SAD (Sum of Absolute Differences)"""
-    if len(original_blocks) != len(reconstructed_blocks):
-        return float('inf')
-    
-    total_sad = 0.0
-    for orig, recon in zip(original_blocks, reconstructed_blocks):
-        # Y分量的SAD（需要乘2还原）
-        y_orig = orig[:4].astype(np.float32) * 2.0  # 还原Y分量
-        y_recon = recon[:4].astype(np.float32) * 2.0  # 还原Y分量
-        y_sad = np.sum(np.abs(y_orig - y_recon))
-        
-        # CrCb分量的SAD（有符号数转换）
-        chroma_orig = orig[4:7].view(np.int8).astype(np.float32)  # d_r, d_g, d_b
-        chroma_recon = recon[4:7].view(np.int8).astype(np.float32)
-        chroma_sad = np.sum(np.abs(chroma_orig - chroma_recon))
-        
-        # 可以调整权重，这里Y和色度等权重
-        total_sad += y_sad + chroma_sad
-    
-    return total_sad / len(original_blocks)  # 平均SAD
 
-# 默认使用SAD
-calculate_distortion = calculate_distortion_sad
 
 def generate_unified_codebook_simplified(small_blocks: list, 
                                        codebook_size: int = EFFECTIVE_UNIFIED_CODEBOOK_SIZE,
@@ -963,72 +453,7 @@ def generate_unified_codebook_simplified(small_blocks: list,
     
     return full_codebook
 
-@njit
-def compute_block_differences_numba(current_flat, prev_flat, blocks_h, blocks_w):
-    """Numba加速的块差异计算"""
-    block_diffs = np.zeros((blocks_h, blocks_w), dtype=np.float64)
-    
-    for i in range(blocks_h * blocks_w):
-        y_diff_sum = 0.0
-        for j in range(4):  # 只计算Y分量差异
-            current_val = int(current_flat[i, j])
-            prev_val = int(prev_flat[i, j])
-            if current_val >= prev_val:
-                diff = current_val - prev_val
-            else:
-                diff = prev_val - current_val
-            y_diff_sum += diff
-        block_diffs[i // blocks_w, i % blocks_w] = y_diff_sum / 4.0
-    
-    return block_diffs
 
-def quantize_blocks_unified(blocks_data: np.ndarray, codebook: np.ndarray) -> np.ndarray:
-    """使用统一码表对块进行量化（避免产生0xFE和0xFF）"""
-    if len(blocks_data) == 0:
-        return np.array([], dtype=np.uint8)
-    
-    # 只使用前253项进行量化，因为0xFE和0xFF用于特殊标记
-    effective_codebook = codebook[:EFFECTIVE_UNIFIED_CODEBOOK_SIZE]
-    
-    blocks_for_clustering = convert_blocks_for_clustering(blocks_data)
-    codebook_for_clustering = convert_blocks_for_clustering(effective_codebook)
-    
-    # 使用Numba加速的距离计算
-    indices = quantize_blocks_distance_numba(blocks_for_clustering, codebook_for_clustering)
-    
-    return indices
-
-@njit
-def quantize_blocks_distance_numba(blocks_for_clustering, codebook_for_clustering):
-    """Numba加速的块量化距离计算"""
-    n_blocks = blocks_for_clustering.shape[0]
-    n_codebook = codebook_for_clustering.shape[0]
-    indices = np.zeros(n_blocks, dtype=np.uint8)
-    
-    for i in range(n_blocks):
-        min_dist = np.inf
-        best_idx = 0
-        
-        for j in range(n_codebook):
-            dist = 0.0
-            # Y分量（前4个字节）使用2倍权重，计算SAD
-            for k in range(4):
-                diff = blocks_for_clustering[i, k] - codebook_for_clustering[j, k]
-                dist += 2.0 * abs(diff)
-            
-            # 色度分量（后3个字节）使用1倍权重，计算SAD
-            # 注意：这里的数据已经在convert_blocks_for_clustering中转换为有符号数
-            for k in range(4, BYTES_PER_2X2_BLOCK):
-                diff = blocks_for_clustering[i, k] - codebook_for_clustering[j, k]
-                dist += abs(diff)
-            
-            if dist < min_dist:
-                min_dist = dist
-                best_idx = j
-        
-        indices[i] = best_idx
-    
-    return indices
 
 def main():
     pa = argparse.ArgumentParser(description="Encode to GBA YUV9 with mixed 4x4/2x2 block codebook")
