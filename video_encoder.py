@@ -3,6 +3,7 @@
 import argparse, cv2, numpy as np, pathlib, textwrap
 import struct
 import concurrent.futures
+import multiprocessing as mp
 from sklearn.cluster import MiniBatchKMeans
 from scipy.spatial.distance import cdist
 from collections import defaultdict
@@ -11,8 +12,6 @@ from numba import jit, njit, types
 from numba.typed import List
 
 from dither_opt import apply_dither_optimized
-
-# ...existing code...
 
 WIDTH, HEIGHT = 240, 160
 DEFAULT_STRIP_COUNT = 4
@@ -722,109 +721,205 @@ def extract_effective_blocks_from_big_blocks(blocks: np.ndarray, big_block_posit
     
     return effective_blocks
 
+def process_single_gop_strip(args_tuple):
+    """处理单个GOP的单个条带 - 用于多进程"""
+    (gop_start, gop_end, strip_idx, strip_frames_data, variance_threshold, 
+     diff_threshold, codebook_size, kmeans_max_iter, i_frame_weight) = args_tuple
+    
+    try:
+        effective_blocks = []
+        block_types_list = []
+        
+        # 处理GOP中的每一帧
+        prev_strip_blocks = None
+        
+        for frame_idx in range(gop_start, gop_end):
+            relative_frame_idx = frame_idx - gop_start
+            if relative_frame_idx >= len(strip_frames_data):
+                break
+                
+            strip_blocks = strip_frames_data[relative_frame_idx]
+            if strip_blocks.size == 0:
+                continue
+            
+            # 确定帧类型和需要更新的大块
+            is_i_frame = (frame_idx == gop_start)  # GOP第一帧是I帧
+            
+            if is_i_frame:
+                # I帧：所有大块都有效
+                blocks_h, blocks_w = strip_blocks.shape[:2]
+                big_blocks_h = blocks_h // 2
+                big_blocks_w = blocks_w // 2
+                updated_big_blocks = {(big_by, big_bx) for big_by in range(big_blocks_h) for big_bx in range(big_blocks_w)}
+            else:
+                # P帧：只有更新的大块有效
+                updated_big_blocks = identify_updated_big_blocks(strip_blocks, prev_strip_blocks, diff_threshold)
+            
+            # 从有效大块中提取2x2块
+            frame_effective_blocks = extract_effective_blocks_from_big_blocks(
+                strip_blocks, updated_big_blocks, variance_threshold)
+            
+            # I帧块加权：复制多次以增加在聚类中的影响力
+            if is_i_frame:
+                weighted_blocks = frame_effective_blocks * i_frame_weight  # 复制i_frame_weight次
+                effective_blocks.extend(weighted_blocks)
+            else:
+                effective_blocks.extend(frame_effective_blocks)
+            
+            # 生成完整的block_types用于编码（所有大块，不只是有效的）
+            frame_blocks, block_types = classify_4x4_blocks_unified(strip_blocks, variance_threshold)
+            block_types_list.append((frame_idx, block_types))
+            
+            prev_strip_blocks = strip_blocks.copy()
+        
+        # 使用有效块生成统一码本
+        unified_codebook = generate_unified_codebook(effective_blocks, codebook_size, kmeans_max_iter)
+        
+        return {
+            'gop_start': gop_start,
+            'strip_idx': strip_idx,
+            'unified_codebook': unified_codebook,
+            'block_types_list': block_types_list,
+            'total_blocks_count': len(effective_blocks),
+            'success': True
+        }
+        
+    except Exception as e:
+        return {
+            'gop_start': gop_start,
+            'strip_idx': strip_idx,
+            'error': str(e),
+            'success': False
+        }
+
 def generate_gop_unified_codebooks(frames: list, strip_count: int, i_frame_interval: int,
                                   variance_threshold: float, diff_threshold: float,
                                   codebook_size: int = DEFAULT_UNIFIED_CODEBOOK_SIZE,
-                                  kmeans_max_iter: int = 100, i_frame_weight: int = 3) -> dict:
-    """为每个GOP生成统一码本（只使用有效块，I帧块加权）"""
-    print("正在为每个GOP生成统一码本（基于有效块，I帧加权）...")
+                                  kmeans_max_iter: int = 100, i_frame_weight: int = 3,
+                                  max_workers: int = None) -> dict:
+    """为每个GOP生成统一码本（多进程版本）"""
+    print("正在为每个GOP生成统一码本（多进程，基于有效块，I帧加权）...")
+    
+    if max_workers is None:
+        max_workers = max(1, mp.cpu_count() - 1)  # 留一个核心给系统
+    
+    print(f"使用 {max_workers} 个进程并行处理")
     
     gop_codebooks = {}
     
+    # 确定I帧位置
     i_frame_positions = []
     for frame_idx in range(len(frames)):
         if frame_idx % i_frame_interval == 0:
             i_frame_positions.append(frame_idx)
     
+    # 准备任务参数
+    tasks = []
     for gop_idx, gop_start in enumerate(i_frame_positions):
         if gop_idx + 1 < len(i_frame_positions):
             gop_end = i_frame_positions[gop_idx + 1]
         else:
             gop_end = len(frames)
         
-        print(f"  处理GOP {gop_idx}: 帧 {gop_start} 到 {gop_end-1}")
-        
-        gop_codebooks[gop_start] = []
-        
+        # 为每个条带创建任务
         for strip_idx in range(strip_count):
-            effective_blocks = []
-            block_types_list = []
-            
-            # 统计信息（汇总整个GOP）
-            total_i_big_blocks = 0
-            total_p_big_blocks = 0
-            total_i_2x2_blocks = 0
-            total_p_2x2_blocks = 0
-            
-            # 处理GOP中的每一帧
-            prev_strip_blocks = None
-            
+            # 提取该GOP该条带的所有帧数据
+            strip_frames_data = []
             for frame_idx in range(gop_start, gop_end):
-                strip_blocks = frames[frame_idx][strip_idx]
-                if strip_blocks.size == 0:
-                    continue
-                
-                # 确定帧类型和需要更新的大块
-                is_i_frame = (frame_idx == gop_start)  # GOP第一帧是I帧
-                
-                if is_i_frame:
-                    # I帧：所有大块都有效
-                    blocks_h, blocks_w = strip_blocks.shape[:2]
-                    big_blocks_h = blocks_h // 2
-                    big_blocks_w = blocks_w // 2
-                    updated_big_blocks = {(big_by, big_bx) for big_by in range(big_blocks_h) for big_bx in range(big_blocks_w)}
+                if frame_idx < len(frames):
+                    strip_frames_data.append(frames[frame_idx][strip_idx])
                 else:
-                    # P帧：只有更新的大块有效
-                    updated_big_blocks = identify_updated_big_blocks(strip_blocks, prev_strip_blocks, diff_threshold)
-                
-                # 从有效大块中提取2x2块
-                frame_effective_blocks = extract_effective_blocks_from_big_blocks(
-                    strip_blocks, updated_big_blocks, variance_threshold)
-                
-                # I帧块加权：复制多次以增加在聚类中的影响力
-                if is_i_frame:
-                    weighted_blocks = frame_effective_blocks * i_frame_weight  # 复制i_frame_weight次
-                    effective_blocks.extend(weighted_blocks)
-                    total_i_big_blocks += len(updated_big_blocks)
-                    total_i_2x2_blocks += len(frame_effective_blocks) * i_frame_weight
-                else:
-                    effective_blocks.extend(frame_effective_blocks)
-                    total_p_big_blocks += len(updated_big_blocks)
-                    total_p_2x2_blocks += len(frame_effective_blocks)
-                
-                # 生成完整的block_types用于编码（所有大块，不只是有效的）
-                frame_blocks, block_types = classify_4x4_blocks_unified(strip_blocks, variance_threshold)
-                block_types_list.append((frame_idx, block_types))
-                
-                prev_strip_blocks = strip_blocks.copy()
+                    break
             
-            # 使用有效块生成统一码本
-            unified_codebook = generate_unified_codebook(effective_blocks, codebook_size, kmeans_max_iter)
-            
-            gop_codebooks[gop_start].append({
-                'unified_codebook': unified_codebook,
-                'block_types_list': block_types_list,
-                'total_blocks_count': len(effective_blocks)
-            })
-            
-            # 统计色块和纹理块数量（基于完整分类，不只是有效块）
-            total_color_count = 0
-            total_detail_count = 0
-            for _, block_types in block_types_list:
-                for (big_by, big_bx), (block_type, _) in block_types.items():
-                    if block_type == 'color':
-                        total_color_count += 1
-                    else:
-                        total_detail_count += 1
-            
-            # 汇总输出一个条带的统计信息
-            print(f"    条带{strip_idx}: I帧{total_i_big_blocks}大块({total_i_2x2_blocks}块×{i_frame_weight}权重), "
-                  f"P帧{total_p_big_blocks}大块({total_p_2x2_blocks}块), "
-                  f"总训练块{len(effective_blocks)}个")
+            if strip_frames_data:  # 只有当有数据时才添加任务
+                task_args = (
+                    gop_start, gop_end, strip_idx, strip_frames_data,
+                    variance_threshold, diff_threshold, codebook_size,
+                    kmeans_max_iter, i_frame_weight
+                )
+                tasks.append(task_args)
+    
+    total_tasks = len(tasks)
+    print(f"总共 {len(i_frame_positions)} 个GOP，{strip_count} 个条带，{total_tasks} 个处理任务")
+    
+    # 使用多进程处理
+    completed_tasks = 0
+    
+    # 设置进程启动方法（避免某些平台的问题）
+    try:
+        mp.set_start_method('spawn', force=True)
+    except RuntimeError:
+        pass  # 如果已经设置过就跳过
+    
+    with mp.Pool(processes=max_workers) as pool:
+        # 提交所有任务
+        results = []
+        for task_args in tasks:
+            result = pool.apply_async(process_single_gop_strip, (task_args,))
+            results.append(result)
+        
+        # 收集结果并显示进度
+        processed_results = []
+        for i, result in enumerate(results):
+            try:
+                task_result = result.get(timeout=300)  # 5分钟超时
+                processed_results.append(task_result)
+                completed_tasks += 1
+                
+                if completed_tasks % max(1, total_tasks // 20) == 0 or completed_tasks == total_tasks:
+                    progress = completed_tasks / total_tasks * 100
+                    print(f"  进度: {completed_tasks}/{total_tasks} ({progress:.1f}%)")
+                    
+            except Exception as e:
+                print(f"  ⚠️ 任务 {i} 处理失败: {e}")
+                # 创建一个失败的结果
+                task_args = tasks[i]
+                processed_results.append({
+                    'gop_start': task_args[0],
+                    'strip_idx': task_args[2],
+                    'success': False,
+                    'error': str(e)
+                })
+    
+    # 组织结果
+    failed_count = 0
+    for result in processed_results:
+        if not result['success']:
+            print(f"  ❌ GOP {result['gop_start']} 条带 {result['strip_idx']} 处理失败: {result.get('error', '未知错误')}")
+            failed_count += 1
+            continue
+        
+        gop_start = result['gop_start']
+        strip_idx = result['strip_idx']
+        
+        if gop_start not in gop_codebooks:
+            gop_codebooks[gop_start] = [None] * strip_count
+        
+        gop_codebooks[gop_start][strip_idx] = {
+            'unified_codebook': result['unified_codebook'],
+            'block_types_list': result['block_types_list'],
+            'total_blocks_count': result['total_blocks_count']
+        }
+    
+    if failed_count > 0:
+        print(f"  ⚠️ 共有 {failed_count} 个任务处理失败")
+    else:
+        print(f"  ✅ 所有 {total_tasks} 个任务处理完成")
+    
+    # 验证结果完整性
+    for gop_start in gop_codebooks:
+        for strip_idx in range(strip_count):
+            if gop_codebooks[gop_start][strip_idx] is None:
+                print(f"  ⚠️ GOP {gop_start} 条带 {strip_idx} 缺少数据，使用默认码本")
+                # 创建默认码本
+                default_codebook = np.zeros((codebook_size, BYTES_PER_BLOCK), dtype=np.uint8)
+                gop_codebooks[gop_start][strip_idx] = {
+                    'unified_codebook': default_codebook,
+                    'block_types_list': [],
+                    'total_blocks_count': 0
+                }
     
     return gop_codebooks
-
-# ...existing code...
 
 class EncodingStats:
     """编码统计类"""
@@ -1009,6 +1104,8 @@ def main():
     pa.add_argument("--threads", type=int, default=None)
     pa.add_argument("--i-frame-weight", type=int, default=3,
                    help="I帧块在聚类中的权重倍数（默认3）")
+    pa.add_argument("--max-workers", type=int, default=None,
+                   help="GOP处理的最大进程数（默认为CPU核心数-1）")
 
     pa.add_argument("--dither", action="store_true",
                    help="启用Floyd-Steinberg抖动算法提升画质")
@@ -1045,6 +1142,7 @@ def main():
                 break
             if idx % every == 0:
                 frm = cv2.resize(frm, (WIDTH, HEIGHT), cv2.INTER_AREA)
+                frm = cv2.GaussianBlur(frm, (3, 3), 0.41)
                 if args.dither:
                     frm = apply_dither_optimized(frm)
                 strip_y_list = []
@@ -1072,11 +1170,11 @@ def main():
 
     print(f"总共提取了 {len(frames)} 帧")
 
-    # 生成统一码本（传入diff_threshold和i_frame_weight参数）
+    # 生成统一码本（传入max_workers参数）
     gop_codebooks = generate_gop_unified_codebooks(
         frames, args.strip_count, args.i_frame_interval, 
         args.variance_threshold, args.diff_threshold, args.codebook_size, 
-        args.kmeans_max_iter, args.i_frame_weight
+        args.kmeans_max_iter, args.i_frame_weight, args.max_workers
     )
 
     # 编码所有帧
