@@ -177,7 +177,7 @@ def classify_4x4_blocks(blocks: np.ndarray, variance_threshold: float = 5.0) -> 
                     else:
                         blocks_4x4.append(np.zeros(BYTES_PER_BLOCK, dtype=np.uint8))
             
-            # 检查每个2x2子块是否内部一致
+            # 检查每个2x2子块是否内部一致（而非整个4x4块）
             all_2x2_blocks_are_uniform = True
             for block in blocks_4x4:
                 if calculate_2x2_block_variance(block) > variance_threshold:
@@ -185,27 +185,27 @@ def classify_4x4_blocks(blocks: np.ndarray, variance_threshold: float = 5.0) -> 
                     break
             
             if all_2x2_blocks_are_uniform:
-                # 大色块：4个2x2块各自内部一致，可以下采样为一个2x2块
-                # 每个2x2块取平均值，然后用这4个平均值组成一个下采样的2x2块
+                # 大色块：每个2x2块内部都一致，可以下采样为一个2x2块
+                # 每个2x2块取其内部的平均值，然后用这4个平均值组成一个下采样的2x2块
                 downsampled_block = np.zeros(BYTES_PER_BLOCK, dtype=np.uint8)
                 
-                # 提取每个2x2块的平均Y值（已经是平均的，直接取第一个Y值）
+                # 提取每个2x2块的内部平均值
                 y_values = []
                 d_r_values = []
                 d_g_values = []
                 d_b_values = []
                 
                 for block in blocks_4x4:
-                    # 每个2x2块内部一致，所以4个Y值应该相近，取平均
+                    # 每个2x2块内部一致，取其4个Y值的平均
                     avg_y = np.mean(block[:4])
                     y_values.append(int(avg_y))
                     
-                    # 色度分量直接使用
+                    # 色度分量直接使用（已经是该2x2块的平均色度）
                     d_r_values.append(block[4].view(np.int8))
                     d_g_values.append(block[5].view(np.int8))
                     d_b_values.append(block[6].view(np.int8))
                 
-                # 构建下采样的2x2块
+                # 构建下采样的2x2块：用4个2x2子块的平均值构成新的2x2块
                 downsampled_block[:4] = np.array(y_values, dtype=np.uint8)
                 downsampled_block[4] = np.clip(np.mean(d_r_values), -128, 127).astype(np.int8).view(np.uint8)
                 downsampled_block[5] = np.clip(np.mean(d_g_values), -128, 127).astype(np.int8).view(np.uint8)
@@ -214,7 +214,7 @@ def classify_4x4_blocks(blocks: np.ndarray, variance_threshold: float = 5.0) -> 
                 color_blocks.append(downsampled_block)
                 block_types[(big_by, big_bx)] = 'color'
             else:
-                # 纹理块：保留所有4个2x2块
+                # 纹理块：至少有一个2x2子块内部不一致，保留所有4个2x2块
                 detail_blocks.extend(blocks_4x4)
                 block_types[(big_by, big_bx)] = 'detail'
     
@@ -242,7 +242,7 @@ def classify_4x4_blocks_unified(blocks: np.ndarray, variance_threshold: float = 
                     else:
                         blocks_4x4.append(np.zeros(BYTES_PER_BLOCK, dtype=np.uint8))
             
-            # 检查每个2x2子块是否内部一致
+            # 检查每个2x2子块是否内部一致（而非整个4x4块）
             all_2x2_blocks_are_uniform = True
             for block in blocks_4x4:
                 if calculate_2x2_block_variance(block) > variance_threshold:
@@ -250,7 +250,7 @@ def classify_4x4_blocks_unified(blocks: np.ndarray, variance_threshold: float = 
                     break
             
             if all_2x2_blocks_are_uniform:
-                # 大色块：用下采样的2x2块表示
+                # 大色块：每个2x2子块内部都一致，用下采样的2x2块表示
                 downsampled_block = np.zeros(BYTES_PER_BLOCK, dtype=np.uint8)
                 
                 y_values = []
@@ -259,12 +259,14 @@ def classify_4x4_blocks_unified(blocks: np.ndarray, variance_threshold: float = 
                 d_b_values = []
                 
                 for block in blocks_4x4:
+                    # 每个2x2块内部一致，取其内部平均值
                     avg_y = np.mean(block[:4])
                     y_values.append(int(avg_y))
                     d_r_values.append(block[4].view(np.int8))
                     d_g_values.append(block[5].view(np.int8))
                     d_b_values.append(block[6].view(np.int8))
                 
+                # 用4个2x2子块的平均值构成下采样块
                 downsampled_block[:4] = np.array(y_values, dtype=np.uint8)
                 downsampled_block[4] = np.clip(np.mean(d_r_values), -128, 127).astype(np.int8).view(np.uint8)
                 downsampled_block[5] = np.clip(np.mean(d_g_values), -128, 127).astype(np.int8).view(np.uint8)
@@ -274,7 +276,7 @@ def classify_4x4_blocks_unified(blocks: np.ndarray, variance_threshold: float = 
                 all_blocks.append(downsampled_block)
                 block_types[(big_by, big_bx)] = ('color', [block_idx])
             else:
-                # 纹理块：保留所有4个2x2块
+                # 纹理块：至少有一个2x2子块内部不一致，保留所有4个2x2块
                 block_indices = []
                 for block in blocks_4x4:
                     block_idx = len(all_blocks)
@@ -686,7 +688,7 @@ def extract_effective_blocks_from_big_blocks(blocks: np.ndarray, big_block_posit
                 else:
                     blocks_4x4.append(np.zeros(BYTES_PER_BLOCK, dtype=np.uint8))
         
-        # 检查是否为色块（所有2x2子块内部一致）
+        # 检查是否为色块（每个2x2子块内部一致）
         all_2x2_blocks_are_uniform = True
         for block in blocks_4x4:
             if calculate_2x2_block_variance(block) > variance_threshold:
@@ -703,12 +705,14 @@ def extract_effective_blocks_from_big_blocks(blocks: np.ndarray, big_block_posit
             d_b_values = []
             
             for block in blocks_4x4:
+                # 每个2x2块内部一致，取其内部平均值
                 avg_y = np.mean(block[:4])
                 y_values.append(int(avg_y))
                 d_r_values.append(block[4].view(np.int8))
                 d_g_values.append(block[5].view(np.int8))
                 d_b_values.append(block[6].view(np.int8))
             
+            # 用4个2x2子块的平均值构成下采样块
             downsampled_block[:4] = np.array(y_values, dtype=np.uint8)
             downsampled_block[4] = np.clip(np.mean(d_r_values), -128, 127).astype(np.int8).view(np.uint8)
             downsampled_block[5] = np.clip(np.mean(d_g_values), -128, 127).astype(np.int8).view(np.uint8)
