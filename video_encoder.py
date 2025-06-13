@@ -528,239 +528,263 @@ def encode_strip_p_frame_with_4x4_blocks(current_blocks: np.ndarray, prev_blocks
     total_updates = total_4x4_updates + total_2x2_updates
     return bytes(data), False, used_zones, total_4x4_updates, total_2x2_updates
 
-def quantize_blocks_unified(blocks_data: np.ndarray, codebook: np.ndarray) -> np.ndarray:
-    """使用统一码表对块进行量化（避免产生0xFE）"""
-    if len(blocks_data) == 0:
-        return np.array([], dtype=np.uint8)
+def classify_4x4_blocks_in_8x8_super_block(blocks_8x8: list, codebook_4x4: np.ndarray,
+                                          codebook_2x2: np.ndarray, distortion_threshold: float = 10.0) -> tuple:
+    """对8x8超级块内的4个4x4子块进行分类"""
+    block_4x4_usage = {}  # 记录哪些4x4子块使用4x4码表
     
-    # 只使用前若干项进行量化，因为最后几项用于特殊标记
-    effective_codebook = codebook[:EFFECTIVE_UNIFIED_CODEBOOK_SIZE]
+    # 将16个2x2块重组为4个4x4块
+    blocks_4x4_in_super = []
+    for quad_idx in range(4):  # 4个4x4块
+        quad_by = quad_idx // 2
+        quad_bx = quad_idx % 2
+        blocks_2x2_in_4x4 = []
+        for sub_by in range(2):
+            for sub_bx in range(2):
+                block_idx = (quad_by * 2 + sub_by) * 4 + (quad_bx * 2 + sub_bx)
+                blocks_2x2_in_4x4.append(blocks_8x8[block_idx])
+        block_4x4 = pack_4x4_block_from_2x2_blocks(blocks_2x2_in_4x4)
+        blocks_4x4_in_super.append((quad_idx, block_4x4, blocks_2x2_in_4x4))
     
-    blocks_for_clustering = convert_blocks_for_clustering(blocks_data)
-    codebook_for_clustering = convert_blocks_for_clustering(effective_codebook)
-    
-    # 使用Numba加速的距离计算
-    indices = quantize_blocks_distance_numba(blocks_for_clustering, codebook_for_clustering)
-    
-    return indices
-
-@njit
-def quantize_blocks_distance_numba(blocks_for_clustering, codebook_for_clustering):
-    """Numba加速的块量化距离计算"""
-    n_blocks = blocks_for_clustering.shape[0]
-    n_codebook = codebook_for_clustering.shape[0]
-    indices = np.zeros(n_blocks, dtype=np.uint8)
-    
-    for i in range(n_blocks):
-        min_dist = np.inf
-        best_idx = 0
-        
-        for j in range(n_codebook):
-            dist = 0.0
-            # Y分量（前4个字节）使用2倍权重，计算SAD
-            for k in range(4):
-                diff = blocks_for_clustering[i, k] - codebook_for_clustering[j, k]
-                dist += 2.0 * abs(diff)
+    # 对每个4x4块独立决定使用哪种码表
+    for quad_idx, block_4x4, blocks_2x2_in_4x4 in blocks_4x4_in_super:
+        # 尝试4x4码表
+        indices_4x4, reconstructed_4x4 = quantize_4x4_blocks([block_4x4], codebook_4x4)
+        if len(reconstructed_4x4) > 0:
+            reconstructed_2x2_from_4x4 = unpack_4x4_block_to_2x2_blocks(reconstructed_4x4[0])
+            distortion_4x4 = calculate_distortion(blocks_2x2_in_4x4, reconstructed_2x2_from_4x4)
             
-            # 色度分量（后3个字节）使用1倍权重，计算SAD
-            # 注意：这里的数据已经在convert_blocks_for_clustering中转换为有符号数
-            for k in range(4, BYTES_PER_2X2_BLOCK):
-                diff = blocks_for_clustering[i, k] - codebook_for_clustering[j, k]
-                dist += abs(diff)
+            # 尝试2x2码表
+            indices_2x2 = []
+            reconstructed_2x2_from_2x2 = []
+            for block_2x2 in blocks_2x2_in_4x4:
+                idx = quantize_blocks_unified(block_2x2.reshape(1, -1), codebook_2x2)[0]
+                indices_2x2.append(idx)
+                reconstructed_2x2_from_2x2.append(codebook_2x2[idx])
+            distortion_2x2 = calculate_distortion(blocks_2x2_in_4x4, reconstructed_2x2_from_2x2)
             
-            if dist < min_dist:
-                min_dist = dist
-                best_idx = j
-        
-        indices[i] = best_idx
-    
-    return indices
-
-def main():
-    pa = argparse.ArgumentParser(description="Encode to GBA YUV9 with 4x4 block codebook")
-    pa.add_argument("input")
-    pa.add_argument("--duration", type=float, default=5.0)
-    pa.add_argument("--full-duration", action="store_true")
-    pa.add_argument("--fps", type=int, default=30)
-    pa.add_argument("--out", default="video_data")
-    pa.add_argument("--strip-count", type=int, default=DEFAULT_STRIP_COUNT)
-    pa.add_argument("--i-frame-interval", type=int, default=60)
-    pa.add_argument("--diff-threshold", type=float, default=2.0)
-    pa.add_argument("--force-i-threshold", type=float, default=0.7)
-    pa.add_argument("--variance-threshold", type=float, default=5.0)
-    pa.add_argument("--distortion-threshold", type=float, default=10.0,
-                   help="失真阈值，用于决定是否使用4x4块码表（默认10.0）")
-    pa.add_argument("--codebook-4x4-size", type=int, default=DEFAULT_4X4_CODEBOOK_SIZE)
-    pa.add_argument("--codebook-2x2-size", type=int, default=EFFECTIVE_UNIFIED_CODEBOOK_SIZE)
-    pa.add_argument("--kmeans-max-iter", type=int, default=200)
-    pa.add_argument("--threads", type=int, default=None)
-    pa.add_argument("--i-frame-weight", type=int, default=3)
-    pa.add_argument("--dither", action="store_true")
-
-    args = pa.parse_args()
-
-    cap = cv2.VideoCapture(args.input)
-    if not cap.isOpened():
-        raise SystemExit("❌ 打不开输入文件")
-
-    src_fps = cap.get(cv2.CAP_PROP_FPS) or 30
-    every = int(round(src_fps / args.fps))
-    
-    if args.full_duration:
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        grab_max = total_frames
-        actual_duration = total_frames / src_fps
-        print(f"编码整个视频: {total_frames} 帧，时长 {actual_duration:.2f} 秒")
-    else:
-        grab_max = int(args.duration * src_fps)
-        print(f"编码时长: {args.duration} 秒 ({grab_max} 帧)")
-
-    strip_heights = calculate_strip_heights(HEIGHT, args.strip_count)
-    print(f"条带配置: {args.strip_count} 个条带，高度分别为: {strip_heights}")
-    print(f"码本配置: 4x4块码表{args.codebook_4x4_size}项, 2x2块码表{args.codebook_2x2_size}项")
-    if args.dither:
-        print(f"🎨 已启用抖动算法（蛇形扫描）")
-    
-    frames = []
-    idx = 0
-    print("正在提取帧...")
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.threads) as executor:
-        while idx < grab_max:
-            ret, frm = cap.read()
-            if not ret:
-                break
-            if idx % every == 0:
-                frm = cv2.resize(frm, (WIDTH, HEIGHT), cv2.INTER_AREA)
-                # if args.dither:
-                #     frm = apply_dither_optimized(frm)
-                strip_y_list = []
-                y = 0
-                for strip_height in strip_heights:
-                    strip_y_list.append((frm, y, strip_height))
-                    y += strip_height
-                future_to_idx = {
-                    executor.submit(pack_yuv420_strip, *args): i
-                    for i, args in enumerate(strip_y_list)
-                }
-                frame_strips = [None] * len(strip_y_list)
-                for future in concurrent.futures.as_completed(future_to_idx):
-                    i = future_to_idx[future]
-                    frame_strips[i] = future.result()
-                frames.append(frame_strips)
-                
-                if len(frames) % 30 == 0:
-                    print(f"  已提取 {len(frames)} 帧")
-            idx += 1
-    cap.release()
-
-    if not frames:
-        raise SystemExit("❌ 没有任何帧被采样")
-
-    print(f"总共提取了 {len(frames)} 帧")
-
-    # 生成码表
-    gop_codebooks = generate_gop_codebooks_with_4x4_blocks(
-        frames, args.strip_count, args.i_frame_interval, 
-        args.variance_threshold, args.diff_threshold, args.distortion_threshold,
-        args.codebook_4x4_size, args.codebook_2x2_size,
-        args.kmeans_max_iter, args.i_frame_weight
-    )
-
-    # 编码所有帧
-    print("正在编码帧...")
-    encoded_frames = []
-    frame_offsets = []
-    current_offset = 0
-    prev_strips = [None] * args.strip_count
-    
-    for frame_idx, current_strips in enumerate(frames):
-        frame_offsets.append(current_offset)
-        
-        # 找到当前GOP
-        gop_start = (frame_idx // args.i_frame_interval) * args.i_frame_interval
-        gop_data = gop_codebooks[gop_start]
-        
-        frame_data = bytearray()
-        
-        for strip_idx, current_strip in enumerate(current_strips):
-            strip_gop_data = gop_data[strip_idx]
-            codebook_4x4 = strip_gop_data['codebook_4x4']
-            codebook_2x2 = strip_gop_data['codebook_2x2']
-            
-            # 找到当前帧的分类信息
-            block_types = None
-            block_4x4_indices = None
-            for fid, bt, bbi in strip_gop_data['block_types_list']:
-                if fid == frame_idx:
-                    block_types = bt
-                    block_4x4_indices = bbi
-                    break
-            
-            force_i_frame = (frame_idx % args.i_frame_interval == 0) or frame_idx == 0
-            
-            if force_i_frame or prev_strips[strip_idx] is None:
-                strip_data = encode_strip_i_frame_with_4x4_blocks(
-                    current_strip, codebook_4x4, codebook_2x2, 
-                    block_types, block_4x4_indices
-                )
-                is_i_frame = True
-                
-                # 计算码本和索引大小
-                codebook_4x4_size = args.codebook_4x4_size * BYTES_PER_4X4_BLOCK
-                codebook_2x2_size = args.codebook_2x2_size * BYTES_PER_2X2_BLOCK
-                index_size = len(strip_data) - 1 - codebook_4x4_size - codebook_2x2_size
-                
-                encoding_stats.add_i_frame(
-                    strip_idx, len(strip_data), 
-                    is_forced=force_i_frame,
-                    codebook_size=codebook_4x4_size + codebook_2x2_size,
-                    index_size=max(0, index_size)
-                )
+            # 选择失真更小的方案
+            if distortion_4x4 <= distortion_2x2 and distortion_4x4 <= distortion_threshold:
+                block_4x4_usage[quad_idx] = ('4x4', indices_4x4[0])
             else:
-                strip_data, is_i_frame, used_zones, updates_4x4, updates_2x2 = encode_strip_p_frame_with_4x4_blocks(
-                    current_strip, prev_strips[strip_idx],
-                    codebook_4x4, codebook_2x2, block_types, block_4x4_indices,
-                    args.diff_threshold, args.force_i_threshold, args.variance_threshold, args.distortion_threshold
-                )
+                block_4x4_usage[quad_idx] = ('2x2', indices_2x2)
+        else:
+            # 4x4量化失败，使用2x2
+            indices_2x2 = []
+            for block_2x2 in blocks_2x2_in_4x4:
+                idx = quantize_blocks_unified(block_2x2.reshape(1, -1), codebook_2x2)[0]
+                indices_2x2.append(idx)
+            block_4x4_usage[quad_idx] = ('2x2', indices_2x2)
+    
+    return block_4x4_usage
+
+def identify_updated_4x4_blocks(current_blocks: np.ndarray, prev_blocks: np.ndarray,
+                               diff_threshold: float) -> dict:
+    """识别需要更新的4x4块（以4x4块为单位）"""
+    if prev_blocks is None or current_blocks.shape != prev_blocks.shape:
+        # 如果没有前一帧，所有4x4块都需要更新
+        blocks_h, blocks_w = current_blocks.shape[:2]
+        super_blocks_h = blocks_h // 4
+        super_blocks_w = blocks_w // 4
+        updated_4x4_blocks = {}
+        for super_by in range(super_blocks_h):
+            for super_bx in range(super_blocks_w):
+                updated_4x4_blocks[(super_by, super_bx)] = [0, 1, 2, 3]  # 所有4个4x4块都更新
+        return updated_4x4_blocks
+    
+    blocks_h, blocks_w = current_blocks.shape[:2]
+    super_blocks_h = blocks_h // 4
+    super_blocks_w = blocks_w // 4
+    updated_4x4_blocks = {}
+    
+    for super_by in range(super_blocks_h):
+        for super_bx in range(super_blocks_w):
+            updated_quads = []
+            
+            # 检查4个4x4子块
+            for quad_idx in range(4):
+                quad_by = quad_idx // 2
+                quad_bx = quad_idx % 2
                 
-                if is_i_frame:
-                    codebook_4x4_size = args.codebook_4x4_size * BYTES_PER_4X4_BLOCK
-                    codebook_2x2_size = args.codebook_2x2_size * BYTES_PER_2X2_BLOCK
-                    index_size = len(strip_data) - 1 - codebook_4x4_size - codebook_2x2_size
-                    
-                    encoding_stats.add_i_frame(
-                        strip_idx, len(strip_data), 
-                        is_forced=False,
-                        codebook_size=codebook_4x4_size + codebook_2x2_size,
-                        index_size=max(0, index_size)
-                    )
+                # 计算该4x4块内4个2x2块的差异
+                total_diff = 0.0
+                for sub_by in range(2):
+                    for sub_bx in range(2):
+                        by = super_by * 4 + quad_by * 2 + sub_by
+                        bx = super_bx * 4 + quad_bx * 2 + sub_bx
+                        
+                        if by < blocks_h and bx < blocks_w:
+                            current_block = current_blocks[by, bx]
+                            prev_block = prev_blocks[by, bx]
+                            
+                            # 计算Y分量差异
+                            y_diff = np.mean(np.abs(current_block[:4].astype(np.float32) - 
+                                                   prev_block[:4].astype(np.float32)))
+                            total_diff += y_diff
+                
+                avg_diff = total_diff / 4.0  # 4个2x2块的平均差异
+                if avg_diff > diff_threshold:
+                    updated_quads.append(quad_idx)
+            
+            if updated_quads:
+                updated_4x4_blocks[(super_by, super_bx)] = updated_quads
+    
+    return updated_4x4_blocks
+
+def encode_strip_i_frame_mixed(blocks: np.ndarray, codebook_4x4: np.ndarray,
+                              codebook_2x2: np.ndarray, distortion_threshold: float = 10.0) -> bytes:
+    """编码I帧条带（混编模式）"""
+    data = bytearray()
+    data.append(FRAME_TYPE_I)
+    
+    if blocks.size > 0:
+        blocks_h, blocks_w = blocks.shape[:2]
+        super_blocks_h = blocks_h // 4
+        super_blocks_w = blocks_w // 4
+        
+        # 存储4x4块码表
+        data.extend(codebook_4x4.flatten().tobytes())
+        
+        # 存储2x2块码表
+        data.extend(codebook_2x2.flatten().tobytes())
+        
+        # 按8x8超级块的顺序编码
+        for super_by in range(super_blocks_h):
+            for super_bx in range(super_blocks_w):
+                # 收集当前8x8超级块的16个2x2块
+                blocks_8x8 = []
+                for sub_by in range(4):
+                    for sub_bx in range(4):
+                        by = super_by * 4 + sub_by
+                        bx = super_bx * 4 + sub_bx
+                        if by < blocks_h and bx < blocks_w:
+                            blocks_8x8.append(blocks[by, bx])
+                        else:
+                            blocks_8x8.append(np.zeros(BYTES_PER_2X2_BLOCK, dtype=np.uint8))
+                
+                # 对4个4x4子块进行分类
+                block_4x4_usage = classify_4x4_blocks_in_8x8_super_block(
+                    blocks_8x8, codebook_4x4, codebook_2x2, distortion_threshold)
+                
+                # 编码4个4x4子块
+                for quad_idx in range(4):
+                    if quad_idx in block_4x4_usage:
+                        mode, indices = block_4x4_usage[quad_idx]
+                        if mode == '4x4':
+                            # 4x4块：0xFF + 1个4x4块码表索引
+                            data.append(BLOCK_4X4_MARKER)
+                            data.append(indices)
+                        else:  # mode == '2x2'
+                            # 2x2块：4个2x2块码表索引
+                            for idx in indices:
+                                data.append(idx)
+                    else:
+                        # 出错情况，用全0填充
+                        data.extend([0] * 4)
+    
+    return bytes(data)
+
+def encode_strip_p_frame_mixed(current_blocks: np.ndarray, prev_blocks: np.ndarray,
+                              codebook_4x4: np.ndarray, codebook_2x2: np.ndarray,
+                              diff_threshold: float, force_i_threshold: float = 0.7,
+                              distortion_threshold: float = 10.0) -> tuple:
+    """编码P帧条带（混编模式 + 4x4块跳过）"""
+    if prev_blocks is None or current_blocks.shape != prev_blocks.shape:
+        i_frame_data = encode_strip_i_frame_mixed(
+            current_blocks, codebook_4x4, codebook_2x2, distortion_threshold)
+        return i_frame_data, True, 0, 0, 0
+    
+    blocks_h, blocks_w = current_blocks.shape[:2]
+    super_blocks_h = blocks_h // 4
+    super_blocks_w = blocks_w // 4
+    total_4x4_blocks = super_blocks_h * super_blocks_w * 4
+    
+    if total_4x4_blocks == 0:
+        return b'', True, 0, 0, 0
+    
+    # 识别需要更新的4x4块
+    updated_4x4_blocks = identify_updated_4x4_blocks(current_blocks, prev_blocks, diff_threshold)
+    
+    # 计算更新比例（以4x4块为单位）
+    total_updated_4x4 = sum(len(quads) for quads in updated_4x4_blocks.values())
+    update_ratio = total_updated_4x4 / total_4x4_blocks if total_4x4_blocks > 0 else 0
+    
+    if update_ratio > force_i_threshold:
+        i_frame_data = encode_strip_i_frame_mixed(
+            current_blocks, codebook_4x4, codebook_2x2, distortion_threshold)
+        return i_frame_data, True, 0, 0, 0
+    
+    # 编码P帧
+    data = bytearray()
+    data.append(FRAME_TYPE_P)
+    
+    # 计算区域数量
+    zones_count = (super_blocks_h + ZONE_HEIGHT_SUPER_BLOCKS - 1) // ZONE_HEIGHT_SUPER_BLOCKS
+    
+    # 按区域组织更新
+    zone_updates = [[] for _ in range(zones_count)]
+    
+    for (super_by, super_bx), updated_quads in updated_4x4_blocks.items():
+        # 计算属于哪个区域
+        zone_idx = min(super_by // ZONE_HEIGHT_SUPER_BLOCKS, zones_count - 1)
+        zone_relative_by = super_by % ZONE_HEIGHT_SUPER_BLOCKS
+        zone_relative_idx = zone_relative_by * super_blocks_w + super_bx
+        
+        # 收集当前8x8超级块的16个2x2块
+        blocks_8x8 = []
+        for sub_by in range(4):
+            for sub_bx in range(4):
+                by = super_by * 4 + sub_by
+                bx = super_bx * 4 + sub_bx
+                if by < blocks_h and bx < blocks_w:
+                    blocks_8x8.append(current_blocks[by, bx])
                 else:
-                    total_updates = updates_4x4 + updates_2x2
-                    
-                    encoding_stats.add_p_frame(
-                        strip_idx, len(strip_data), total_updates, used_zones,
-                        updates_4x4, updates_2x2
-                    )
-            
-            frame_data.extend(struct.pack('<H', len(strip_data)))
-            frame_data.extend(strip_data)
-            
-            prev_strips[strip_idx] = current_strip.copy() if current_strip.size > 0 else None
+                    blocks_8x8.append(np.zeros(BYTES_PER_2X2_BLOCK, dtype=np.uint8))
         
-        encoded_frames.append(bytes(frame_data))
-        current_offset += len(frame_data)
+        # 对需要更新的4x4子块进行分类
+        block_4x4_usage = classify_4x4_blocks_in_8x8_super_block(
+            blocks_8x8, codebook_4x4, codebook_2x2, distortion_threshold)
         
-        if frame_idx % 30 == 0 or frame_idx == len(frames) - 1:
-            print(f"  已编码 {frame_idx + 1}/{len(frames)} 帧")
+        # 构建更新数据
+        update_data = []
+        for quad_idx in range(4):
+            if quad_idx in updated_quads:
+                mode, indices = block_4x4_usage[quad_idx]
+                if mode == '4x4':
+                    update_data.extend([BLOCK_4X4_MARKER, indices])
+                else:  # mode == '2x2'
+                    update_data.extend(indices)
+            else:
+                # 跳过该4x4块
+                update_data.append(BLOCK_SKIP_MARKER)
+        
+        zone_updates[zone_idx].append((zone_relative_idx, update_data))
     
-    all_data = b''.join(encoded_frames)
+    # 生成区域bitmap
+    zone_bitmap = 0
+    used_zones = 0
+    total_updates = 0
     
-    write_header(pathlib.Path(args.out).with_suffix(".h"), len(frames), len(all_data), 
-                args.strip_count, strip_heights, args.codebook_4x4_size, args.codebook_2x2_size)
-    write_source(pathlib.Path(args.out).with_suffix(".c"), all_data, frame_offsets, strip_heights)
+    for zone_idx in range(zones_count):
+        if zone_updates[zone_idx]:
+            zone_bitmap |= (1 << zone_idx)
+            used_zones += 1
+            total_updates += len(zone_updates[zone_idx])
     
-    # 打印详细统计
-    encoding_stats.print_summary(len(frames), len(all_data))
+    data.extend(struct.pack('<H', zone_bitmap))
+    
+    # 按区域编码更新
+    for zone_idx in range(zones_count):
+        if zone_bitmap & (1 << zone_idx):
+            updates = zone_updates[zone_idx]
+            data.append(len(updates))
+            
+            for relative_idx, update_data in updates:
+                data.append(relative_idx)
+                for byte_val in update_data:
+                    data.append(byte_val)
+    
+    return bytes(data), False, used_zones, total_updates, 0
 
 def write_header(path_h: pathlib.Path, frame_cnt: int, total_bytes: int, strip_count: int, 
                 strip_heights: list, codebook_4x4_size: int, codebook_2x2_size: int):
@@ -781,6 +805,7 @@ def write_header(path_h: pathlib.Path, frame_cnt: int, total_bytes: int, strip_c
             #define EFFECTIVE_UNIFIED_CODEBOOK_SIZE {EFFECTIVE_UNIFIED_CODEBOOK_SIZE}
 
             #define BLOCK_4X4_MARKER {BLOCK_4X4_MARKER}
+            #define BLOCK_SKIP_MARKER {BLOCK_SKIP_MARKER}
             
             // 帧类型定义
             #define FRAME_TYPE_I        0x00
@@ -957,7 +982,231 @@ def compute_block_differences_numba(current_flat, prev_flat, blocks_h, blocks_w)
     
     return block_diffs
 
+def quantize_blocks_unified(blocks_data: np.ndarray, codebook: np.ndarray) -> np.ndarray:
+    """使用统一码表对块进行量化（避免产生0xFE和0xFF）"""
+    if len(blocks_data) == 0:
+        return np.array([], dtype=np.uint8)
+    
+    # 只使用前253项进行量化，因为0xFE和0xFF用于特殊标记
+    effective_codebook = codebook[:EFFECTIVE_UNIFIED_CODEBOOK_SIZE]
+    
+    blocks_for_clustering = convert_blocks_for_clustering(blocks_data)
+    codebook_for_clustering = convert_blocks_for_clustering(effective_codebook)
+    
+    # 使用Numba加速的距离计算
+    indices = quantize_blocks_distance_numba(blocks_for_clustering, codebook_for_clustering)
+    
+    return indices
 
+@njit
+def quantize_blocks_distance_numba(blocks_for_clustering, codebook_for_clustering):
+    """Numba加速的块量化距离计算"""
+    n_blocks = blocks_for_clustering.shape[0]
+    n_codebook = codebook_for_clustering.shape[0]
+    indices = np.zeros(n_blocks, dtype=np.uint8)
+    
+    for i in range(n_blocks):
+        min_dist = np.inf
+        best_idx = 0
+        
+        for j in range(n_codebook):
+            dist = 0.0
+            # Y分量（前4个字节）使用2倍权重，计算SAD
+            for k in range(4):
+                diff = blocks_for_clustering[i, k] - codebook_for_clustering[j, k]
+                dist += 2.0 * abs(diff)
+            
+            # 色度分量（后3个字节）使用1倍权重，计算SAD
+            # 注意：这里的数据已经在convert_blocks_for_clustering中转换为有符号数
+            for k in range(4, BYTES_PER_2X2_BLOCK):
+                diff = blocks_for_clustering[i, k] - codebook_for_clustering[j, k]
+                dist += abs(diff)
+            
+            if dist < min_dist:
+                min_dist = dist
+                best_idx = j
+        
+        indices[i] = best_idx
+    
+    return indices
+
+def main():
+    pa = argparse.ArgumentParser(description="Encode to GBA YUV9 with mixed 4x4/2x2 block codebook")
+    pa.add_argument("input")
+    pa.add_argument("--duration", type=float, default=5.0)
+    pa.add_argument("--full-duration", action="store_true")
+    pa.add_argument("--fps", type=int, default=30)
+    pa.add_argument("--out", default="video_data")
+    pa.add_argument("--strip-count", type=int, default=DEFAULT_STRIP_COUNT)
+    pa.add_argument("--i-frame-interval", type=int, default=60)
+    pa.add_argument("--diff-threshold", type=float, default=2.0)
+    pa.add_argument("--force-i-threshold", type=float, default=0.7)
+    pa.add_argument("--variance-threshold", type=float, default=5.0)
+    pa.add_argument("--distortion-threshold", type=float, default=10.0,
+                   help="失真阈值，用于决定是否使用4x4块码表（默认10.0）")
+    pa.add_argument("--codebook-4x4-size", type=int, default=DEFAULT_4X4_CODEBOOK_SIZE)
+    pa.add_argument("--codebook-2x2-size", type=int, default=EFFECTIVE_UNIFIED_CODEBOOK_SIZE)
+    pa.add_argument("--kmeans-max-iter", type=int, default=200)
+    pa.add_argument("--threads", type=int, default=None)
+    pa.add_argument("--i-frame-weight", type=int, default=3)
+    pa.add_argument("--dither", action="store_true")
+
+    args = pa.parse_args()
+
+    cap = cv2.VideoCapture(args.input)
+    if not cap.isOpened():
+        raise SystemExit("❌ 打不开输入文件")
+
+    src_fps = cap.get(cv2.CAP_PROP_FPS) or 30
+    every = int(round(src_fps / args.fps))
+    
+    if args.full_duration:
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        grab_max = total_frames
+        actual_duration = total_frames / src_fps
+        print(f"编码整个视频: {total_frames} 帧，时长 {actual_duration:.2f} 秒")
+    else:
+        grab_max = int(args.duration * src_fps)
+        print(f"编码时长: {args.duration} 秒 ({grab_max} 帧)")
+
+    strip_heights = calculate_strip_heights(HEIGHT, args.strip_count)
+    print(f"条带配置: {args.strip_count} 个条带，高度分别为: {strip_heights}")
+    print(f"码本配置: 4x4块码表{args.codebook_4x4_size}项, 2x2块码表{args.codebook_2x2_size}项")
+    print(f"🔄 已启用混编模式（4x4+2x2混合编码）")
+    if args.dither:
+        print(f"🎨 已启用抖动算法（蛇形扫描）")
+    
+    frames = []
+    idx = 0
+    print("正在提取帧...")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.threads) as executor:
+        while idx < grab_max:
+            ret, frm = cap.read()
+            if not ret:
+                break
+            if idx % every == 0:
+                frm = cv2.resize(frm, (WIDTH, HEIGHT), cv2.INTER_AREA)
+                # if args.dither:
+                #     frm = apply_dither_optimized(frm)
+                strip_y_list = []
+                y = 0
+                for strip_height in strip_heights:
+                    strip_y_list.append((frm, y, strip_height))
+                    y += strip_height
+                future_to_idx = {
+                    executor.submit(pack_yuv420_strip, *args): i
+                    for i, args in enumerate(strip_y_list)
+                }
+                frame_strips = [None] * len(strip_y_list)
+                for future in concurrent.futures.as_completed(future_to_idx):
+                    i = future_to_idx[future]
+                    frame_strips[i] = future.result()
+                frames.append(frame_strips)
+                
+                if len(frames) % 30 == 0:
+                    print(f"  已提取 {len(frames)} 帧")
+            idx += 1
+    cap.release()
+
+    if not frames:
+        raise SystemExit("❌ 没有任何帧被采样")
+
+    print(f"总共提取了 {len(frames)} 帧")
+
+    # 生成码表
+    gop_codebooks = generate_gop_codebooks_with_4x4_blocks(
+        frames, args.strip_count, args.i_frame_interval, 
+        args.variance_threshold, args.diff_threshold, args.distortion_threshold,
+        args.codebook_4x4_size, args.codebook_2x2_size,
+        args.kmeans_max_iter, args.i_frame_weight
+    )
+
+    # 编码所有帧
+    print("正在编码帧...")
+    encoded_frames = []
+    frame_offsets = []
+    current_offset = 0
+    prev_strips = [None] * args.strip_count
+    
+    for frame_idx, current_strips in enumerate(frames):
+        frame_offsets.append(current_offset)
+        
+        # 找到当前GOP
+        gop_start = (frame_idx // args.i_frame_interval) * args.i_frame_interval
+        gop_data = gop_codebooks[gop_start]
+        
+        frame_data = bytearray()
+        
+        for strip_idx, current_strip in enumerate(current_strips):
+            strip_gop_data = gop_data[strip_idx]
+            codebook_4x4 = strip_gop_data['codebook_4x4']
+            codebook_2x2 = strip_gop_data['codebook_2x2']
+            distortion_threshold = strip_gop_data['distortion_threshold']
+            
+            force_i_frame = (frame_idx % args.i_frame_interval == 0) or frame_idx == 0
+            
+            if force_i_frame or prev_strips[strip_idx] is None:
+                # 使用新的混编I帧编码
+                strip_data = encode_strip_i_frame_mixed(
+                    current_strip, codebook_4x4, codebook_2x2, distortion_threshold
+                )
+                is_i_frame = True
+                
+                # 计算码本和索引大小
+                codebook_4x4_size = args.codebook_4x4_size * BYTES_PER_4X4_BLOCK
+                codebook_2x2_size = args.codebook_2x2_size * BYTES_PER_2X2_BLOCK
+                index_size = len(strip_data) - 1 - codebook_4x4_size - codebook_2x2_size
+                
+                encoding_stats.add_i_frame(
+                    strip_idx, len(strip_data), 
+                    is_forced=force_i_frame,
+                    codebook_size=codebook_4x4_size + codebook_2x2_size,
+                    index_size=max(0, index_size)
+                )
+            else:
+                # 使用新的混编P帧编码
+                strip_data, is_i_frame, used_zones, total_updates, _ = encode_strip_p_frame_mixed(
+                    current_strip, prev_strips[strip_idx],
+                    codebook_4x4, codebook_2x2,
+                    args.diff_threshold, args.force_i_threshold, distortion_threshold
+                )
+                
+                if is_i_frame:
+                    codebook_4x4_size = args.codebook_4x4_size * BYTES_PER_4X4_BLOCK
+                    codebook_2x2_size = args.codebook_2x2_size * BYTES_PER_2X2_BLOCK
+                    index_size = len(strip_data) - 1 - codebook_4x4_size - codebook_2x2_size
+                    
+                    encoding_stats.add_i_frame(
+                        strip_idx, len(strip_data), 
+                        is_forced=False,
+                        codebook_size=codebook_4x4_size + codebook_2x2_size,
+                        index_size=max(0, index_size)
+                    )
+                else:
+                    encoding_stats.add_p_frame(
+                        strip_idx, len(strip_data), total_updates, used_zones,
+                        0, 0  # 这些统计在混编模式下不再适用
+                    )
+            
+            frame_data.extend(struct.pack('<H', len(strip_data)))
+            frame_data.extend(strip_data)
+            
+            prev_strips[strip_idx] = current_strip.copy() if current_strip.size > 0 else None
+        
+        encoded_frames.append(bytes(frame_data))
+        current_offset += len(frame_data)
+        
+        if frame_idx % 30 == 0 or frame_idx == len(frames) - 1:
+            print(f"  已编码 {frame_idx + 1}/{len(frames)} 帧")
+    
+    all_data = b''.join(encoded_frames)
+    
+    write_header(pathlib.Path(args.out).with_suffix(".h"), len(frames), len(all_data), 
+                args.strip_count, strip_heights, args.codebook_4x4_size, args.codebook_2x2_size)
+    write_source(pathlib.Path(args.out).with_suffix(".c"), all_data, frame_offsets, strip_heights)
+    
+    # 打印详细统计
+    encoding_stats.print_summary(len(frames), len(all_data))
 
 if __name__ == "__main__":
     main()

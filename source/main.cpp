@@ -334,14 +334,144 @@ IWRAM_CODE void decode_strip_p_frame_with_8x8_super_blocks(int strip_idx, const 
     }
 }
 
+#define BLOCK_SKIP_MARKER 0xFE  // 新增：跳过4x4块的标记
+
+IWRAM_CODE void decode_strip_i_frame_mixed(int strip_idx, const u8* src, u16* dst)
+{
+    u16 strip_base_offset = strip_info[strip_idx].buffer_offset;
+    
+    // 加载码表
+    copy_4x4_codebook_simple(strip_4x4_codebooks_raw[strip_idx], src, 
+                             &strip_4x4_codebooks[strip_idx], CODEBOOK_4X4_SIZE);
+    src += CODEBOOK_4X4_SIZE * BYTES_PER_4X4_BLOCK;
+    
+    copy_2x2_codebook_simple(strip_2x2_codebooks_raw[strip_idx], src, 
+                            &strip_2x2_codebooks[strip_idx], CODEBOOK_2X2_SIZE);
+    src += CODEBOOK_2X2_SIZE * BYTES_PER_2X2_BLOCK;
+    
+    auto &strip = strip_info[strip_idx];
+    auto &codebook_4x4 = strip_4x4_codebooks[strip_idx];
+    auto &codebook_2x2 = strip_2x2_codebooks[strip_idx];
+    
+    // 计算当前条带的8x8超级块数量
+    u16 strip_super_blocks_w = VIDEO_WIDTH / SUPER_BLOCK_SIZE;
+    u16 strip_super_blocks_h = strip.height / SUPER_BLOCK_SIZE;
+    u16 tot_super_blocks = strip_super_blocks_w * strip_super_blocks_h;
+    
+    u16* strip_dst = dst + strip_base_offset;
+    
+    // 解码所有8x8超级块
+    u16 super_bx = 0, super_by = 0;
+    for (int super_block_idx = 0; super_block_idx < tot_super_blocks; super_block_idx++) {
+        u16 block_offset = super_by * SUPER_BLOCK_SIZE * SCREEN_WIDTH + super_bx * SUPER_BLOCK_SIZE;
+        u16* super_block_dst = strip_dst + block_offset;
+        
+        // 解码4个4x4子块
+        for (int quad_idx = 0; quad_idx < 4; quad_idx++) {
+            u16 quad_by = quad_idx / 2;
+            u16 quad_bx = quad_idx % 2;
+            u16* quad_dst = super_block_dst + quad_by * 4 * SCREEN_WIDTH + quad_bx * 4;
+            
+            u8 first_byte = *src++;
+            
+            if (first_byte == BLOCK_4X4_MARKER) {
+                // 4x4块模式：读取1个4x4块码表索引
+                u8 index_4x4 = *src++;
+                decode_4x4_block_direct(codebook_4x4[index_4x4], quad_dst);
+            } else {
+                // 2x2块模式：当前字节是第一个2x2块码表索引，继续读取3个
+                u8 indices_2x2[4];
+                indices_2x2[0] = first_byte;
+                indices_2x2[1] = *src++;
+                indices_2x2[2] = *src++;
+                indices_2x2[3] = *src++;
+                decode_4x4_block(codebook_2x2, indices_2x2, quad_dst);
+            }
+        }
+        
+        super_bx++;
+        if (super_bx >= strip_super_blocks_w) {
+            super_bx = 0;
+            super_by++;
+        }
+    }
+}
+
+IWRAM_CODE void decode_strip_p_frame_mixed(int strip_idx, const u8* src, u16* dst)
+{
+    u16 strip_base_offset = strip_info[strip_idx].buffer_offset;
+    
+    // 读取区域bitmap
+    u16 zone_bitmap = src[0] | (src[1] << 8);
+    src += 2;
+
+    auto &codebook_4x4 = strip_4x4_codebooks[strip_idx];
+    auto &codebook_2x2 = strip_2x2_codebooks[strip_idx];
+    
+    // 计算该条带的8x8超级块布局
+    u16 strip_super_blocks_w = VIDEO_WIDTH / SUPER_BLOCK_SIZE;
+    u16 strip_super_blocks_h = strip_info[strip_idx].height / SUPER_BLOCK_SIZE;
+    
+    // 处理每个有效区域
+    u8 zone_idx = 0;
+    while (zone_bitmap) {
+        if (zone_bitmap & 1) {
+            u8 updates_count = *src++;
+            
+            // 计算区域在条带中的起始超级块行
+            u16 zone_start_super_by = zone_idx * ZONE_HEIGHT_SUPER_BLOCKS;
+            
+            // 处理该区域的所有更新
+            for (u8 i = 0; i < updates_count; i++) {
+                u8 zone_relative_idx = *src++;
+                
+                u16 relative_super_by = zone_relative_idx / strip_super_blocks_w;
+                u16 relative_super_bx = zone_relative_idx % strip_super_blocks_w;
+                u16 absolute_super_by = zone_start_super_by + relative_super_by;
+                
+                u16 block_offset = absolute_super_by * SUPER_BLOCK_SIZE * SCREEN_WIDTH + relative_super_bx * SUPER_BLOCK_SIZE;
+                u16* super_block_dst = dst + strip_base_offset + block_offset;
+                
+                // 解码4个4x4子块
+                for (int quad_idx = 0; quad_idx < 4; quad_idx++) {
+                    u16 quad_by = quad_idx / 2;
+                    u16 quad_bx = quad_idx % 2;
+                    u16* quad_dst = super_block_dst + quad_by * 4 * SCREEN_WIDTH + quad_bx * 4;
+                    
+                    u8 first_byte = *src++;
+                    
+                    if (first_byte == BLOCK_SKIP_MARKER) {
+                        // 跳过该4x4块，不做任何操作
+                        continue;
+                    } else if (first_byte == BLOCK_4X4_MARKER) {
+                        // 4x4块模式
+                        u8 index_4x4 = *src++;
+                        decode_4x4_block_direct(codebook_4x4[index_4x4], quad_dst);
+                    } else {
+                        // 2x2块模式
+                        u8 indices_2x2[4];
+                        indices_2x2[0] = first_byte;
+                        indices_2x2[1] = *src++;
+                        indices_2x2[2] = *src++;
+                        indices_2x2[3] = *src++;
+                        decode_4x4_block(codebook_2x2, indices_2x2, quad_dst);
+                    }
+                }
+            }
+        }
+        zone_bitmap >>= 1;
+        zone_idx++;
+    }
+}
+
 IWRAM_CODE void decode_strip(int strip_idx, const u8* src, u16 strip_data_size, u16* dst)
 {
     u8 frame_type = *src++;
     
     if (frame_type == FRAME_TYPE_I) {
-        decode_strip_i_frame_with_8x8_super_blocks(strip_idx, src, dst);
+        decode_strip_i_frame_mixed(strip_idx, src, dst);
     } else if (frame_type == FRAME_TYPE_P) {
-        decode_strip_p_frame_with_8x8_super_blocks(strip_idx, src, dst);
+        decode_strip_p_frame_mixed(strip_idx, src, dst);
     }
 }
 
