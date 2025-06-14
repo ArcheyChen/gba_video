@@ -57,17 +57,17 @@ void init_table(){
     }
 }
 
-IWRAM_CODE inline u32 yuv_to_rgb555_2pix(const u8 y[2], s8 d_r, s8 d_g, s8 d_b, const s8* bayer_bias)
+IWRAM_CODE inline u32 yuv_to_rgb555_2pix(u8 _y0, u8 _y1, s8 d_r, s8 d_g, s8 d_b, const s8* bayer_bias)
 {
-    s16 _y = y[0] + bayer_bias[0];
-    u32 result = clip_lookup_table[_y + d_r];
-    result |= (clip_lookup_table[_y + d_g] << 5);
-    result |= (clip_lookup_table[_y + d_b] << 10);
+    s8 y0 = _y0 + bayer_bias[0];
+    s8 y1 = _y1 + bayer_bias[1];
+    u32 result = clip_lookup_table[y0 + d_r];
+    result |= (clip_lookup_table[y0 + d_g] << 5);
+    result |= (clip_lookup_table[y0 + d_b] << 10);
 
-    _y = y[1] + bayer_bias[1];
-    result |= (clip_lookup_table[_y + d_r] << 16);
-    result |= (clip_lookup_table[_y + d_g] << 21);
-    result |= (clip_lookup_table[_y + d_b] << 26);
+    result |= (clip_lookup_table[y1 + d_r] << 16);
+    result |= (clip_lookup_table[y1 + d_g] << 21);
+    result |= (clip_lookup_table[y1 + d_b] << 26);
     
     return result;
 }
@@ -135,11 +135,14 @@ IWRAM_CODE inline void decode_block(const YUV_Struct &yuv_data, u16* dst, u8 bay
     const s8 &d_g = yuv_data.d_g;
     const s8 &d_b = yuv_data.d_b;
 
+    // s8 d_g = (-(d_b >> 1) - d_r) >> 1; 
+
     u32* dst_row = (u32*)dst;
+    auto const &y = yuv_data.y;
     *dst_row = yuv_to_rgb555_2pix(
-        yuv_data.y[0], d_r, d_g, d_b, bayer_bias_4_2x2[bayer_idx]);
+        y[0][0],y[0][1], d_r, d_g, d_b, bayer_bias_4_2x2[bayer_idx]);
     *(dst_row + SCREEN_WIDTH/2) = yuv_to_rgb555_2pix(
-        yuv_data.y[1], d_r, d_g, d_b,bayer_bias_4_2x2[bayer_idx]+2);
+        y[1][0],y[1][1], d_r, d_g, d_b,bayer_bias_4_2x2[bayer_idx]+2);
 }
 
 // 解码色块（2x2上采样到4x4）
@@ -148,40 +151,28 @@ IWRAM_CODE inline void decode_color_block(const YUV_Struct &yuv_data, u16* dst)
     const s8 &d_r = yuv_data.d_r;
     const s8 &d_g = yuv_data.d_g;
     const s8 &d_b = yuv_data.d_b;
-
-    // 将2x2的Y值上采样到4x4
-    // 原始: 12/34 -> 目标: 1122/1122/3344/3344
-    // y[0][0]=1, y[0][1]=2, y[1][0]=3, y[1][1]=4
+    auto &y = yuv_data.y;
     
-    // 为每个重复的Y值对创建数组
-    u8 y_11[2] = {yuv_data.y[0][0], yuv_data.y[0][0]}; // 1,1
-    u8 y_22[2] = {yuv_data.y[0][1], yuv_data.y[0][1]}; // 2,2
-    u8 y_33[2] = {yuv_data.y[1][0], yuv_data.y[1][0]}; // 3,3
-    u8 y_44[2] = {yuv_data.y[1][1], yuv_data.y[1][1]}; // 4,4
-    
-    // u32 pix_33 = yuv_to_rgb555_2pix(y_33, d_r, d_g, d_b,bayer_bias_4_2x2[2]);
-    // u32 pix_44 = yuv_to_rgb555_2pix(y_44, d_r, d_g, d_b,bayer_bias_4_2x2[3]);
-
     u32* dst_row = (u32*)dst;
     
     // 第一行：1122
-    *dst_row = yuv_to_rgb555_2pix(y_11, d_r, d_g, d_b,bayer_bias_4_2x2[0]);;
-    *(dst_row + 1) = yuv_to_rgb555_2pix(y_22, d_r, d_g, d_b,bayer_bias_4_2x2[1]);
+    *dst_row = yuv_to_rgb555_2pix(y[0][0],y[0][0], d_r, d_g, d_b,bayer_bias_4_2x2[0]);;
+    *(dst_row + 1) = yuv_to_rgb555_2pix(y[0][1],y[0][1], d_r, d_g, d_b,bayer_bias_4_2x2[1]);
     
     // 第二行：1122
     dst_row += SCREEN_WIDTH/2;
-    *dst_row = yuv_to_rgb555_2pix(y_11, d_r, d_g, d_b,bayer_bias_4_2x2[2]);;
-    *(dst_row + 1) = yuv_to_rgb555_2pix(y_22, d_r, d_g, d_b,bayer_bias_4_2x2[3]);
+    *dst_row = yuv_to_rgb555_2pix(y[0][0],y[0][0], d_r, d_g, d_b,bayer_bias_4_2x2[2]);;
+    *(dst_row + 1) = yuv_to_rgb555_2pix(y[0][1],y[0][1], d_r, d_g, d_b,bayer_bias_4_2x2[3]);
     
     // 第三行：3344
     dst_row += SCREEN_WIDTH/2;
-    *dst_row = yuv_to_rgb555_2pix(y_33, d_r, d_g, d_b,bayer_bias_4_2x2[0]);
-    *(dst_row + 1) = yuv_to_rgb555_2pix(y_44, d_r, d_g, d_b,bayer_bias_4_2x2[1]);
+    *dst_row = yuv_to_rgb555_2pix(y[1][0],y[1][0], d_r, d_g, d_b,bayer_bias_4_2x2[0]);
+    *(dst_row + 1) = yuv_to_rgb555_2pix(y[1][1],y[1][1], d_r, d_g, d_b,bayer_bias_4_2x2[1]);
     
     // 第四行：3344
     dst_row += SCREEN_WIDTH/2;
-    *dst_row = yuv_to_rgb555_2pix(y_33, d_r, d_g, d_b,bayer_bias_4_2x2[2]);
-    *(dst_row + 1) = yuv_to_rgb555_2pix(y_44, d_r, d_g, d_b,bayer_bias_4_2x2[3]);
+    *dst_row = yuv_to_rgb555_2pix(y[1][0],y[1][0], d_r, d_g, d_b,bayer_bias_4_2x2[2]);
+    *(dst_row + 1) = yuv_to_rgb555_2pix(y[1][1],y[1][1], d_r, d_g, d_b,bayer_bias_4_2x2[3]);
 }
 
 // 通用的4x4大块解码函数（纹理块）
