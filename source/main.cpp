@@ -196,7 +196,7 @@ IWRAM_CODE void decode_i_frame_unified(const u8* src, u16* dst)
         copy_unified_codebook(unified_codebook_raw, src, 
                          &unified_codebook, UNIFIED_CODEBOOK_SIZE);
     }
-    code_book_preloaded = false;
+    code_book_preloaded = false;//清空标记，不然下一次的预载可能就不管用了
     src += UNIFIED_CODEBOOK_SIZE * BYTES_PER_BLOCK;
     
     u16 tot_big_blocks = (VIDEO_WIDTH / (BLOCK_WIDTH * 2)) * (VIDEO_HEIGHT / (BLOCK_HEIGHT * 2));
@@ -286,9 +286,9 @@ IWRAM_CODE void decode_frame(const u8* frame_data, u16* dst)
 static volatile u32 vbl = 0;
 static volatile u32 acc = 0;
 static volatile bool should_copy = false;
-void isr_vbl() { 
+IWRAM_CODE void isr_vbl() { 
     ++vbl; 
-    acc += 24;
+    acc += VIDEO_FPS;  // 使用头文件中定义的FPS
     if(acc >= 60) {
         should_copy = true;
         acc -= 60;

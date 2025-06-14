@@ -1035,7 +1035,9 @@ def main():
         raise SystemExit("❌ 打不开输入文件")
 
     src_fps = cap.get(cv2.CAP_PROP_FPS) or 30
-    every = int(round(src_fps / args.fps))
+    # 计算实际输出FPS：如果目标FPS高于源FPS，使用源FPS
+    actual_output_fps = min(args.fps, src_fps)
+    every = int(round(src_fps / actual_output_fps))
     
     if args.full_duration:
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -1046,6 +1048,7 @@ def main():
         grab_max = int(args.duration * src_fps)
         print(f"编码时长: {args.duration} 秒 ({grab_max} 帧)")
 
+    print(f"源视频FPS: {src_fps:.2f}, 目标FPS: {args.fps}, 实际输出FPS: {actual_output_fps:.2f}")
     print(f"码本配置: 统一码本{args.codebook_size}项")
     if args.dither:
         print(f"🎨 已启用抖动算法（蛇形扫描）")
@@ -1161,13 +1164,13 @@ def main():
     all_data = b''.join(encoded_frames)
     
     write_header(pathlib.Path(args.out).with_suffix(".h"), len(frames), len(all_data), 
-                args.codebook_size)
+                args.codebook_size, actual_output_fps)
     write_source(pathlib.Path(args.out).with_suffix(".c"), all_data, frame_offsets)
     
     # 打印详细统计
     encoding_stats.print_summary(len(frames), len(all_data))
 
-def write_header(path_h: pathlib.Path, frame_cnt: int, total_bytes: int, codebook_size: int):
+def write_header(path_h: pathlib.Path, frame_cnt: int, total_bytes: int, codebook_size: int, output_fps: float):
     guard = "VIDEO_DATA_H"
     
     with path_h.open("w", encoding="utf-8") as f:
@@ -1179,6 +1182,7 @@ def write_header(path_h: pathlib.Path, frame_cnt: int, total_bytes: int, codeboo
             #define VIDEO_WIDTH         {WIDTH}
             #define VIDEO_HEIGHT        {HEIGHT}
             #define VIDEO_TOTAL_BYTES   {total_bytes}
+            #define VIDEO_FPS           {int(round(output_fps))}
             #define UNIFIED_CODEBOOK_SIZE {codebook_size}
             #define EFFECTIVE_UNIFIED_CODEBOOK_SIZE {EFFECTIVE_UNIFIED_CODEBOOK_SIZE}
             
@@ -1216,6 +1220,5 @@ def write_source(path_c: pathlib.Path, data: bytes, frame_offsets: list):
             chunk = ', '.join(f"0x{v:02X}" for v in data[i:i+per_line])
             f.write("    " + chunk + ",\n")
         f.write("};\n")
-
 if __name__ == "__main__":
     main()
