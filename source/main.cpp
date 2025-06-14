@@ -29,12 +29,6 @@ IWRAM_DATA static s8 bayer_bias_4_2x2[4][4] =
     {0, -1, 0,1},
     {0, -1, 1, -2}
 };
-// IWRAM_DATA const  s8 bayer_bias1d[16] = {
-//         -4,  0, -3,  1,
-//          2, -2,  3, -1,
-//         -3,  1, -4,  0,
-//          4,  0,  3, -2
-//     };
 
 struct YUV_Struct{
     u8 y[2][2];
@@ -90,6 +84,8 @@ struct StripInfo {
 
 IWRAM_DATA StripInfo strip_info[VIDEO_STRIP_COUNT];
 IWRAM_DATA u16 big_block_relative_offsets[240/4*160/4];
+// 新增：zone内block相对偏移查找表，最多240个block
+IWRAM_DATA u16 zone_block_relative_offsets[240];
 
 void init_strip_info(){
     u16 current_y = 0;
@@ -118,6 +114,15 @@ void init_strip_info(){
         strip_info[strip_idx].total_blocks = strip_info[strip_idx].blocks_per_row * strip_info[strip_idx].blocks_per_col;
         strip_info[strip_idx].buffer_offset = current_y * SCREEN_WIDTH;
         current_y += strip_heights[strip_idx];
+    }
+
+    // 初始化zone内block相对偏移查找表
+    u16 zone_big_blocks_w = VIDEO_WIDTH / (BLOCK_WIDTH * 2);  // 每个zone行内的大块数
+    for(int zone_block_idx = 0; zone_block_idx < 240; zone_block_idx++){
+        u16 zone_big_bx = zone_block_idx % zone_big_blocks_w;
+        u16 zone_big_by = zone_block_idx / zone_big_blocks_w;
+        zone_block_relative_offsets[zone_block_idx] = 
+            (zone_big_by * BLOCK_HEIGHT * 2 * SCREEN_WIDTH) + (zone_big_bx * BLOCK_WIDTH * 2);
     }
 }
 
@@ -267,9 +272,6 @@ IWRAM_CODE void decode_strip_p_frame_unified(int strip_idx, const u8* src, u16* 
     
     auto &unified_codebook = strip_unified_codebooks[strip_idx];
     
-    // 计算该条带的大块布局
-    u16 strip_big_blocks_w = VIDEO_WIDTH / (BLOCK_WIDTH * 2);
-    
     // 使用bitmap右移优化处理每个有效区域
     u8 zone_idx = 0;
     while (zone_bitmap) {
@@ -278,8 +280,10 @@ IWRAM_CODE void decode_strip_p_frame_unified(int strip_idx, const u8* src, u16* 
             u8 detail_blocks_to_update = *src++;
             u8 color_blocks_to_update = *src++;
             
-            // 计算区域在条带中的起始大块行
-            u16 zone_start_big_by = zone_idx * ZONE_HEIGHT_BIG_BLOCKS;
+            // 计算zone在整个屏幕中的基址偏移
+            u16 zone_base_offset = strip_base_offset + 
+                (zone_idx * ZONE_HEIGHT_PIXELS * SCREEN_WIDTH);
+            u16* zone_dst = dst + zone_base_offset;
             
             // 处理纹理块更新（4个索引）
             for (u8 i = 0; i < detail_blocks_to_update; i++) {
@@ -291,13 +295,8 @@ IWRAM_CODE void decode_strip_p_frame_unified(int strip_idx, const u8* src, u16* 
                 quant_indices[2] = *src++;
                 quant_indices[3] = *src++;
                 
-                // 将区域相对坐标转换为条带内的绝对坐标
-                u16 relative_big_by = zone_relative_idx / strip_big_blocks_w;
-                u16 relative_big_bx = zone_relative_idx % strip_big_blocks_w;
-                u16 absolute_big_by = zone_start_big_by + relative_big_by;
-                u16 big_block_idx = absolute_big_by * strip_big_blocks_w + relative_big_bx;
-                
-                u16* big_block_dst = dst + strip_base_offset + big_block_relative_offsets[big_block_idx];
+                // 直接使用查找表获取相对偏移
+                u16* big_block_dst = zone_dst + zone_block_relative_offsets[zone_relative_idx];
                 decode_big_block(unified_codebook, quant_indices, big_block_dst);
             }
             
@@ -306,13 +305,8 @@ IWRAM_CODE void decode_strip_p_frame_unified(int strip_idx, const u8* src, u16* 
                 u8 zone_relative_idx = *src++;
                 u8 unified_idx = *src++;
                 
-                // 将区域相对坐标转换为条带内的绝对坐标
-                u16 relative_big_by = zone_relative_idx / strip_big_blocks_w;
-                u16 relative_big_bx = zone_relative_idx % strip_big_blocks_w;
-                u16 absolute_big_by = zone_start_big_by + relative_big_by;
-                u16 big_block_idx = absolute_big_by * strip_big_blocks_w + relative_big_bx;
-                
-                u16* big_block_dst = dst + strip_base_offset + big_block_relative_offsets[big_block_idx];
+                // 直接使用查找表获取相对偏移
+                u16* big_block_dst = zone_dst + zone_block_relative_offsets[zone_relative_idx];
                 decode_color_block(unified_codebook[unified_idx], big_block_dst);
             }
         }
@@ -321,8 +315,6 @@ IWRAM_CODE void decode_strip_p_frame_unified(int strip_idx, const u8* src, u16* 
     }
 }
 
-// 函数声明
-IWRAM_CODE void decode_strip(int strip_idx, const u8* src, u16 strip_data_size, u16* dst);
 
 IWRAM_CODE void decode_strip(int strip_idx, const u8* src, u16 strip_data_size, u16* dst)
 {
