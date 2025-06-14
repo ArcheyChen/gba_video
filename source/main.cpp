@@ -177,11 +177,26 @@ IWRAM_CODE void copy_unified_codebook(u8* dst_raw, const u8* src, YUV_Struct** c
     }
 }
 
+bool code_book_preloaded = false;
+IWRAM_CODE void preload_codebook(const u8* src)
+{
+    u8 frame_type = src[0];
+    if(frame_type != FRAME_TYPE_I || code_book_preloaded) {
+        VBlankIntrWait(); // 等待VBlank，防止CPU空跑跑满
+        return; // 只在I帧中预加载码本
+    }
+    copy_unified_codebook(unified_codebook_raw, src + 1, &unified_codebook, UNIFIED_CODEBOOK_SIZE);
+    code_book_preloaded = true;
+}
+
 IWRAM_CODE void decode_i_frame_unified(const u8* src, u16* dst)
 {
     // 拷贝统一码本
-    copy_unified_codebook(unified_codebook_raw, src, 
+    if(!code_book_preloaded){
+        copy_unified_codebook(unified_codebook_raw, src, 
                          &unified_codebook, UNIFIED_CODEBOOK_SIZE);
+    }
+    code_book_preloaded = false;
     src += UNIFIED_CODEBOOK_SIZE * BYTES_PER_BLOCK;
     
     u16 tot_big_blocks = (VIDEO_WIDTH / (BLOCK_WIDTH * 2)) * (VIDEO_HEIGHT / (BLOCK_HEIGHT * 2));
@@ -269,7 +284,17 @@ IWRAM_CODE void decode_frame(const u8* frame_data, u16* dst)
 }
 
 static volatile u32 vbl = 0;
-void isr_vbl() { ++vbl; REG_IF = IRQ_VBLANK; }
+static volatile u32 acc = 0;
+static volatile bool should_copy = false;
+void isr_vbl() { 
+    ++vbl; 
+    acc += 24;
+    if(acc >= 60) {
+        should_copy = true;
+        acc -= 60;
+    }
+    REG_IF = IRQ_VBLANK; 
+}
 
 int main()
 {
@@ -293,7 +318,13 @@ int main()
         decode_frame(frame_data, ewramBuffer);
         
         // VBlankIntrWait(); // 注释掉以提高性能，让DMA自动等待
-        DMA3COPY(ewramBuffer, VRAM, PIXELS_PER_FRAME | DMA16);
+        while(!should_copy) {
+            preload_codebook(frame_data);
+            // 预加载码本，以消耗掉空闲时间
+            // 这个函数里面如果没事做，会等待VBlank，因此不用担心跑满CPU
+        }
+        should_copy = false;
+        DMA3COPY(ewramBuffer, VRAM, (PIXELS_PER_FRAME>>1) | DMA32);
 
         frame++;
         if(frame >= VIDEO_FRAME_COUNT) {
