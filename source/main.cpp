@@ -286,30 +286,20 @@ IWRAM_CODE void decode_frame(const u8* frame_data, u16* dst)
 static volatile u32 vbl = 0;
 static volatile u32 acc = 0;
 static volatile bool should_copy = false;
+#define LCD_FPS 597275
+//这个是乘了10000后的FPS，这样更精确
 IWRAM_CODE void isr_vbl() { 
     ++vbl; 
     acc += VIDEO_FPS;  // 使用头文件中定义的FPS
-    if(acc >= 60) {
+
+    if(acc >= LCD_FPS) {
         should_copy = true;
-        acc -= 60;
+        acc -= LCD_FPS;
     }
     REG_IF = IRQ_VBLANK; 
 }
 
-int main()
-{
-    REG_DISPCNT = MODE_3 | BG2_ENABLE;
-
-    irqInit();
-    irqSet(IRQ_VBLANK, isr_vbl);
-    irqEnable(IRQ_VBLANK);
-
-    init_table();
-    init_block_offsets();
-    
-    memset(ewramBuffer, 0, PIXELS_PER_FRAME * sizeof(u16));
-    DMA3COPY(ewramBuffer, VRAM, PIXELS_PER_FRAME | DMA16);
-
+IWRAM_CODE void doit(){
     int frame = 0;
     
     while (1)
@@ -347,4 +337,21 @@ int main()
             if (frame >= VIDEO_FRAME_COUNT) frame = 0;
         }
     }
+}
+
+int main()
+{
+    REG_DISPCNT = MODE_3 | BG2_ENABLE;
+
+    irqInit();
+    irqSet(IRQ_VBLANK, isr_vbl);
+    irqEnable(IRQ_VBLANK);
+
+    init_table();
+    init_block_offsets();
+    
+    memset(ewramBuffer, 0, PIXELS_PER_FRAME * sizeof(u16));
+    DMA3COPY(ewramBuffer, VRAM, PIXELS_PER_FRAME | DMA16);
+
+    doit();
 }

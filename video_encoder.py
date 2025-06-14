@@ -1182,7 +1182,7 @@ def write_header(path_h: pathlib.Path, frame_cnt: int, total_bytes: int, codeboo
             #define VIDEO_WIDTH         {WIDTH}
             #define VIDEO_HEIGHT        {HEIGHT}
             #define VIDEO_TOTAL_BYTES   {total_bytes}
-            #define VIDEO_FPS           {int(round(output_fps))}
+            #define VIDEO_FPS           {int(round(output_fps*10000))}
             #define UNIFIED_CODEBOOK_SIZE {codebook_size}
             #define EFFECTIVE_UNIFIED_CODEBOOK_SIZE {EFFECTIVE_UNIFIED_CODEBOOK_SIZE}
             
