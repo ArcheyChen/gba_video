@@ -14,7 +14,6 @@ from numba.typed import List
 from dither_opt import apply_dither_optimized
 
 WIDTH, HEIGHT = 240, 160
-DEFAULT_STRIP_COUNT = 4
 DEFAULT_UNIFIED_CODEBOOK_SIZE = 256   # 统一码本大小
 EFFECTIVE_UNIFIED_CODEBOOK_SIZE = 254  # 有效码本大小（0xFF保留）
 
@@ -35,31 +34,6 @@ ZONE_HEIGHT_BIG_BLOCKS = ZONE_HEIGHT_PIXELS // (BLOCK_H * 2)  # 每个区域的4
 FRAME_TYPE_I = 0x00  # I帧（关键帧）
 FRAME_TYPE_P = 0x01  # P帧（差分帧）
 
-def calculate_strip_heights(height: int, strip_count: int) -> list:
-    """计算每个条带的高度，确保每个条带高度都是4的倍数"""
-    if height % 4 != 0:
-        raise ValueError(f"视频高度 {height} 必须是4的倍数")
-    
-    base_height = (height // strip_count // 4) * 4
-    remaining_height = height - (base_height * strip_count)
-    
-    strip_heights = []
-    for i in range(strip_count):
-        current_height = base_height
-        if remaining_height >= 4:
-            current_height += 4
-            remaining_height -= 4
-        strip_heights.append(current_height)
-    
-    if sum(strip_heights) != height:
-        raise ValueError(f"条带高度分配错误: {strip_heights} 总和 {sum(strip_heights)} != {height}")
-    
-    for i, h in enumerate(strip_heights):
-        if h % 4 != 0:
-            raise ValueError(f"条带 {i} 高度 {h} 不是4的倍数")
-    
-    return strip_heights
-
 @njit
 def clip_value(value, min_val, max_val):
     """Numba兼容的clip函数"""
@@ -71,10 +45,10 @@ def clip_value(value, min_val, max_val):
         return value
 
 @njit
-def pack_yuv420_strip_numba(bgr_strip, strip_height, width):
-    """Numba加速的YUV420转换"""
-    blocks_h = strip_height // BLOCK_H
-    blocks_w = width // BLOCK_W
+def pack_yuv420_frame_numba(bgr_frame):
+    """Numba加速的整帧YUV420转换"""
+    blocks_h = HEIGHT // BLOCK_H
+    blocks_w = WIDTH // BLOCK_W
     
     block_array = np.zeros((blocks_h, blocks_w, BYTES_PER_BLOCK), dtype=np.uint8)
     
@@ -92,10 +66,10 @@ def pack_yuv420_strip_numba(bgr_strip, strip_height, width):
             idx = 0
             for dy in range(BLOCK_H):
                 for dx in range(BLOCK_W):
-                    if y_start + dy < strip_height and x_start + dx < width:
-                        b = float(bgr_strip[y_start + dy, x_start + dx, 0])
-                        g = float(bgr_strip[y_start + dy, x_start + dx, 1])  
-                        r = float(bgr_strip[y_start + dy, x_start + dx, 2])
+                    if y_start + dy < HEIGHT and x_start + dx < WIDTH:
+                        b = float(bgr_frame[y_start + dy, x_start + dx, 0])
+                        g = float(bgr_frame[y_start + dy, x_start + dx, 1])  
+                        r = float(bgr_frame[y_start + dy, x_start + dx, 2])
                         
                         y = r * 0.28571429 + g * 0.57142857 + b * 0.14285714
                         cb = r * (-0.14285714) + g * (-0.28571429) + b * 0.42857143
@@ -124,10 +98,9 @@ def pack_yuv420_strip_numba(bgr_strip, strip_height, width):
     
     return block_array
 
-def pack_yuv420_strip(frame_bgr: np.ndarray, strip_y: int, strip_height: int) -> np.ndarray:
-    """使用Numba加速的YUV转换包装函数"""
-    strip_bgr = frame_bgr[strip_y:strip_y + strip_height, :, :]
-    return pack_yuv420_strip_numba(strip_bgr, strip_height, WIDTH)
+def pack_yuv420_frame(frame_bgr: np.ndarray) -> np.ndarray:
+    """使用Numba加速的整帧YUV转换包装函数"""
+    return pack_yuv420_frame_numba(frame_bgr)
 
 def calculate_block_variance(blocks_4x4: list) -> float:
     """计算4x4块的方差，用于判断是否为纯色块"""
@@ -386,9 +359,9 @@ def quantize_blocks_unified(blocks_data: np.ndarray, codebook: np.ndarray) -> np
     
     return indices
 
-def encode_strip_i_frame_unified(blocks: np.ndarray, unified_codebook: np.ndarray, 
-                                block_types: dict) -> bytes:
-    """编码条带I帧（统一码本）"""
+def encode_i_frame_unified(blocks: np.ndarray, unified_codebook: np.ndarray, 
+                          block_types: dict) -> bytes:
+    """编码I帧（统一码本）"""
     data = bytearray()
     data.append(FRAME_TYPE_I)
     
@@ -441,12 +414,12 @@ def encode_strip_i_frame_unified(blocks: np.ndarray, unified_codebook: np.ndarra
     
     return bytes(data)
 
-def encode_strip_differential_unified(current_blocks: np.ndarray, prev_blocks: np.ndarray,
-                                     unified_codebook: np.ndarray, block_types: dict,
-                                     diff_threshold: float, force_i_threshold: float = 0.7) -> tuple:
-    """差分编码当前条带（统一码本）"""
+def encode_p_frame_unified(current_blocks: np.ndarray, prev_blocks: np.ndarray,
+                          unified_codebook: np.ndarray, block_types: dict,
+                          diff_threshold: float, force_i_threshold: float = 0.7) -> tuple:
+    """差分编码P帧（统一码本）"""
     if prev_blocks is None or current_blocks.shape != prev_blocks.shape:
-        i_frame_data = encode_strip_i_frame_unified(current_blocks, unified_codebook, block_types)
+        i_frame_data = encode_i_frame_unified(current_blocks, unified_codebook, block_types)
         return i_frame_data, True, 0, 0, 0
     
     blocks_h, blocks_w = current_blocks.shape[:2]
@@ -525,7 +498,7 @@ def encode_strip_differential_unified(current_blocks: np.ndarray, prev_blocks: n
     # 判断是否需要I帧
     update_ratio = total_updated_blocks / total_blocks
     if update_ratio > force_i_threshold:
-        i_frame_data = encode_strip_i_frame_unified(current_blocks, unified_codebook, block_types)
+        i_frame_data = encode_i_frame_unified(current_blocks, unified_codebook, block_types)
         return i_frame_data, True, 0, 0, 0
     
     # 编码P帧
@@ -547,8 +520,6 @@ def encode_strip_differential_unified(current_blocks: np.ndarray, prev_blocks: n
             total_detail_updates += len(zone_detail_updates[zone_idx])
     
     # u16 bitmap
-    # data.append(zone_bitmap & 0xFF)  # 只存储低8位
-    # data.append((zone_bitmap >> 8) & 0xFF)  # 存储高8位\
     data.extend(struct.pack('<H', zone_bitmap))
     
     # 按区域编码更新
@@ -725,9 +696,9 @@ def extract_effective_blocks_from_big_blocks(blocks: np.ndarray, big_block_posit
     
     return effective_blocks
 
-def process_single_gop_strip(args_tuple):
-    """处理单个GOP的单个条带 - 用于多进程"""
-    (gop_start, gop_end, strip_idx, strip_frames_data, variance_threshold, 
+def process_single_gop_frame(args_tuple):
+    """处理单个GOP的单帧 - 用于多进程"""
+    (gop_start, gop_end, frame_data_list, variance_threshold, 
      diff_threshold, codebook_size, kmeans_max_iter, i_frame_weight) = args_tuple
     
     try:
@@ -735,15 +706,15 @@ def process_single_gop_strip(args_tuple):
         block_types_list = []
         
         # 处理GOP中的每一帧
-        prev_strip_blocks = None
+        prev_blocks = None
         
         for frame_idx in range(gop_start, gop_end):
             relative_frame_idx = frame_idx - gop_start
-            if relative_frame_idx >= len(strip_frames_data):
+            if relative_frame_idx >= len(frame_data_list):
                 break
                 
-            strip_blocks = strip_frames_data[relative_frame_idx]
-            if strip_blocks.size == 0:
+            frame_blocks = frame_data_list[relative_frame_idx]
+            if frame_blocks.size == 0:
                 continue
             
             # 确定帧类型和需要更新的大块
@@ -751,17 +722,17 @@ def process_single_gop_strip(args_tuple):
             
             if is_i_frame:
                 # I帧：所有大块都有效
-                blocks_h, blocks_w = strip_blocks.shape[:2]
+                blocks_h, blocks_w = frame_blocks.shape[:2]
                 big_blocks_h = blocks_h // 2
                 big_blocks_w = blocks_w // 2
                 updated_big_blocks = {(big_by, big_bx) for big_by in range(big_blocks_h) for big_bx in range(big_blocks_w)}
             else:
                 # P帧：只有更新的大块有效
-                updated_big_blocks = identify_updated_big_blocks(strip_blocks, prev_strip_blocks, diff_threshold)
+                updated_big_blocks = identify_updated_big_blocks(frame_blocks, prev_blocks, diff_threshold)
             
             # 从有效大块中提取2x2块
             frame_effective_blocks = extract_effective_blocks_from_big_blocks(
-                strip_blocks, updated_big_blocks, variance_threshold)
+                frame_blocks, updated_big_blocks, variance_threshold)
             
             # I帧块加权：复制多次以增加在聚类中的影响力
             if is_i_frame:
@@ -771,17 +742,16 @@ def process_single_gop_strip(args_tuple):
                 effective_blocks.extend(frame_effective_blocks)
             
             # 生成完整的block_types用于编码（所有大块，不只是有效的）
-            frame_blocks, block_types = classify_4x4_blocks_unified(strip_blocks, variance_threshold)
+            frame_blocks_list, block_types = classify_4x4_blocks_unified(frame_blocks, variance_threshold)
             block_types_list.append((frame_idx, block_types))
             
-            prev_strip_blocks = strip_blocks.copy()
+            prev_blocks = frame_blocks.copy()
         
         # 使用有效块生成统一码本
         unified_codebook = generate_unified_codebook(effective_blocks, codebook_size, kmeans_max_iter)
         
         return {
             'gop_start': gop_start,
-            'strip_idx': strip_idx,
             'unified_codebook': unified_codebook,
             'block_types_list': block_types_list,
             'total_blocks_count': len(effective_blocks),
@@ -791,12 +761,11 @@ def process_single_gop_strip(args_tuple):
     except Exception as e:
         return {
             'gop_start': gop_start,
-            'strip_idx': strip_idx,
             'error': str(e),
             'success': False
         }
 
-def generate_gop_unified_codebooks(frames: list, strip_count: int, i_frame_interval: int,
+def generate_gop_unified_codebooks(frames: list, i_frame_interval: int,
                                   variance_threshold: float, diff_threshold: float,
                                   codebook_size: int = DEFAULT_UNIFIED_CODEBOOK_SIZE,
                                   kmeans_max_iter: int = 100, i_frame_weight: int = 3,
@@ -825,26 +794,24 @@ def generate_gop_unified_codebooks(frames: list, strip_count: int, i_frame_inter
         else:
             gop_end = len(frames)
         
-        # 为每个条带创建任务
-        for strip_idx in range(strip_count):
-            # 提取该GOP该条带的所有帧数据
-            strip_frames_data = []
-            for frame_idx in range(gop_start, gop_end):
-                if frame_idx < len(frames):
-                    strip_frames_data.append(frames[frame_idx][strip_idx])
-                else:
-                    break
-            
-            if strip_frames_data:  # 只有当有数据时才添加任务
-                task_args = (
-                    gop_start, gop_end, strip_idx, strip_frames_data,
-                    variance_threshold, diff_threshold, codebook_size,
-                    kmeans_max_iter, i_frame_weight
-                )
-                tasks.append(task_args)
+        # 提取该GOP的所有帧数据
+        frame_data_list = []
+        for frame_idx in range(gop_start, gop_end):
+            if frame_idx < len(frames):
+                frame_data_list.append(frames[frame_idx])
+            else:
+                break
+        
+        if frame_data_list:  # 只有当有数据时才添加任务
+            task_args = (
+                gop_start, gop_end, frame_data_list,
+                variance_threshold, diff_threshold, codebook_size,
+                kmeans_max_iter, i_frame_weight
+            )
+            tasks.append(task_args)
     
     total_tasks = len(tasks)
-    print(f"总共 {len(i_frame_positions)} 个GOP，{strip_count} 个条带，{total_tasks} 个处理任务")
+    print(f"总共 {len(i_frame_positions)} 个GOP，{total_tasks} 个处理任务")
     
     # 使用多进程处理
     completed_tasks = 0
@@ -859,7 +826,7 @@ def generate_gop_unified_codebooks(frames: list, strip_count: int, i_frame_inter
         # 提交所有任务
         results = []
         for task_args in tasks:
-            result = pool.apply_async(process_single_gop_strip, (task_args,))
+            result = pool.apply_async(process_single_gop_frame, (task_args,))
             results.append(result)
         
         # 收集结果并显示进度
@@ -880,7 +847,6 @@ def generate_gop_unified_codebooks(frames: list, strip_count: int, i_frame_inter
                 task_args = tasks[i]
                 processed_results.append({
                     'gop_start': task_args[0],
-                    'strip_idx': task_args[2],
                     'success': False,
                     'error': str(e)
                 })
@@ -889,17 +855,12 @@ def generate_gop_unified_codebooks(frames: list, strip_count: int, i_frame_inter
     failed_count = 0
     for result in processed_results:
         if not result['success']:
-            print(f"  ❌ GOP {result['gop_start']} 条带 {result['strip_idx']} 处理失败: {result.get('error', '未知错误')}")
+            print(f"  ❌ GOP {result['gop_start']} 处理失败: {result.get('error', '未知错误')}")
             failed_count += 1
             continue
         
         gop_start = result['gop_start']
-        strip_idx = result['strip_idx']
-        
-        if gop_start not in gop_codebooks:
-            gop_codebooks[gop_start] = [None] * strip_count
-        
-        gop_codebooks[gop_start][strip_idx] = {
+        gop_codebooks[gop_start] = {
             'unified_codebook': result['unified_codebook'],
             'block_types_list': result['block_types_list'],
             'total_blocks_count': result['total_blocks_count']
@@ -911,17 +872,16 @@ def generate_gop_unified_codebooks(frames: list, strip_count: int, i_frame_inter
         print(f"  ✅ 所有 {total_tasks} 个任务处理完成")
     
     # 验证结果完整性
-    for gop_start in gop_codebooks:
-        for strip_idx in range(strip_count):
-            if gop_codebooks[gop_start][strip_idx] is None:
-                print(f"  ⚠️ GOP {gop_start} 条带 {strip_idx} 缺少数据，使用默认码本")
-                # 创建默认码本
-                default_codebook = np.zeros((codebook_size, BYTES_PER_BLOCK), dtype=np.uint8)
-                gop_codebooks[gop_start][strip_idx] = {
-                    'unified_codebook': default_codebook,
-                    'block_types_list': [],
-                    'total_blocks_count': 0
-                }
+    for gop_start in i_frame_positions:
+        if gop_start not in gop_codebooks:
+            print(f"  ⚠️ GOP {gop_start} 缺少数据，使用默认码本")
+            # 创建默认码本
+            default_codebook = np.zeros((codebook_size, BYTES_PER_BLOCK), dtype=np.uint8)
+            gop_codebooks[gop_start] = {
+                'unified_codebook': default_codebook,
+                'block_types_list': [],
+                'total_blocks_count': 0
+            }
     
     return gop_codebooks
 
@@ -929,7 +889,7 @@ class EncodingStats:
     """编码统计类"""
     def __init__(self):
         # 帧统计
-        self.total_frames_processed = 0  # 实际处理的帧数（条带级别）
+        self.total_frames_processed = 0
         self.total_i_frames = 0
         self.forced_i_frames = 0  # 强制I帧（GOP开始）
         self.threshold_i_frames = 0  # 超阈值I帧
@@ -951,14 +911,8 @@ class EncodingStats:
         self.detail_block_bytes = 0
         self.color_update_count = 0
         self.detail_update_count = 0
-        
-        # 条带统计
-        self.strip_stats = defaultdict(lambda: {
-            'i_frames': 0, 'p_frames': 0, 
-            'i_bytes': 0, 'p_bytes': 0
-        })
     
-    def add_i_frame(self, strip_idx, size_bytes, is_forced=True, codebook_size=0, index_size=0):
+    def add_i_frame(self, size_bytes, is_forced=True, codebook_size=0, index_size=0):
         self.total_frames_processed += 1
         self.total_i_frames += 1
         if is_forced:
@@ -969,11 +923,8 @@ class EncodingStats:
         self.total_i_frame_bytes += size_bytes
         self.total_codebook_bytes += codebook_size
         self.total_index_bytes += index_size
-        
-        self.strip_stats[strip_idx]['i_frames'] += 1
-        self.strip_stats[strip_idx]['i_bytes'] += size_bytes
     
-    def add_p_frame(self, strip_idx, size_bytes, updates_count, zone_count, 
+    def add_p_frame(self, size_bytes, updates_count, zone_count, 
                    color_updates=0, detail_updates=0):
         self.total_frames_processed += 1
         self.total_p_frames += 1
@@ -981,36 +932,24 @@ class EncodingStats:
         self.p_frame_updates.append(updates_count)
         self.zone_usage[zone_count] += 1
         
-        # P帧开销：帧类型(1) + bitmap(1) + 每个区域的计数(2*zones)
-        overhead = 2 + zone_count * 2
+        # P帧开销：帧类型(1) + bitmap(2) + 每个区域的计数(2*zones)
+        overhead = 3 + zone_count * 2
         self.total_p_overhead_bytes += overhead
         
         self.color_update_count += color_updates
         self.detail_update_count += detail_updates
-        
-        self.strip_stats[strip_idx]['p_frames'] += 1
-        self.strip_stats[strip_idx]['p_bytes'] += size_bytes
-    
-    def add_block_stats(self, color_bytes, detail_bytes):
-        self.color_block_bytes += color_bytes
-        self.detail_block_bytes += detail_bytes
     
     def print_summary(self, total_frames, total_bytes):
         print(f"\n📊 编码统计报告")
         print(f"=" * 60)
         
-        # 计算条带级别的统计
-        strip_count = len(self.strip_stats) if self.strip_stats else 1
-        
         # 基本统计
         print(f"🎬 帧统计:")
         print(f"   视频帧数: {total_frames}")
-        print(f"   条带总数: {strip_count}")
-        print(f"   处理的条带帧: {self.total_frames_processed}")
-        print(f"   I帧条带: {self.total_i_frames} ({self.total_i_frames/self.total_frames_processed*100:.1f}%)")
+        print(f"   I帧: {self.total_i_frames} ({self.total_i_frames/total_frames*100:.1f}%)")
         print(f"     - 强制I帧: {self.forced_i_frames}")
         print(f"     - 超阈值I帧: {self.threshold_i_frames}")
-        print(f"   P帧条带: {self.total_p_frames} ({self.total_p_frames/self.total_frames_processed*100:.1f}%)")
+        print(f"   P帧: {self.total_p_frames} ({self.total_p_frames/total_frames*100:.1f}%)")
         
         # 大小统计
         print(f"\n💾 空间占用:")
@@ -1032,18 +971,6 @@ class EncodingStats:
         p_frame_data_bytes = self.total_p_frame_bytes - self.total_p_overhead_bytes
         print(f"   P帧更新数据: {p_frame_data_bytes:,} bytes ({p_frame_data_bytes/total_bytes*100:.1f}%)")
         print(f"   P帧开销: {self.total_p_overhead_bytes:,} bytes ({self.total_p_overhead_bytes/total_bytes*100:.1f}%)")
-        
-        # 其他数据
-        other_bytes = total_bytes - (self.total_codebook_bytes + self.total_index_bytes + self.total_p_frame_bytes)
-        if other_bytes > 0:
-            print(f"   其他数据: {other_bytes:,} bytes ({other_bytes/total_bytes*100:.1f}%)")
-        
-        # 块类型统计
-        print(f"\n🧩 块类型分布:")
-        if self.color_block_bytes > 0 or self.detail_block_bytes > 0:
-            total_block_data = self.color_block_bytes + self.detail_block_bytes
-            print(f"   色块索引: {self.color_block_bytes} 个 ({self.color_block_bytes/total_block_data*100:.1f}%)")
-            print(f"   纹理块索引: {self.detail_block_bytes} 个 ({self.detail_block_bytes/total_block_data*100:.1f}%)")
         
         # P帧更新统计
         if self.p_frame_updates:
@@ -1068,16 +995,6 @@ class EncodingStats:
                 if self.total_p_frames > 0:
                     print(f"   {zone_count}个区域: {frames_count}次 ({frames_count/self.total_p_frames*100:.1f}%)")
         
-        # 条带统计
-        print(f"\n📏 条带统计:")
-        for strip_idx in sorted(self.strip_stats.keys()):
-            stats = self.strip_stats[strip_idx]
-            total_strip_frames = stats['i_frames'] + stats['p_frames']
-            total_strip_bytes = stats['i_bytes'] + stats['p_bytes']
-            if total_strip_frames > 0:
-                print(f"   条带{strip_idx}: {total_strip_frames}帧, {total_strip_bytes:,}bytes, "
-                      f"平均{total_strip_bytes/total_strip_frames:.1f}bytes/帧")
-        
         # 压缩效率
         raw_size = total_frames * WIDTH * HEIGHT * 2  # 假设16位像素
         compression_ratio = raw_size / total_bytes if total_bytes > 0 else 0
@@ -1096,7 +1013,6 @@ def main():
     pa.add_argument("--full-duration", action="store_true")
     pa.add_argument("--fps", type=int, default=30)
     pa.add_argument("--out", default="video_data")
-    pa.add_argument("--strip-count", type=int, default=DEFAULT_STRIP_COUNT)
     pa.add_argument("--i-frame-interval", type=int, default=60)
     pa.add_argument("--diff-threshold", type=float, default=2.0)
     pa.add_argument("--force-i-threshold", type=float, default=0.7)
@@ -1110,7 +1026,6 @@ def main():
                    help="I帧块在聚类中的权重倍数（默认3）")
     pa.add_argument("--max-workers", type=int, default=None,
                    help="GOP处理的最大进程数（默认为CPU核心数-1）")
-
     pa.add_argument("--dither", action="store_true",
                    help="启用Floyd-Steinberg抖动算法提升画质")
     args = pa.parse_args()
@@ -1131,42 +1046,30 @@ def main():
         grab_max = int(args.duration * src_fps)
         print(f"编码时长: {args.duration} 秒 ({grab_max} 帧)")
 
-    strip_heights = calculate_strip_heights(HEIGHT, args.strip_count)
-    print(f"条带配置: {args.strip_count} 个条带，高度分别为: {strip_heights}")
     print(f"码本配置: 统一码本{args.codebook_size}项")
     if args.dither:
         print(f"🎨 已启用抖动算法（蛇形扫描）")
+    
     frames = []
     idx = 0
     print("正在提取帧...")
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.threads) as executor:
-        while idx < grab_max:
-            ret, frm = cap.read()
-            if not ret:
-                break
-            if idx % every == 0:
-                frm = cv2.resize(frm, (WIDTH, HEIGHT), cv2.INTER_AREA)
-                frm = cv2.GaussianBlur(frm, (3, 3), 0.41)
-                if args.dither:
-                    frm = apply_dither_optimized(frm)
-                strip_y_list = []
-                y = 0
-                for strip_height in strip_heights:
-                    strip_y_list.append((frm, y, strip_height))
-                    y += strip_height
-                future_to_idx = {
-                    executor.submit(pack_yuv420_strip, *args): i
-                    for i, args in enumerate(strip_y_list)
-                }
-                frame_strips = [None] * len(strip_y_list)
-                for future in concurrent.futures.as_completed(future_to_idx):
-                    i = future_to_idx[future]
-                    frame_strips[i] = future.result()
-                frames.append(frame_strips)
-                
-                if len(frames) % 30 == 0:
-                    print(f"  已提取 {len(frames)} 帧")
-            idx += 1
+    
+    while idx < grab_max:
+        ret, frm = cap.read()
+        if not ret:
+            break
+        if idx % every == 0:
+            frm = cv2.resize(frm, (WIDTH, HEIGHT), cv2.INTER_AREA)
+            frm = cv2.GaussianBlur(frm, (3, 3), 0.41)
+            if args.dither:
+                frm = apply_dither_optimized(frm)
+            
+            frame_blocks = pack_yuv420_frame(frm)
+            frames.append(frame_blocks)
+            
+            if len(frames) % 30 == 0:
+                print(f"  已提取 {len(frames)} 帧")
+        idx += 1
     cap.release()
 
     if not frames:
@@ -1176,7 +1079,7 @@ def main():
 
     # 生成统一码本（传入max_workers参数）
     gop_codebooks = generate_gop_unified_codebooks(
-        frames, args.strip_count, args.i_frame_interval, 
+        frames, args.i_frame_interval, 
         args.variance_threshold, args.diff_threshold, args.codebook_size, 
         args.kmeans_max_iter, args.i_frame_weight, args.max_workers
     )
@@ -1186,78 +1089,71 @@ def main():
     encoded_frames = []
     frame_offsets = []
     current_offset = 0
-    prev_strips = [None] * args.strip_count
+    prev_frame = None
     
-    for frame_idx, current_strips in enumerate(frames):
+    for frame_idx, current_frame in enumerate(frames):
         frame_offsets.append(current_offset)
         
         # 找到当前GOP
         gop_start = (frame_idx // args.i_frame_interval) * args.i_frame_interval
         gop_data = gop_codebooks[gop_start]
         
-        frame_data = bytearray()
+        unified_codebook = gop_data['unified_codebook']
         
-        for strip_idx, current_strip in enumerate(current_strips):
-            strip_gop_data = gop_data[strip_idx]
-            unified_codebook = strip_gop_data['unified_codebook']
+        # 找到当前帧的block_types
+        block_types = None
+        for fid, bt in gop_data['block_types_list']:
+            if fid == frame_idx:
+                block_types = bt
+                break
+        
+        force_i_frame = (frame_idx % args.i_frame_interval == 0) or frame_idx == 0
+        
+        if force_i_frame or prev_frame is None:
+            frame_data = encode_i_frame_unified(
+                current_frame, unified_codebook, block_types
+            )
+            is_i_frame = True
             
-            # 找到当前帧的block_types
-            block_types = None
-            for fid, bt in strip_gop_data['block_types_list']:
-                if fid == frame_idx:
-                    block_types = bt
-                    break
+            # 计算码本和索引大小
+            codebook_size = args.codebook_size * BYTES_PER_BLOCK
+            index_size = len(frame_data) - 1 - codebook_size
             
-            force_i_frame = (frame_idx % args.i_frame_interval == 0) or frame_idx == 0
+            encoding_stats.add_i_frame(
+                len(frame_data), 
+                is_forced=force_i_frame,
+                codebook_size=codebook_size,
+                index_size=max(0, index_size)
+            )
+        else:
+            frame_data, is_i_frame, used_zones, color_updates, detail_updates = encode_p_frame_unified(
+                current_frame, prev_frame,
+                unified_codebook, block_types,
+                args.diff_threshold, args.force_i_threshold
+            )
             
-            if force_i_frame or prev_strips[strip_idx] is None:
-                strip_data = encode_strip_i_frame_unified(
-                    current_strip, unified_codebook, block_types
-                )
-                is_i_frame = True
-                
-                # 计算码本和索引大小
+            if is_i_frame:
                 codebook_size = args.codebook_size * BYTES_PER_BLOCK
-                index_size = len(strip_data) - 1 - codebook_size
+                index_size = len(frame_data) - 1 - codebook_size
                 
                 encoding_stats.add_i_frame(
-                    strip_idx, len(strip_data), 
-                    is_forced=force_i_frame,
+                    len(frame_data), 
+                    is_forced=False,
                     codebook_size=codebook_size,
                     index_size=max(0, index_size)
                 )
             else:
-                strip_data, is_i_frame, used_zones, color_updates, detail_updates = encode_strip_differential_unified(
-                    current_strip, prev_strips[strip_idx],
-                    unified_codebook, block_types,
-                    args.diff_threshold, args.force_i_threshold
-                )
+                total_updates = color_updates + detail_updates
                 
-                if is_i_frame:
-                    codebook_size = args.codebook_size * BYTES_PER_BLOCK
-                    index_size = len(strip_data) - 1 - codebook_size
-                    
-                    encoding_stats.add_i_frame(
-                        strip_idx, len(strip_data), 
-                        is_forced=False,
-                        codebook_size=codebook_size,
-                        index_size=max(0, index_size)
-                    )
-                else:
-                    total_updates = color_updates + detail_updates
-                    
-                    encoding_stats.add_p_frame(
-                        strip_idx, len(strip_data), total_updates, used_zones,
-                        color_updates, detail_updates
-                    )
-            
-            frame_data.extend(struct.pack('<H', len(strip_data)))
-            frame_data.extend(strip_data)
-            
-            prev_strips[strip_idx] = current_strip.copy() if current_strip.size > 0 else None
+                encoding_stats.add_p_frame(
+                    len(frame_data), total_updates, used_zones,
+                    color_updates, detail_updates
+                )
         
-        encoded_frames.append(bytes(frame_data))
+        encoded_frames.append(frame_data)
         current_offset += len(frame_data)
+        
+        prev_frame = current_frame.copy() if current_frame.size > 0 else None
         
         if frame_idx % 30 == 0 or frame_idx == len(frames) - 1:
             print(f"  已编码 {frame_idx + 1}/{len(frames)} 帧")
@@ -1265,14 +1161,13 @@ def main():
     all_data = b''.join(encoded_frames)
     
     write_header(pathlib.Path(args.out).with_suffix(".h"), len(frames), len(all_data), 
-                args.strip_count, strip_heights, args.codebook_size)
-    write_source(pathlib.Path(args.out).with_suffix(".c"), all_data, frame_offsets, strip_heights)
+                args.codebook_size)
+    write_source(pathlib.Path(args.out).with_suffix(".c"), all_data, frame_offsets)
     
     # 打印详细统计
     encoding_stats.print_summary(len(frames), len(all_data))
 
-def write_header(path_h: pathlib.Path, frame_cnt: int, total_bytes: int, strip_count: int, 
-                strip_heights: list, codebook_size: int):
+def write_header(path_h: pathlib.Path, frame_cnt: int, total_bytes: int, codebook_size: int):
     guard = "VIDEO_DATA_H"
     
     with path_h.open("w", encoding="utf-8") as f:
@@ -1284,7 +1179,6 @@ def write_header(path_h: pathlib.Path, frame_cnt: int, total_bytes: int, strip_c
             #define VIDEO_WIDTH         {WIDTH}
             #define VIDEO_HEIGHT        {HEIGHT}
             #define VIDEO_TOTAL_BYTES   {total_bytes}
-            #define VIDEO_STRIP_COUNT   {strip_count}
             #define UNIFIED_CODEBOOK_SIZE {codebook_size}
             #define EFFECTIVE_UNIFIED_CODEBOOK_SIZE {EFFECTIVE_UNIFIED_CODEBOOK_SIZE}
             
@@ -1299,9 +1193,6 @@ def write_header(path_h: pathlib.Path, frame_cnt: int, total_bytes: int, strip_c
             #define BLOCK_WIDTH         2
             #define BLOCK_HEIGHT        2
             #define BYTES_PER_BLOCK     7
-
-            // 条带高度数组
-            extern const unsigned char strip_heights[VIDEO_STRIP_COUNT];
             
             extern const unsigned char video_data[VIDEO_TOTAL_BYTES];
             extern const unsigned int frame_offsets[VIDEO_FRAME_COUNT];
@@ -1309,15 +1200,9 @@ def write_header(path_h: pathlib.Path, frame_cnt: int, total_bytes: int, strip_c
             #endif // {guard}
             """))
 
-def write_source(path_c: pathlib.Path, data: bytes, frame_offsets: list, strip_heights: list):
+def write_source(path_c: pathlib.Path, data: bytes, frame_offsets: list):
     with path_c.open("w", encoding="utf-8") as f:
         f.write('#include "video_data.h"\n\n')
-        
-
-        
-        f.write("const unsigned char strip_heights[] = {\n")
-        f.write("    " + ', '.join(map(str, strip_heights)) + "\n")
-        f.write("};\n\n")
         
         f.write("const unsigned int frame_offsets[] = {\n")
         for i in range(0, len(frame_offsets), 8):

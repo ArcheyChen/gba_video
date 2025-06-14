@@ -1,5 +1,5 @@
-// gba_video_player.cpp  v7
-// Mode 3 单缓冲 + YUV9 → RGB555 + 条带帧间差分解码 + 统一码本向量量化
+// gba_video_player.cpp  v8
+// Mode 3 单缓冲 + YUV9 → RGB555 + 条带帧间差分解码 + 统一码本向量量化 + 单条带模式
 
 #include <gba_systemcalls.h>
 #include <gba_video.h>
@@ -22,7 +22,6 @@ EWRAM_BSS u16 ewramBuffer[PIXELS_PER_FRAME];
 IWRAM_DATA static u8 clip_table_raw[512];
 u8* clip_lookup_table = clip_table_raw + 128;
 IWRAM_DATA static s8 bayer_bias_4_2x2[4][4] =
-//  {};
 {
     {-2, 0, 1, -1},
     {-1, 0, 1, 0},
@@ -38,13 +37,11 @@ struct YUV_Struct{
 } __attribute__((packed));
 
 // 统一码本存储（在IWRAM中）
-IWRAM_DATA u8 strip_unified_codebooks_raw[VIDEO_STRIP_COUNT][UNIFIED_CODEBOOK_SIZE*sizeof(YUV_Struct)+4]__attribute__((aligned(32)));
-IWRAM_DATA YUV_Struct *strip_unified_codebooks[VIDEO_STRIP_COUNT];
+IWRAM_DATA u8 unified_codebook_raw[UNIFIED_CODEBOOK_SIZE*sizeof(YUV_Struct)+4]__attribute__((aligned(32)));
+IWRAM_DATA YUV_Struct *unified_codebook;
 
 void init_table(){
-    for(int i = 0; i < VIDEO_STRIP_COUNT; i++) {
-        strip_unified_codebooks[i] = (YUV_Struct*)strip_unified_codebooks_raw[i];
-    }
+    unified_codebook = (YUV_Struct*)unified_codebook_raw;
     for(int i=-128;i<512-128;i++){
         u8 raw_val;
         if(i<=0)
@@ -72,48 +69,18 @@ IWRAM_CODE inline u32 yuv_to_rgb555_2pix(u8 _y0, u8 _y1, s8 d_r, s8 d_g, s8 d_b,
     return result;
 }
 
-// 条带信息结构
-struct StripInfo {
-    u16 start_y;
-    u16 height;
-    u16 blocks_per_row;
-    u16 blocks_per_col;
-    u16 total_blocks;
-    u16 buffer_offset;
-};
-
-IWRAM_DATA StripInfo strip_info[VIDEO_STRIP_COUNT];
 IWRAM_DATA u16 big_block_relative_offsets[240/4*160/4];
-// 新增：zone内block相对偏移查找表，最多240个block
+// zone内block相对偏移查找表
 IWRAM_DATA u16 zone_block_relative_offsets[240];
 
-void init_strip_info(){
-    u16 current_y = 0;
-
+void init_block_offsets(){
     u16 max_big_blocks_per_row = VIDEO_WIDTH / (BLOCK_WIDTH * 2);
-    u16 max_big_blocks_per_col = 0;
-
-    for(int strip_idx = 0; strip_idx < VIDEO_STRIP_COUNT; strip_idx++){
-        u16 strip_big_blocks_per_col = strip_heights[strip_idx] / (BLOCK_HEIGHT * 2);
-        if(strip_big_blocks_per_col > max_big_blocks_per_col) {
-            max_big_blocks_per_col = strip_big_blocks_per_col;
-        }
-    }
+    u16 max_big_blocks_per_col = VIDEO_HEIGHT / (BLOCK_HEIGHT * 2);
 
     for(int big_block_idx = 0; big_block_idx < max_big_blocks_per_row * max_big_blocks_per_col; big_block_idx++){
         u16 big_bx = big_block_idx % max_big_blocks_per_row;
         u16 big_by = big_block_idx / max_big_blocks_per_row;
         big_block_relative_offsets[big_block_idx] = (big_by * BLOCK_HEIGHT * 2 * SCREEN_WIDTH) + (big_bx * BLOCK_WIDTH * 2);
-    }
-
-    for(int strip_idx = 0; strip_idx < VIDEO_STRIP_COUNT; strip_idx++){
-        strip_info[strip_idx].start_y = current_y;
-        strip_info[strip_idx].height = strip_heights[strip_idx];
-        strip_info[strip_idx].blocks_per_row = VIDEO_WIDTH / BLOCK_WIDTH;
-        strip_info[strip_idx].blocks_per_col = strip_heights[strip_idx] / BLOCK_HEIGHT;
-        strip_info[strip_idx].total_blocks = strip_info[strip_idx].blocks_per_row * strip_info[strip_idx].blocks_per_col;
-        strip_info[strip_idx].buffer_offset = current_y * SCREEN_WIDTH;
-        current_y += strip_heights[strip_idx];
     }
 
     // 初始化zone内block相对偏移查找表
@@ -126,16 +93,12 @@ void init_strip_info(){
     }
 }
 
-
-
 // 解码单个2x2块
 IWRAM_CODE inline void decode_block(const YUV_Struct &yuv_data, u16* dst, u8 bayer_idx)
 {
     const s8 &d_r = yuv_data.d_r;
     const s8 &d_g = yuv_data.d_g;
     const s8 &d_b = yuv_data.d_b;
-
-    // s8 d_g = (-(d_b >> 1) - d_r) >> 1; 
 
     u32* dst_row = (u32*)dst;
     auto const &y = yuv_data.y;
@@ -214,24 +177,18 @@ IWRAM_CODE void copy_unified_codebook(u8* dst_raw, const u8* src, YUV_Struct** c
     }
 }
 
-IWRAM_CODE void decode_strip_i_frame_unified(int strip_idx, const u8* src, u16* dst)
+IWRAM_CODE void decode_i_frame_unified(const u8* src, u16* dst)
 {
-    u16 strip_base_offset = strip_info[strip_idx].buffer_offset;
-    
     // 拷贝统一码本
-    copy_unified_codebook(strip_unified_codebooks_raw[strip_idx], src, 
-                         &strip_unified_codebooks[strip_idx], UNIFIED_CODEBOOK_SIZE);
+    copy_unified_codebook(unified_codebook_raw, src, 
+                         &unified_codebook, UNIFIED_CODEBOOK_SIZE);
     src += UNIFIED_CODEBOOK_SIZE * BYTES_PER_BLOCK;
     
-    auto &strip = strip_info[strip_idx];
-    auto &unified_codebook = strip_unified_codebooks[strip_idx];
-    
-    u16 tot_big_blocks = strip.total_blocks >> 2;
-    u16* strip_dst = dst + strip_base_offset;
+    u16 tot_big_blocks = (VIDEO_WIDTH / (BLOCK_WIDTH * 2)) * (VIDEO_HEIGHT / (BLOCK_HEIGHT * 2));
     
     // 解码所有4x4大块
     for (int big_block_idx = 0; big_block_idx < tot_big_blocks; big_block_idx++) {
-        u16* big_block_dst = strip_dst + big_block_relative_offsets[big_block_idx];
+        u16* big_block_dst = dst + big_block_relative_offsets[big_block_idx];
         
         // 读取第一个索引/标记
         u8 first_byte = *src++;
@@ -252,16 +209,11 @@ IWRAM_CODE void decode_strip_i_frame_unified(int strip_idx, const u8* src, u16* 
     }
 }
 
-IWRAM_CODE void decode_strip_p_frame_unified(int strip_idx, const u8* src, u16* dst)
+IWRAM_CODE void decode_p_frame_unified(const u8* src, u16* dst)
 {
-    u16 strip_base_offset = strip_info[strip_idx].buffer_offset;
-    
     // 读取区域bitmap
-    // u8 zone_bitmap = *src++;
     u16 zone_bitmap = src[0] | (src[1] << 8);
     src += 2; // 跳过bitmap的两个字节
-    
-    auto &unified_codebook = strip_unified_codebooks[strip_idx];
     
     // 使用bitmap右移优化处理每个有效区域
     u8 zone_idx = 0;
@@ -272,8 +224,7 @@ IWRAM_CODE void decode_strip_p_frame_unified(int strip_idx, const u8* src, u16* 
             u8 color_blocks_to_update = *src++;
             
             // 计算zone在整个屏幕中的基址偏移
-            u16 zone_base_offset = strip_base_offset + 
-                (zone_idx * ZONE_HEIGHT_PIXELS * SCREEN_WIDTH);
+            u16 zone_base_offset = zone_idx * ZONE_HEIGHT_PIXELS * SCREEN_WIDTH;
             u16* zone_dst = dst + zone_base_offset;
             
             // 处理纹理块更新（4个索引）
@@ -306,28 +257,14 @@ IWRAM_CODE void decode_strip_p_frame_unified(int strip_idx, const u8* src, u16* 
     }
 }
 
-
-IWRAM_CODE void decode_strip(int strip_idx, const u8* src, u16 strip_data_size, u16* dst)
-{
-    u8 frame_type = *src++;
-    
-    if (frame_type == FRAME_TYPE_I) {
-        decode_strip_i_frame_unified(strip_idx, src, dst);
-    } else if (frame_type == FRAME_TYPE_P) {
-        decode_strip_p_frame_unified(strip_idx, src, dst);
-    }
-}
-
 IWRAM_CODE void decode_frame(const u8* frame_data, u16* dst)
 {
-    const u8* src = frame_data;
+    u8 frame_type = *frame_data++;
     
-    for (int strip_idx = 0; strip_idx < VIDEO_STRIP_COUNT; strip_idx++) {
-        u16 strip_data_size = src[0] | (src[1] << 8);
-        src += 2;
-        
-        decode_strip(strip_idx, src, strip_data_size, dst);
-        src += strip_data_size;
+    if (frame_type == FRAME_TYPE_I) {
+        decode_i_frame_unified(frame_data, dst);
+    } else if (frame_type == FRAME_TYPE_P) {
+        decode_p_frame_unified(frame_data, dst);
     }
 }
 
@@ -343,7 +280,7 @@ int main()
     irqEnable(IRQ_VBLANK);
 
     init_table();
-    init_strip_info();
+    init_block_offsets();
     
     memset(ewramBuffer, 0, PIXELS_PER_FRAME * sizeof(u16));
     DMA3COPY(ewramBuffer, VRAM, PIXELS_PER_FRAME | DMA16);
