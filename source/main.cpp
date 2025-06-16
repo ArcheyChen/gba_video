@@ -17,7 +17,7 @@ constexpr int PIXELS_PER_FRAME = SCREEN_WIDTH * SCREEN_HEIGHT;
 #define ZONE_HEIGHT_PIXELS 16  // 每个区域的像素高度
 #define ZONE_HEIGHT_BIG_BLOCKS (ZONE_HEIGHT_PIXELS / (BLOCK_HEIGHT * 2))  // 每个区域的4x4大块行数
 #define MINI_CODEBOOK_SIZE 15  // 每个分段码本的大小
-#define TOTAL_SEGMENTS 17      // 总分段数：1个强制段 + 16个可选段
+#define DEFAULT_FORCED_SEGMENTS 2  // 默认强制处理的段数
 #define SKIP_MARKER_4BIT 0xF   // 4bit跳过标记
 
 // EWRAM 单缓冲
@@ -268,7 +268,7 @@ IWRAM_CODE void decode_p_frame_unified(const u8* src, u16* dst)
     u16 color_zone_bitmap = src[2] | (src[3] << 8);
     src += 4; // 跳过两个bitmap的四个字节
     
-    // 处理纹理块更新（新的分段解码）
+    // 处理纹理块更新（混合编码模式）
     u8 zone_idx = 0;
     u16 temp_bitmap = detail_zone_bitmap;
     while (temp_bitmap) {
@@ -277,44 +277,36 @@ IWRAM_CODE void decode_p_frame_unified(const u8* src, u16* dst)
             u16 zone_base_offset = zone_idx * ZONE_HEIGHT_PIXELS * SCREEN_WIDTH;
             u16* zone_dst = dst + zone_base_offset;
             
-            // 强制处理第0段
-            const YUV_Struct* mini_codebook = unified_codebook;  // 第0段开始
-            u8 seg0_blocks_to_update = *src++;
+            // 读取强制段数
+            u8 forced_segments = *src++;
             
-            for (u8 i = 0; i < seg0_blocks_to_update; i++) {
-                u8 zone_relative_idx = *src++;
-                u8 packed_byte1 = *src++;
-                u8 packed_byte2 = *src++;
+            // 处理前N段（分段编码）
+            for (u8 seg_idx = 0; seg_idx < forced_segments; seg_idx++) {
+                const YUV_Struct* mini_codebook = unified_codebook + (seg_idx * MINI_CODEBOOK_SIZE);
+                u8 seg_blocks_to_update = *src++;
                 
-                u16* big_block_dst = zone_dst + zone_block_relative_offsets[zone_relative_idx];
-                decode_segmented_block(mini_codebook, packed_byte1, packed_byte2, big_block_dst);
+                for (u8 i = 0; i < seg_blocks_to_update; i++) {
+                    u8 zone_relative_idx = *src++;
+                    u8 packed_byte1 = *src++;
+                    u8 packed_byte2 = *src++;
+                    
+                    u16* big_block_dst = zone_dst + zone_block_relative_offsets[zone_relative_idx];
+                    decode_segmented_block(mini_codebook, packed_byte1, packed_byte2, big_block_dst);
+                }
             }
             
-            // 读取后16段的bitmap
-            u16 segment_bitmap = src[0] | (src[1] << 8);
-            src += 2;
-            
-            // 处理有数据的段
-            mini_codebook += MINI_CODEBOOK_SIZE;  // 移动到第1段
-            u8 seg_idx = 1;
-            u16 temp_seg_bitmap = segment_bitmap;
-            
-            while (temp_seg_bitmap) {
-                if (temp_seg_bitmap & 1) {
-                    u8 seg_blocks_to_update = *src++;
-                    
-                    for (u8 i = 0; i < seg_blocks_to_update; i++) {
-                        u8 zone_relative_idx = *src++;
-                        u8 packed_byte1 = *src++;
-                        u8 packed_byte2 = *src++;
-                        
-                        u16* big_block_dst = zone_dst + zone_block_relative_offsets[zone_relative_idx];
-                        decode_segmented_block(mini_codebook, packed_byte1, packed_byte2, big_block_dst);
-                    }
-                }
-                temp_seg_bitmap >>= 1;
-                mini_codebook += MINI_CODEBOOK_SIZE;  // 移动到下一段
-                seg_idx++;
+            // 处理剩余更新（完整索引）
+            u8 remaining_blocks_to_update = *src++;
+            for (u8 i = 0; i < remaining_blocks_to_update; i++) {
+                u8 zone_relative_idx = *src++;
+                u8 quant_indices[4];
+                quant_indices[0] = *src++;
+                quant_indices[1] = *src++;
+                quant_indices[2] = *src++;
+                quant_indices[3] = *src++;
+                
+                u16* big_block_dst = zone_dst + zone_block_relative_offsets[zone_relative_idx];
+                decode_big_block(unified_codebook, quant_indices, big_block_dst);
             }
         }
         temp_bitmap >>= 1;
