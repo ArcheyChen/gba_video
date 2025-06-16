@@ -359,6 +359,25 @@ def quantize_blocks_unified(blocks_data: np.ndarray, codebook: np.ndarray) -> np
     
     return indices
 
+@njit
+def compute_2x2_block_differences_numba(current_flat, prev_flat, blocks_h, blocks_w):
+    """Numba加速的2x2块差异计算"""
+    block_diffs = np.zeros((blocks_h, blocks_w), dtype=np.float64)
+    
+    for i in range(blocks_h * blocks_w):
+        y_diff_sum = 0.0
+        for j in range(4):  # 只计算Y分量差异
+            current_val = int(current_flat[i, j])
+            prev_val = int(prev_flat[i, j])
+            if current_val >= prev_val:
+                diff = current_val - prev_val
+            else:
+                diff = prev_val - current_val
+            y_diff_sum += diff
+        block_diffs[i // blocks_w, i % blocks_w] = y_diff_sum / 4.0
+    
+    return block_diffs
+
 def encode_i_frame_unified(blocks: np.ndarray, unified_codebook: np.ndarray, 
                           block_types: dict) -> bytes:
     """编码I帧（统一码本）"""
@@ -376,7 +395,20 @@ def encode_i_frame_unified(blocks: np.ndarray, unified_codebook: np.ndarray,
         # 按4x4大块的顺序编码
         for big_by in range(big_blocks_h):
             for big_bx in range(big_blocks_w):
-                if (big_by, big_bx) in block_types:
+                # 处理block_types为None的情况
+                if block_types is None or (big_by, big_bx) not in block_types:
+                    # 默认为纹理块处理
+                    for sub_by in range(2):
+                        for sub_bx in range(2):
+                            by = big_by * 2 + sub_by
+                            bx = big_bx * 2 + sub_bx
+                            if by < blocks_h and bx < blocks_w:
+                                block = blocks[by, bx]
+                                unified_idx = quantize_blocks_unified(block.reshape(1, -1), unified_codebook)[0]
+                                data.append(unified_idx)
+                            else:
+                                data.append(0)
+                else:
                     block_type, block_indices = block_types[(big_by, big_bx)]
                     
                     if block_type == 'color':
@@ -478,7 +510,12 @@ def encode_p_frame_unified(current_blocks: np.ndarray, prev_blocks: np.ndarray,
                 actual_updated_subblocks = sum(subblock_needs_update)
                 total_updated_blocks += actual_updated_subblocks
                 
-                if (big_by, big_bx) in block_types and block_types[(big_by, big_bx)][0] == 'color':
+                # 检查block_types是否为None或不包含当前块
+                is_color_block = (block_types is not None and 
+                                (big_by, big_bx) in block_types and 
+                                block_types[(big_by, big_bx)][0] == 'color')
+                
+                if is_color_block:
                     # 色块更新：如果任何子块需要更新，就更新整个色块
                     blocks_4x4 = []
                     for by, bx in positions:
@@ -504,7 +541,10 @@ def encode_p_frame_unified(current_blocks: np.ndarray, prev_blocks: np.ndarray,
                         else:
                             # 不需要更新的子块：使用跳过标记
                             indices.append(COLOR_BLOCK_MARKER)  # 0xFF
-                    zone_detail_updates[zone_idx].append((zone_relative_idx, indices))
+                    
+                    # 检查是否所有子块都不需要更新（防止发送全FF的块）
+                    if any(idx != COLOR_BLOCK_MARKER for idx in indices):
+                        zone_detail_updates[zone_idx].append((zone_relative_idx, indices))
     
     # 判断是否需要I帧
     update_ratio = total_updated_blocks / total_blocks
@@ -566,43 +606,7 @@ def encode_p_frame_unified(current_blocks: np.ndarray, prev_blocks: np.ndarray,
     
     return bytes(data), False, used_zones, total_color_updates, total_detail_updates
 
-def compute_block_differences_numba(current_flat, prev_flat, blocks_h, blocks_w):
-    """Numba加速的块差异计算"""
-    block_diffs = np.zeros((blocks_h, blocks_w), dtype=np.float64)
-    
-    for i in range(blocks_h * blocks_w):
-        y_diff_sum = 0.0
-        for j in range(4):  # 只计算Y分量差异
-            current_val = int(current_flat[i, j])
-            prev_val = int(prev_flat[i, j])
-            if current_val >= prev_val:
-                diff = current_val - prev_val
-            else:
-                diff = prev_val - current_val
-            y_diff_sum += diff
-        block_diffs[i // blocks_w, i % blocks_w] = y_diff_sum / 4.0
-    
-    return block_diffs
-
 @njit
-def compute_2x2_block_differences_numba(current_flat, prev_flat, blocks_h, blocks_w):
-    """Numba加速的2x2块差异计算"""
-    block_diffs = np.zeros((blocks_h, blocks_w), dtype=np.float64)
-    
-    for i in range(blocks_h * blocks_w):
-        y_diff_sum = 0.0
-        for j in range(4):  # 只计算Y分量差异
-            current_val = int(current_flat[i, j])
-            prev_val = int(prev_flat[i, j])
-            if current_val >= prev_val:
-                diff = current_val - prev_val
-            else:
-                diff = prev_val - current_val
-            y_diff_sum += diff
-        block_diffs[i // blocks_w, i % blocks_w] = y_diff_sum / 4.0
-    
-    return block_diffs
-
 def identify_updated_blocks_numba(block_diffs, diff_threshold, blocks_h, blocks_w):
     """Numba加速的更新块识别"""
     big_blocks_h = blocks_h // 2
@@ -646,7 +650,7 @@ def identify_updated_big_blocks(current_blocks: np.ndarray, prev_blocks: np.ndar
     # 使用Numba加速的块差异计算
     current_flat = current_blocks.reshape(-1, BYTES_PER_BLOCK)
     prev_flat = prev_blocks.reshape(-1, BYTES_PER_BLOCK)
-    block_diffs = compute_block_differences_numba(current_flat, prev_flat, blocks_h, blocks_w)
+    block_diffs = compute_2x2_block_differences_numba(current_flat, prev_flat, blocks_h, blocks_w)
     
     # 使用Numba加速的更新块识别
     updated_list = identify_updated_blocks_numba(block_diffs, diff_threshold, blocks_h, blocks_w)
@@ -1142,12 +1146,18 @@ def main():
         
         unified_codebook = gop_data['unified_codebook']
         
-        # 找到当前帧的block_types
+        # 找到当前帧的block_types，处理缺失的情况
         block_types = None
         for fid, bt in gop_data['block_types_list']:
             if fid == frame_idx:
                 block_types = bt
                 break
+        
+        # 如果block_types仍然为None，生成默认的block_types
+        if block_types is None:
+            print(f"  ⚠️ 帧 {frame_idx} 缺少block_types，使用默认分类")
+            # 临时生成block_types
+            _, block_types = classify_4x4_blocks_unified(current_frame, args.variance_threshold)
         
         force_i_frame = (frame_idx % args.i_frame_interval == 0) or frame_idx == 0
         
