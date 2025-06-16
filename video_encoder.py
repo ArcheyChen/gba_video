@@ -510,32 +510,43 @@ def encode_p_frame_unified(current_blocks: np.ndarray, prev_blocks: np.ndarray,
     total_color_updates = 0
     total_detail_updates = 0
     
-    # 生成区域bitmap
-    zone_bitmap = 0
+    # 生成两个区域bitmap
+    detail_zone_bitmap = 0
+    color_zone_bitmap = 0
+    
     for zone_idx in range(zones_count):
-        if zone_detail_updates[zone_idx] or zone_color_updates[zone_idx]:
-            zone_bitmap |= (1 << zone_idx)
-            used_zones += 1
-            total_color_updates += len(zone_color_updates[zone_idx])
+        if zone_detail_updates[zone_idx]:
+            detail_zone_bitmap |= (1 << zone_idx)
             total_detail_updates += len(zone_detail_updates[zone_idx])
+        if zone_color_updates[zone_idx]:
+            color_zone_bitmap |= (1 << zone_idx)
+            total_color_updates += len(zone_color_updates[zone_idx])
     
-    # u16 bitmap
-    data.extend(struct.pack('<H', zone_bitmap))
+    # 计算实际使用的区域数（两个bitmap的并集）
+    combined_bitmap = detail_zone_bitmap | color_zone_bitmap
+    used_zones = bin(combined_bitmap).count('1')
     
-    # 按区域编码更新
+    # 写入两个u16 bitmap
+    data.extend(struct.pack('<H', detail_zone_bitmap))
+    data.extend(struct.pack('<H', color_zone_bitmap))
+    
+    # 按区域编码纹理块更新
     for zone_idx in range(zones_count):
-        if zone_bitmap & (1 << zone_idx):
+        if detail_zone_bitmap & (1 << zone_idx):
             detail_updates = zone_detail_updates[zone_idx]
-            color_updates = zone_color_updates[zone_idx]
-            
             data.append(len(detail_updates))
-            data.append(len(color_updates))
             
             # 存储纹理块更新
             for relative_idx, indices in detail_updates:
                 data.append(relative_idx)
                 for idx in indices:
                     data.append(idx)
+    
+    # 按区域编码色块更新
+    for zone_idx in range(zones_count):
+        if color_zone_bitmap & (1 << zone_idx):
+            color_updates = zone_color_updates[zone_idx]
+            data.append(len(color_updates))
             
             # 存储色块更新
             for relative_idx, unified_idx in color_updates:
@@ -544,7 +555,8 @@ def encode_p_frame_unified(current_blocks: np.ndarray, prev_blocks: np.ndarray,
     
     return bytes(data), False, used_zones, total_color_updates, total_detail_updates
 
-@njit
+# ...existing code...
+
 def compute_block_differences_numba(current_flat, prev_flat, blocks_h, blocks_w):
     """Numba加速的块差异计算"""
     block_diffs = np.zeros((blocks_h, blocks_w), dtype=np.float64)

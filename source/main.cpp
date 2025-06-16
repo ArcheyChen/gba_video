@@ -226,17 +226,18 @@ IWRAM_CODE void decode_i_frame_unified(const u8* src, u16* dst)
 
 IWRAM_CODE void decode_p_frame_unified(const u8* src, u16* dst)
 {
-    // 读取区域bitmap
-    u16 zone_bitmap = src[0] | (src[1] << 8);
-    src += 2; // 跳过bitmap的两个字节
+    // 读取两个区域bitmap：纹理块和色块
+    u16 detail_zone_bitmap = src[0] | (src[1] << 8);
+    u16 color_zone_bitmap = src[2] | (src[3] << 8);
+    src += 4; // 跳过两个bitmap的四个字节
     
-    // 使用bitmap右移优化处理每个有效区域
+    // 处理纹理块更新
     u8 zone_idx = 0;
-    while (zone_bitmap) {
-        if (zone_bitmap & 1) {
-            // 读取两种类型的更新数量
+    u16 temp_bitmap = detail_zone_bitmap;
+    while (temp_bitmap) {
+        if (temp_bitmap & 1) {
+            // 读取纹理块更新数量
             u8 detail_blocks_to_update = *src++;
-            u8 color_blocks_to_update = *src++;
             
             // 计算zone在整个屏幕中的基址偏移
             u16 zone_base_offset = zone_idx * ZONE_HEIGHT_PIXELS * SCREEN_WIDTH;
@@ -256,6 +257,22 @@ IWRAM_CODE void decode_p_frame_unified(const u8* src, u16* dst)
                 u16* big_block_dst = zone_dst + zone_block_relative_offsets[zone_relative_idx];
                 decode_big_block(unified_codebook, quant_indices, big_block_dst);
             }
+        }
+        temp_bitmap >>= 1;
+        zone_idx++;
+    }
+    
+    // 处理色块更新
+    zone_idx = 0;
+    temp_bitmap = color_zone_bitmap;
+    while (temp_bitmap) {
+        if (temp_bitmap & 1) {
+            // 读取色块更新数量
+            u8 color_blocks_to_update = *src++;
+            
+            // 计算zone在整个屏幕中的基址偏移
+            u16 zone_base_offset = zone_idx * ZONE_HEIGHT_PIXELS * SCREEN_WIDTH;
+            u16* zone_dst = dst + zone_base_offset;
             
             // 处理色块更新（1个统一码本索引）
             for (u8 i = 0; i < color_blocks_to_update; i++) {
@@ -267,7 +284,7 @@ IWRAM_CODE void decode_p_frame_unified(const u8* src, u16* dst)
                 decode_color_block(unified_codebook[unified_idx], big_block_dst);
             }
         }
-        zone_bitmap >>= 1;
+        temp_bitmap >>= 1;
         zone_idx++;
     }
 }
