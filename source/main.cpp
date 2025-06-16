@@ -16,6 +16,9 @@ constexpr int PIXELS_PER_FRAME = SCREEN_WIDTH * SCREEN_HEIGHT;
 // 新增常量定义
 #define ZONE_HEIGHT_PIXELS 16  // 每个区域的像素高度
 #define ZONE_HEIGHT_BIG_BLOCKS (ZONE_HEIGHT_PIXELS / (BLOCK_HEIGHT * 2))  // 每个区域的4x4大块行数
+#define MINI_CODEBOOK_SIZE 15  // 每个分段码本的大小
+#define TOTAL_SEGMENTS 17      // 总分段数：1个强制段 + 16个可选段
+#define SKIP_MARKER_4BIT 0xF   // 4bit跳过标记
 
 // EWRAM 单缓冲
 EWRAM_BSS u16 ewramBuffer[PIXELS_PER_FRAME];
@@ -156,6 +159,31 @@ IWRAM_CODE void decode_big_block(const YUV_Struct* codebook, const u8 quant_indi
     }
 }
 
+// 解码分段纹理块的辅助函数
+IWRAM_CODE void decode_segmented_block(const YUV_Struct* mini_codebook, u8 packed_byte1, u8 packed_byte2, u16* big_block_dst)
+{
+    // 解包4个4bit索引
+    u8 indices[4];
+    indices[0] = packed_byte1 & 0xF;
+    indices[1] = (packed_byte1 >> 4) & 0xF;
+    indices[2] = packed_byte2 & 0xF;
+    indices[3] = (packed_byte2 >> 4) & 0xF;
+    
+    // 解码每个2x2子块，如果索引是0xF则跳过
+    if (indices[0] != SKIP_MARKER_4BIT) {
+        decode_block(mini_codebook[indices[0]], big_block_dst, 0);
+    }
+    if (indices[1] != SKIP_MARKER_4BIT) {
+        decode_block(mini_codebook[indices[1]], big_block_dst + 2, 1);
+    }
+    if (indices[2] != SKIP_MARKER_4BIT) {
+        decode_block(mini_codebook[indices[2]], big_block_dst + SCREEN_WIDTH * 2, 2);
+    }
+    if (indices[3] != SKIP_MARKER_4BIT) {
+        decode_block(mini_codebook[indices[3]], big_block_dst + SCREEN_WIDTH * 2 + 2, 3);
+    }
+}
+
 // DMA拷贝码本的辅助函数
 IWRAM_CODE void copy_unified_codebook(u8* dst_raw, const u8* src, YUV_Struct** codebook_ptr, int codebook_size)
 {
@@ -240,38 +268,60 @@ IWRAM_CODE void decode_p_frame_unified(const u8* src, u16* dst)
     u16 color_zone_bitmap = src[2] | (src[3] << 8);
     src += 4; // 跳过两个bitmap的四个字节
     
-    // 处理纹理块更新
+    // 处理纹理块更新（新的分段解码）
     u8 zone_idx = 0;
     u16 temp_bitmap = detail_zone_bitmap;
     while (temp_bitmap) {
         if (temp_bitmap & 1) {
-            // 读取纹理块更新数量
-            u8 detail_blocks_to_update = *src++;
-            
             // 计算zone在整个屏幕中的基址偏移
             u16 zone_base_offset = zone_idx * ZONE_HEIGHT_PIXELS * SCREEN_WIDTH;
             u16* zone_dst = dst + zone_base_offset;
             
-            // 处理纹理块更新（4个索引）
-            for (u8 i = 0; i < detail_blocks_to_update; i++) {
+            // 强制处理第0段
+            const YUV_Struct* mini_codebook = unified_codebook;  // 第0段开始
+            u8 seg0_blocks_to_update = *src++;
+            
+            for (u8 i = 0; i < seg0_blocks_to_update; i++) {
                 u8 zone_relative_idx = *src++;
+                u8 packed_byte1 = *src++;
+                u8 packed_byte2 = *src++;
                 
-                u8 quant_indices[4];
-                quant_indices[0] = *src++;
-                quant_indices[1] = *src++;
-                quant_indices[2] = *src++;
-                quant_indices[3] = *src++;
-                
-                // 直接使用查找表获取相对偏移
                 u16* big_block_dst = zone_dst + zone_block_relative_offsets[zone_relative_idx];
-                decode_big_block(unified_codebook, quant_indices, big_block_dst);
+                decode_segmented_block(mini_codebook, packed_byte1, packed_byte2, big_block_dst);
+            }
+            
+            // 读取后16段的bitmap
+            u16 segment_bitmap = src[0] | (src[1] << 8);
+            src += 2;
+            
+            // 处理有数据的段
+            mini_codebook += MINI_CODEBOOK_SIZE;  // 移动到第1段
+            u8 seg_idx = 1;
+            u16 temp_seg_bitmap = segment_bitmap;
+            
+            while (temp_seg_bitmap) {
+                if (temp_seg_bitmap & 1) {
+                    u8 seg_blocks_to_update = *src++;
+                    
+                    for (u8 i = 0; i < seg_blocks_to_update; i++) {
+                        u8 zone_relative_idx = *src++;
+                        u8 packed_byte1 = *src++;
+                        u8 packed_byte2 = *src++;
+                        
+                        u16* big_block_dst = zone_dst + zone_block_relative_offsets[zone_relative_idx];
+                        decode_segmented_block(mini_codebook, packed_byte1, packed_byte2, big_block_dst);
+                    }
+                }
+                temp_seg_bitmap >>= 1;
+                mini_codebook += MINI_CODEBOOK_SIZE;  // 移动到下一段
+                seg_idx++;
             }
         }
         temp_bitmap >>= 1;
         zone_idx++;
     }
     
-    // 处理色块更新
+    // 处理色块更新（逻辑不变）
     zone_idx = 0;
     temp_bitmap = color_zone_bitmap;
     while (temp_bitmap) {
