@@ -469,12 +469,13 @@ def encode_i_frame_unified(blocks: np.ndarray, unified_codebook: np.ndarray,
                                     data.append(0)
     
     return bytes(data)
+# 将原文件中的 encode_p_frame_unified 函数替换为以下版本
 
 def encode_p_frame_unified(current_blocks: np.ndarray, prev_blocks: np.ndarray,
                           unified_codebook: np.ndarray, block_types: dict,
                           diff_threshold: float, force_i_threshold: float = 0.7,
                           forced_segments: int = DEFAULT_FORCED_SEGMENTS) -> tuple:
-    """差分编码P帧（统一码本，混合分段编码）"""
+    """差分编码P帧（统一码本，混合分段编码）- 修复重复编码问题"""
     if prev_blocks is None or current_blocks.shape != prev_blocks.shape:
         i_frame_data = encode_i_frame_unified(current_blocks, unified_codebook, block_types)
         return i_frame_data, True, 0, 0, 0
@@ -555,11 +556,12 @@ def encode_p_frame_unified(current_blocks: np.ndarray, prev_blocks: np.ndarray,
                     color_idx = quantize_blocks_unified(avg_block.reshape(1, -1), unified_codebook)[0]
                     zone_color_updates[zone_idx].append((zone_relative_idx, color_idx))
                 else:
-                    # 纹理块更新：混合编码模式
+                    # 纹理块更新：修复后的编码模式选择逻辑
                     segment_indices = []
                     within_indices = []
                     full_indices = []
                     
+                    # 先计算所有子块的编码信息
                     for i, (by, bx) in enumerate(positions):
                         if by < blocks_h and bx < blocks_w and subblock_needs_update[i]:
                             # 需要更新的子块：量化并获取分段索引
@@ -576,9 +578,40 @@ def encode_p_frame_unified(current_blocks: np.ndarray, prev_blocks: np.ndarray,
                             within_indices.append(SKIP_MARKER_4BIT)  # 0xF
                             full_indices.append(COLOR_BLOCK_MARKER)  # 0xFF用于完整索引跳过
                     
-                    # 检查是否所有子块都不需要更新
-                    if any(idx != SKIP_MARKER_4BIT for idx in within_indices):
-                        zone_detail_updates[zone_idx].append((zone_relative_idx, segment_indices, within_indices, full_indices))
+                    # 【关键修复】：检查所有需要更新的子块是否都能用小码表编码
+                    can_use_small_codebook = True
+                    used_segments = set()
+                    has_updates = False
+                    
+                    for i, (seg_idx, within_idx) in enumerate(zip(segment_indices, within_indices)):
+                        if within_idx != SKIP_MARKER_4BIT:  # 这是需要更新的子块
+                            has_updates = True
+                            if seg_idx >= forced_segments:  # 超出强制段范围，必须用大码表
+                                can_use_small_codebook = False
+                                break
+                            used_segments.add(seg_idx)
+                    
+                    # 进一步检查：避免段过于分散（可选的优化，避免一个4x4块跨太多段）
+                    if can_use_small_codebook and len(used_segments) > 2:
+                        can_use_small_codebook = False
+                    
+                    # 根据检查结果选择编码模式（关键：每个4x4块只选择一种模式）
+                    if can_use_small_codebook and has_updates and used_segments:
+                        # 所有需要更新的子块都能用小码表编码，使用小码表模式
+                        zone_detail_updates[zone_idx].append({
+                            'type': 'small',
+                            'zone_relative_idx': zone_relative_idx,
+                            'segment_indices': segment_indices,
+                            'within_indices': within_indices,
+                            'used_segments': used_segments
+                        })
+                    elif has_updates:
+                        # 至少有一个子块需要大码表，整个4x4块使用完整索引模式
+                        zone_detail_updates[zone_idx].append({
+                            'type': 'full',
+                            'zone_relative_idx': zone_relative_idx,
+                            'full_indices': full_indices
+                        })
     
     # 判断是否需要I帧
     update_ratio = total_updated_blocks / total_blocks
@@ -615,39 +648,37 @@ def encode_p_frame_unified(current_blocks: np.ndarray, prev_blocks: np.ndarray,
     data.extend(struct.pack('<H', detail_zone_bitmap))
     data.extend(struct.pack('<H', color_zone_bitmap))
     
-    # 按区域编码纹理块更新（混合编码模式）
+    # 按区域编码纹理块更新（修复后的混合编码模式）
     for zone_idx in range(zones_count):
         if detail_zone_bitmap & (1 << zone_idx):
             detail_updates = zone_detail_updates[zone_idx]
             
-            # 按段分组纹理块更新，只处理前N段
-            segment_groups = [[] for _ in range(forced_segments)]
-            remaining_updates = []  # 剩余更新，用完整索引
+            # 分离小码表编码和完整索引编码
+            small_codebook_updates = [[] for _ in range(forced_segments)]
+            full_index_updates = []
             
-            for zone_relative_idx, segment_indices, within_indices, full_indices in detail_updates:
-                # 检查是否可以用前N段编码
-                can_use_segments = False
-                used_segments = set()
-                
-                for seg_idx, within_idx in zip(segment_indices, within_indices):
-                    if within_idx != SKIP_MARKER_4BIT and seg_idx < forced_segments:
-                        used_segments.add(seg_idx)
-                        can_use_segments = True
-                
-                if can_use_segments and len(used_segments) <= 2:  # 最多涉及2个段，避免过于分散
-                    # 将这个大块加入到相关的段中
-                    for seg_idx in used_segments:
-                        segment_groups[seg_idx].append((zone_relative_idx, segment_indices, within_indices))
-                else:
-                    # 使用完整索引编码
-                    remaining_updates.append((zone_relative_idx, full_indices))
+            for update_info in detail_updates:
+                if update_info['type'] == 'small':
+                    # 小码表编码：按段分组
+                    zone_relative_idx = update_info['zone_relative_idx']
+                    segment_indices = update_info['segment_indices']
+                    within_indices = update_info['within_indices']
+                    
+                    for seg_idx in update_info['used_segments']:
+                        small_codebook_updates[seg_idx].append((zone_relative_idx, segment_indices, within_indices))
+                        
+                elif update_info['type'] == 'full':
+                    # 完整索引编码
+                    zone_relative_idx = update_info['zone_relative_idx']
+                    full_indices = update_info['full_indices']
+                    full_index_updates.append((zone_relative_idx, full_indices))
             
             # 写入强制段数
             data.append(forced_segments)
             
-            # 处理前N段
+            # 处理小码表编码段
             for seg_idx in range(forced_segments):
-                seg_updates = segment_groups[seg_idx]
+                seg_updates = small_codebook_updates[seg_idx]
                 data.append(len(seg_updates))
                 for zone_relative_idx, segment_indices, within_indices in seg_updates:
                     data.append(zone_relative_idx)
@@ -664,9 +695,9 @@ def encode_p_frame_unified(current_blocks: np.ndarray, prev_blocks: np.ndarray,
                     data.append(packed_byte1)
                     data.append(packed_byte2)
             
-            # 处理剩余更新（完整索引）
-            data.append(len(remaining_updates))
-            for zone_relative_idx, full_indices in remaining_updates:
+            # 处理完整索引编码
+            data.append(len(full_index_updates))
+            for zone_relative_idx, full_indices in full_index_updates:
                 data.append(zone_relative_idx)
                 for idx in full_indices:
                     data.append(idx)
@@ -683,7 +714,7 @@ def encode_p_frame_unified(current_blocks: np.ndarray, prev_blocks: np.ndarray,
                 data.append(unified_idx)
     
     return bytes(data), False, used_zones, total_color_updates, total_detail_updates
-
+    
 def extract_effective_blocks_from_big_blocks(blocks: np.ndarray, big_block_positions: set,
                                            variance_threshold: float = 5.0) -> list:
     """从指定的4x4大块位置提取有效的2x2块"""
