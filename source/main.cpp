@@ -138,13 +138,22 @@ IWRAM_CODE inline void decode_color_block(const YUV_Struct &yuv_data, u16* dst)
     *(dst_row + 1) = yuv_to_rgb555_2pix(y[1][1],y[1][1], d_r, d_g, d_b,bayer_bias_4_2x2[3]);
 }
 
-// 通用的4x4大块解码函数（纹理块）
+// 通用的4x4大块解码函数（纹理块）- 支持跳过标记
 IWRAM_CODE void decode_big_block(const YUV_Struct* codebook, const u8 quant_indices[4], u16* big_block_dst)
 {
-    decode_block(codebook[quant_indices[0]], big_block_dst ,0);
-    decode_block(codebook[quant_indices[1]], big_block_dst + 2,1);
-    decode_block(codebook[quant_indices[2]], big_block_dst + SCREEN_WIDTH * 2,2);
-    decode_block(codebook[quant_indices[3]], big_block_dst + SCREEN_WIDTH * 2 + 2,3);
+    // 解码每个2x2子块，如果索引是0xFF则跳过
+    if (quant_indices[0] != 0xFF) {
+        decode_block(codebook[quant_indices[0]], big_block_dst, 0);
+    }
+    if (quant_indices[1] != 0xFF) {
+        decode_block(codebook[quant_indices[1]], big_block_dst + 2, 1);
+    }
+    if (quant_indices[2] != 0xFF) {
+        decode_block(codebook[quant_indices[2]], big_block_dst + SCREEN_WIDTH * 2, 2);
+    }
+    if (quant_indices[3] != 0xFF) {
+        decode_block(codebook[quant_indices[3]], big_block_dst + SCREEN_WIDTH * 2 + 2, 3);
+    }
 }
 
 // DMA拷贝码本的辅助函数

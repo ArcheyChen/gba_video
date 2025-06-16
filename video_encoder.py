@@ -428,10 +428,10 @@ def encode_p_frame_unified(current_blocks: np.ndarray, prev_blocks: np.ndarray,
     if total_blocks == 0:
         return b'', True, 0, 0, 0
     
-    # 使用Numba加速的块差异计算
+    # 使用Numba加速的2x2块差异计算
     current_flat = current_blocks.reshape(-1, BYTES_PER_BLOCK)
     prev_flat = prev_blocks.reshape(-1, BYTES_PER_BLOCK)
-    block_diffs = compute_block_differences_numba(current_flat, prev_flat, blocks_h, blocks_w)
+    block_diffs = compute_2x2_block_differences_numba(current_flat, prev_flat, blocks_h, blocks_w)
     
     big_blocks_h = blocks_h // 2
     big_blocks_w = blocks_w // 2
@@ -446,7 +446,7 @@ def encode_p_frame_unified(current_blocks: np.ndarray, prev_blocks: np.ndarray,
     
     for big_by in range(big_blocks_h):
         for big_bx in range(big_blocks_w):
-            needs_update = False
+            # 检查4x4大块内每个2x2子块是否需要更新
             positions = [
                 (big_by * 2, big_bx * 2),
                 (big_by * 2, big_bx * 2 + 1),
@@ -454,23 +454,32 @@ def encode_p_frame_unified(current_blocks: np.ndarray, prev_blocks: np.ndarray,
                 (big_by * 2 + 1, big_bx * 2 + 1)
             ]
             
+            # 检查每个2x2子块是否需要更新
+            subblock_needs_update = []
+            any_subblock_needs_update = False
+            
             for by, bx in positions:
                 if by < blocks_h and bx < blocks_w:
-                    if block_diffs[by, bx] > diff_threshold:
-                        needs_update = True
-                        break
+                    needs_update = block_diffs[by, bx] > diff_threshold
+                    subblock_needs_update.append(needs_update)
+                    if needs_update:
+                        any_subblock_needs_update = True
+                else:
+                    subblock_needs_update.append(False)
             
-            if needs_update:
+            if any_subblock_needs_update:
                 # 计算属于哪个区域
                 zone_idx = min(big_by // ZONE_HEIGHT_BIG_BLOCKS, zones_count - 1)
                 # 计算在区域内的相对坐标
                 zone_relative_by = big_by % ZONE_HEIGHT_BIG_BLOCKS
                 zone_relative_idx = zone_relative_by * big_blocks_w + big_bx
                 
-                total_updated_blocks += 4
+                # 统计实际更新的子块数
+                actual_updated_subblocks = sum(subblock_needs_update)
+                total_updated_blocks += actual_updated_subblocks
                 
                 if (big_by, big_bx) in block_types and block_types[(big_by, big_bx)][0] == 'color':
-                    # 色块更新
+                    # 色块更新：如果任何子块需要更新，就更新整个色块
                     blocks_4x4 = []
                     for by, bx in positions:
                         if by < blocks_h and bx < blocks_w:
@@ -484,15 +493,17 @@ def encode_p_frame_unified(current_blocks: np.ndarray, prev_blocks: np.ndarray,
                     color_idx = quantize_blocks_unified(avg_block.reshape(1, -1), unified_codebook)[0]
                     zone_color_updates[zone_idx].append((zone_relative_idx, color_idx))
                 else:
-                    # 纹理块更新
+                    # 纹理块更新：为每个2x2子块生成索引，不需要更新的用0xFF标记
                     indices = []
-                    for by, bx in positions:
-                        if by < blocks_h and bx < blocks_w:
+                    for i, (by, bx) in enumerate(positions):
+                        if by < blocks_h and bx < blocks_w and subblock_needs_update[i]:
+                            # 需要更新的子块：量化并获取索引
                             block = current_blocks[by, bx]
                             unified_idx = quantize_blocks_unified(block.reshape(1, -1), unified_codebook)[0]
                             indices.append(unified_idx)
                         else:
-                            indices.append(0)
+                            # 不需要更新的子块：使用跳过标记
+                            indices.append(COLOR_BLOCK_MARKER)  # 0xFF
                     zone_detail_updates[zone_idx].append((zone_relative_idx, indices))
     
     # 判断是否需要I帧
@@ -555,8 +566,6 @@ def encode_p_frame_unified(current_blocks: np.ndarray, prev_blocks: np.ndarray,
     
     return bytes(data), False, used_zones, total_color_updates, total_detail_updates
 
-# ...existing code...
-
 def compute_block_differences_numba(current_flat, prev_flat, blocks_h, blocks_w):
     """Numba加速的块差异计算"""
     block_diffs = np.zeros((blocks_h, blocks_w), dtype=np.float64)
@@ -576,6 +585,24 @@ def compute_block_differences_numba(current_flat, prev_flat, blocks_h, blocks_w)
     return block_diffs
 
 @njit
+def compute_2x2_block_differences_numba(current_flat, prev_flat, blocks_h, blocks_w):
+    """Numba加速的2x2块差异计算"""
+    block_diffs = np.zeros((blocks_h, blocks_w), dtype=np.float64)
+    
+    for i in range(blocks_h * blocks_w):
+        y_diff_sum = 0.0
+        for j in range(4):  # 只计算Y分量差异
+            current_val = int(current_flat[i, j])
+            prev_val = int(prev_flat[i, j])
+            if current_val >= prev_val:
+                diff = current_val - prev_val
+            else:
+                diff = prev_val - current_val
+            y_diff_sum += diff
+        block_diffs[i // blocks_w, i % blocks_w] = y_diff_sum / 4.0
+    
+    return block_diffs
+
 def identify_updated_blocks_numba(block_diffs, diff_threshold, blocks_h, blocks_w):
     """Numba加速的更新块识别"""
     big_blocks_h = blocks_h // 2
