@@ -1130,6 +1130,38 @@ def main():
         args.kmeans_max_iter, args.i_frame_weight, args.max_workers
     )
 
+    # 基于 GOP 内 P 帧纹理块使用频次，对每个码本项降序重排
+    import numpy as _np
+    for gop_start, gop_data in gop_codebooks.items():
+        codebook = gop_data['unified_codebook']
+        counts = _np.zeros(len(codebook), dtype=int)
+        # GOP 范围：起始帧下一个到下一个 I 帧
+        gop_end = min(gop_start + args.i_frame_interval, len(frames))
+        for fid in range(gop_start + 1, gop_end):
+            cur = frames[fid]
+            prev = frames[fid - 1]
+            # 识别更新的大块
+            updated = identify_updated_big_blocks(cur, prev, args.diff_threshold)
+            # 取出该帧的 block_types
+            bt_map = None
+            for fno, bt in gop_data['block_types_list']:
+                if fno == fid:
+                    bt_map = bt; break
+            # 累加每个纹理子块的索引使用次数
+            for by, bx in updated:
+                is_color = bt_map and bt_map.get((by, bx), ('detail',))[0] == 'color'
+                if not is_color:
+                    for sy in (0,1):
+                        for sx in (0,1):
+                            y, x = by*2+sy, bx*2+sx
+                            if y < cur.shape[0] and x < cur.shape[1]:
+                                b = cur[y, x]
+                                idx = quantize_blocks_unified(b.reshape(1, -1), codebook)[0]
+                                counts[idx] += 1
+        # 根据 counts 降序排序，stable 保持相同频次项原序
+        order = _np.argsort(-counts, kind='stable')
+        gop_data['unified_codebook'] = codebook[order]
+    
     # 编码所有帧
     print("正在编码帧...")
     encoded_frames = []
