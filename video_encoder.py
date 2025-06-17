@@ -683,12 +683,18 @@ def encode_p_frame_unified(current_blocks: np.ndarray, prev_blocks: np.ndarray,
                     full_indices = update_info['full_indices']
                     full_index_updates.append((zone_relative_idx, full_indices))
             
-            # 写入启用段bitmap
-            data.append(enabled_segments_bitmap)
-            
-            # 处理启用的小码表编码段
+            # 【关键修复】：计算实际有数据的段，动态生成bitmap
+            actual_enabled_segments_bitmap = 0
             for seg_idx in range(8):
-                if enabled_segments_bitmap & (1 << seg_idx):
+                if (enabled_segments_bitmap & (1 << seg_idx)) and len(small_codebook_updates[seg_idx]) > 0:
+                    actual_enabled_segments_bitmap |= (1 << seg_idx)
+            
+            # 写入实际启用段bitmap（只包含有数据的段）
+            data.append(actual_enabled_segments_bitmap)
+            
+            # 处理实际启用的小码表编码段
+            for seg_idx in range(8):
+                if actual_enabled_segments_bitmap & (1 << seg_idx):
                     seg_updates = small_codebook_updates[seg_idx]
                     data.append(len(seg_updates))
                     for zone_relative_idx, segment_indices, within_indices in seg_updates:
