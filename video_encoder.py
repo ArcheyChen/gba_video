@@ -4,12 +4,7 @@ import argparse, cv2, numpy as np, pathlib, textwrap
 import statistics
 from collections import defaultdict
 
-from core_encoder import (
-    WIDTH, HEIGHT, DEFAULT_UNIFIED_CODEBOOK_SIZE, EFFECTIVE_UNIFIED_CODEBOOK_SIZE,
-    BYTES_PER_BLOCK, DEFAULT_ENABLED_SEGMENTS_BITMAP, MINI_CODEBOOK_SIZE,
-    pack_yuv420_frame, classify_4x4_blocks_unified, encode_i_frame_unified,
-    encode_p_frame_unified, quantize_blocks_unified, identify_updated_big_blocks
-)
+from core_encoder import *
 from gop_processor import generate_gop_unified_codebooks
 from dither_opt import apply_dither_optimized
 
@@ -155,6 +150,8 @@ def main():
                    help="启用Floyd-Steinberg抖动算法提升画质")
     pa.add_argument("--enabled-segments-bitmap", type=int, default=DEFAULT_ENABLED_SEGMENTS_BITMAP,
                    help=f"启用段的bitmap，每位表示对应段是否启用小码表模式（默认0x{DEFAULT_ENABLED_SEGMENTS_BITMAP:02X}）")
+    pa.add_argument("--enabled-medium-segments-bitmap", type=int, default=DEFAULT_ENABLED_MEDIUM_SEGMENTS_BITMAP,
+                   help=f"启用中码表段的bitmap，每位表示对应段是否启用中码表模式（默认0x{DEFAULT_ENABLED_MEDIUM_SEGMENTS_BITMAP:02X}）")
     args = pa.parse_args()
 
     cap = cv2.VideoCapture(args.input)
@@ -297,7 +294,8 @@ def main():
             frame_data, is_i_frame, used_zones, color_updates, detail_updates = encode_p_frame_unified(
                 current_frame, prev_frame,
                 unified_codebook, block_types,
-                args.diff_threshold, args.force_i_threshold, args.enabled_segments_bitmap
+                args.diff_threshold, args.force_i_threshold, args.enabled_segments_bitmap,
+                args.enabled_medium_segments_bitmap
             )
             
             if is_i_frame:

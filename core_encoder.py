@@ -27,8 +27,11 @@ ZONE_HEIGHT_PIXELS = 16  # 每个区域的像素高度
 ZONE_HEIGHT_BIG_BLOCKS = ZONE_HEIGHT_PIXELS // (BLOCK_H * 2)  # 每个区域的4x4大块行数 (16像素 = 4行4x4大块)
 
 MINI_CODEBOOK_SIZE = 15  # 每个分段码本的大小
+MEDIUM_CODEBOOK_SIZE = 63  # 每个中等码本的大小
 DEFAULT_ENABLED_SEGMENTS_BITMAP = 0xFF  # 默认启用前8段的bitmap (11111111)
+DEFAULT_ENABLED_MEDIUM_SEGMENTS_BITMAP = 0x0F  # 默认启用前4个中码表段的bitmap (00001111)
 SKIP_MARKER_4BIT = 0xF   # 4bit跳过标记
+SKIP_MARKER_6BIT = 0x3F  # 6bit跳过标记（63）
 
 # 帧类型标识
 FRAME_TYPE_I = 0x00  # I帧（关键帧）
@@ -303,6 +306,27 @@ def quantize_blocks_unified_segmented(blocks_data: np.ndarray, codebook: np.ndar
     
     return segment_indices, within_segment_indices
 
+def quantize_blocks_unified_medium(blocks_data: np.ndarray, codebook: np.ndarray) -> tuple:
+    """使用中等码本对块进行量化，返回段索引和段内索引"""
+    if len(blocks_data) == 0:
+        return np.array([], dtype=np.uint8), np.array([], dtype=np.uint8)
+    
+    # 只使用前252项进行量化（4个中码表 × 63项）
+    max_medium_items = min(4 * MEDIUM_CODEBOOK_SIZE, EFFECTIVE_UNIFIED_CODEBOOK_SIZE)
+    effective_codebook = codebook[:max_medium_items]
+    
+    blocks_for_clustering = convert_blocks_for_clustering(blocks_data)
+    codebook_for_clustering = convert_blocks_for_clustering(effective_codebook)
+    
+    # 使用Numba加速的距离计算
+    indices = quantize_blocks_distance_numba(blocks_for_clustering, codebook_for_clustering)
+    
+    # 将索引转换为段索引和段内索引
+    segment_indices = indices // MEDIUM_CODEBOOK_SIZE
+    within_segment_indices = indices % MEDIUM_CODEBOOK_SIZE
+    
+    return segment_indices, within_segment_indices
+
 @njit
 def compute_2x2_block_differences_numba(current_flat, prev_flat, blocks_h, blocks_w):
     """Numba加速的2x2块差异计算"""
@@ -471,8 +495,9 @@ def encode_i_frame_unified(blocks: np.ndarray, unified_codebook: np.ndarray,
 def encode_p_frame_unified(current_blocks: np.ndarray, prev_blocks: np.ndarray,
                           unified_codebook: np.ndarray, block_types: dict,
                           diff_threshold: float, force_i_threshold: float = 0.7,
-                          enabled_segments_bitmap: int = DEFAULT_ENABLED_SEGMENTS_BITMAP) -> tuple:
-    """差分编码P帧（统一码本，混合分段编码）- 使用段启用bitmap"""
+                          enabled_segments_bitmap: int = DEFAULT_ENABLED_SEGMENTS_BITMAP,
+                          enabled_medium_segments_bitmap: int = DEFAULT_ENABLED_MEDIUM_SEGMENTS_BITMAP) -> tuple:
+    """差分编码P帧（统一码本，三级分段编码）- 小码表→中码表→大码表"""
     if prev_blocks is None or current_blocks.shape != prev_blocks.shape:
         i_frame_data = encode_i_frame_unified(current_blocks, unified_codebook, block_types)
         return i_frame_data, True, 0, 0, 0
@@ -562,58 +587,89 @@ def encode_p_frame_unified(current_blocks: np.ndarray, prev_blocks: np.ndarray,
                     color_idx = quantize_blocks_unified(avg_block.reshape(1, -1), unified_codebook)[0]
                     zone_color_updates[zone_idx].append((zone_relative_idx, color_idx))
                 else:
-                    # 纹理块更新：修复后的编码模式选择逻辑
-                    segment_indices = []
-                    within_indices = []
+                    # 纹理块更新：三级编码模式选择逻辑
+                    small_segment_indices = []
+                    small_within_indices = []
+                    medium_segment_indices = []
+                    medium_within_indices = []
                     full_indices = []
                     
-                    # 先计算所有子块的编码信息
+                    # 计算所有子块的编码信息
                     for i, (by, bx) in enumerate(positions):
                         if by < blocks_h and bx < blocks_w and subblock_needs_update[i]:
-                            # 需要更新的子块：量化并获取分段索引
                             block = current_blocks[by, bx]
-                            seg_idx, within_idx = quantize_blocks_unified_segmented(block.reshape(1, -1), unified_codebook)
-                            segment_indices.append(seg_idx[0])
-                            within_indices.append(within_idx[0])
-                            # 同时获取完整索引用于兜底
+                            # 小码表编码
+                            small_seg_idx, small_within_idx = quantize_blocks_unified_segmented(block.reshape(1, -1), unified_codebook)
+                            small_segment_indices.append(small_seg_idx[0])
+                            small_within_indices.append(small_within_idx[0])
+                            # 中码表编码
+                            medium_seg_idx, medium_within_idx = quantize_blocks_unified_medium(block.reshape(1, -1), unified_codebook)
+                            medium_segment_indices.append(medium_seg_idx[0])
+                            medium_within_indices.append(medium_within_idx[0])
+                            # 完整索引
                             full_idx = quantize_blocks_unified(block.reshape(1, -1), unified_codebook)[0]
                             full_indices.append(full_idx)
                         else:
                             # 不需要更新的子块：使用跳过标记
-                            segment_indices.append(0)  # 段索引任意
-                            within_indices.append(SKIP_MARKER_4BIT)  # 0xF
-                            full_indices.append(COLOR_BLOCK_MARKER)  # 0xFF用于完整索引跳过
+                            small_segment_indices.append(0)
+                            small_within_indices.append(SKIP_MARKER_4BIT)
+                            medium_segment_indices.append(0)
+                            medium_within_indices.append(SKIP_MARKER_6BIT)
+                            full_indices.append(COLOR_BLOCK_MARKER)
                     
-                    # 检查所有需要更新的子块是否都能用启用的小码表编码
+                    # 检查小码表编码可行性
                     can_use_small_codebook = True
-                    used_segments = set()
+                    small_used_segments = set()
                     has_updates = False
                     
-                    for i, (seg_idx, within_idx) in enumerate(zip(segment_indices, within_indices)):
-                        if within_idx != SKIP_MARKER_4BIT:  # 这是需要更新的子块
+                    for i, (seg_idx, within_idx) in enumerate(zip(small_segment_indices, small_within_indices)):
+                        if within_idx != SKIP_MARKER_4BIT:
                             has_updates = True
-                            # 检查段是否在启用的bitmap中，且在前8段范围内
                             if seg_idx >= 8 or not (enabled_segments_bitmap & (1 << seg_idx)):
                                 can_use_small_codebook = False
                                 break
-                            used_segments.add(seg_idx)
+                            small_used_segments.add(seg_idx)
                     
-                    # 进一步检查：避免段过于分散（可选的优化，避免一个4x4块跨太多段）
-                    if can_use_small_codebook and len(used_segments) > 2:
+                    if can_use_small_codebook and len(small_used_segments) > 2:
                         can_use_small_codebook = False
                     
-                    # 根据检查结果选择编码模式（关键：每个4x4块只选择一种模式）
-                    if can_use_small_codebook and has_updates and used_segments:
-                        # 所有需要更新的子块都能用小码表编码，使用小码表模式
+                    # 检查中码表编码可行性
+                    can_use_medium_codebook = False
+                    medium_used_segments = set()
+                    if not can_use_small_codebook and has_updates:
+                        can_use_medium_codebook = True
+                        for i, (seg_idx, within_idx) in enumerate(zip(medium_segment_indices, medium_within_indices)):
+                            if within_idx != SKIP_MARKER_6BIT:
+                                if seg_idx >= 4 or not (enabled_medium_segments_bitmap & (1 << seg_idx)):
+                                    can_use_medium_codebook = False
+                                    break
+                                medium_used_segments.add(seg_idx)
+                        
+                        # 中码表也要求在同一段内
+                        if can_use_medium_codebook and len(medium_used_segments) > 1:
+                            can_use_medium_codebook = False
+                    
+                    # 根据检查结果选择编码模式
+                    if can_use_small_codebook and has_updates and small_used_segments:
+                        # 使用小码表模式
                         zone_detail_updates[zone_idx].append({
                             'type': 'small',
                             'zone_relative_idx': zone_relative_idx,
-                            'segment_indices': segment_indices,
-                            'within_indices': within_indices,
-                            'used_segments': used_segments
+                            'segment_indices': small_segment_indices,
+                            'within_indices': small_within_indices,
+                            'used_segments': small_used_segments
+                        })
+                    elif can_use_medium_codebook and has_updates and medium_used_segments:
+                        # 使用中码表模式
+                        zone_detail_updates[zone_idx].append({
+                            'type': 'medium',
+                            'zone_relative_idx': zone_relative_idx,
+                            'segment_indices': medium_segment_indices,
+                            'within_indices': medium_within_indices,
+                            'used_segments': medium_used_segments
                         })
                     elif has_updates:
-                        # 至少有一个子块需要大码表，整个4x4块使用完整索引模式
+                        # 使用完整索引模式
                         zone_detail_updates[zone_idx].append({
                             'type': 'full',
                             'zone_relative_idx': zone_relative_idx,
@@ -655,18 +711,19 @@ def encode_p_frame_unified(current_blocks: np.ndarray, prev_blocks: np.ndarray,
     data.extend(struct.pack('<H', detail_zone_bitmap))
     data.extend(struct.pack('<H', color_zone_bitmap))
     
-    # 按区域编码纹理块更新（修复后的混合编码模式）
+    # 按区域编码纹理块更新（支持三级编码）
     for zone_idx in range(zones_count):
         if detail_zone_bitmap & (1 << zone_idx):
             detail_updates = zone_detail_updates[zone_idx]
             
-            # 分离小码表编码和完整索引编码
-            small_codebook_updates = [[] for _ in range(8)]  # 最多8段
+            # 分离三种编码模式
+            small_codebook_updates = [[] for _ in range(8)]
+            medium_codebook_updates = [[] for _ in range(4)]
             full_index_updates = []
             
             for update_info in detail_updates:
                 if update_info['type'] == 'small':
-                    # 小码表编码：按段分组
+                    # 小码表编码
                     zone_relative_idx = update_info['zone_relative_idx']
                     segment_indices = update_info['segment_indices']
                     within_indices = update_info['within_indices']
@@ -674,29 +731,44 @@ def encode_p_frame_unified(current_blocks: np.ndarray, prev_blocks: np.ndarray,
                     for seg_idx in update_info['used_segments']:
                         small_codebook_updates[seg_idx].append((zone_relative_idx, segment_indices, within_indices))
                         
+                elif update_info['type'] == 'medium':
+                    # 中码表编码
+                    zone_relative_idx = update_info['zone_relative_idx']
+                    segment_indices = update_info['segment_indices']
+                    within_indices = update_info['within_indices']
+                    
+                    for seg_idx in update_info['used_segments']:
+                        medium_codebook_updates[seg_idx].append((zone_relative_idx, segment_indices, within_indices))
+                        
                 elif update_info['type'] == 'full':
                     # 完整索引编码
                     zone_relative_idx = update_info['zone_relative_idx']
                     full_indices = update_info['full_indices']
                     full_index_updates.append((zone_relative_idx, full_indices))
             
-            # 计算实际有数据的段，动态生成bitmap
+            # 计算实际有数据的小码表段
             actual_enabled_segments_bitmap = 0
             for seg_idx in range(8):
                 if (enabled_segments_bitmap & (1 << seg_idx)) and len(small_codebook_updates[seg_idx]) > 0:
                     actual_enabled_segments_bitmap |= (1 << seg_idx)
             
-            # 写入实际启用段bitmap（只包含有数据的段）
+            # 计算实际有数据的中码表段
+            actual_enabled_medium_segments_bitmap = 0
+            for seg_idx in range(4):
+                if (enabled_medium_segments_bitmap & (1 << seg_idx)) and len(medium_codebook_updates[seg_idx]) > 0:
+                    actual_enabled_medium_segments_bitmap |= (1 << seg_idx)
+            
+            # 写入小码表启用bitmap
             data.append(actual_enabled_segments_bitmap)
             
-            # 处理实际启用的小码表编码段
+            # 处理小码表编码段
             for seg_idx in range(8):
                 if actual_enabled_segments_bitmap & (1 << seg_idx):
                     seg_updates = small_codebook_updates[seg_idx]
                     data.append(len(seg_updates))
                     for zone_relative_idx, segment_indices, within_indices in seg_updates:
                         data.append(zone_relative_idx)
-                        # 只编码属于当前段的索引
+                        # 编码4bit索引
                         filtered_within_indices = []
                         for seg_i, within_i in zip(segment_indices, within_indices):
                             if seg_i == seg_idx and within_i != SKIP_MARKER_4BIT:
@@ -708,6 +780,36 @@ def encode_p_frame_unified(current_blocks: np.ndarray, prev_blocks: np.ndarray,
                         packed_byte2 = (filtered_within_indices[2] & 0xF) | ((filtered_within_indices[3] & 0xF) << 4)
                         data.append(packed_byte1)
                         data.append(packed_byte2)
+            
+            # 写入中码表启用bitmap
+            data.append(actual_enabled_medium_segments_bitmap)
+            
+            # 处理中码表编码段
+            for seg_idx in range(4):
+                if actual_enabled_medium_segments_bitmap & (1 << seg_idx):
+                    seg_updates = medium_codebook_updates[seg_idx]
+                    data.append(len(seg_updates))
+                    for zone_relative_idx, segment_indices, within_indices in seg_updates:
+                        data.append(zone_relative_idx)
+                        # 编码6bit索引到24bit，用uint32避免溢出
+                        filtered_within_indices = []
+                        for seg_i, within_i in zip(segment_indices, within_indices):
+                            if seg_i == seg_idx and within_i != SKIP_MARKER_6BIT:
+                                filtered_within_indices.append(within_i)
+                            else:
+                                filtered_within_indices.append(SKIP_MARKER_6BIT)
+                        
+                        # 使用uint32打包4个6bit = 24bit
+                        packed_24bit = np.uint32(0)
+                        packed_24bit |= np.uint32(filtered_within_indices[0] & 0x3F)
+                        packed_24bit |= np.uint32(filtered_within_indices[1] & 0x3F) << 6
+                        packed_24bit |= np.uint32(filtered_within_indices[2] & 0x3F) << 12
+                        packed_24bit |= np.uint32(filtered_within_indices[3] & 0x3F) << 18
+                        
+                        # 拆成3个u8
+                        data.append(np.uint8(packed_24bit & 0xFF))
+                        data.append(np.uint8((packed_24bit >> 8) & 0xFF))
+                        data.append(np.uint8((packed_24bit >> 16) & 0xFF))
             
             # 处理完整索引编码
             data.append(len(full_index_updates))

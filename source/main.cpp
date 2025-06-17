@@ -17,7 +17,9 @@ constexpr int PIXELS_PER_FRAME = SCREEN_WIDTH * SCREEN_HEIGHT;
 #define ZONE_HEIGHT_PIXELS 16  // 每个区域的像素高度
 #define ZONE_HEIGHT_BIG_BLOCKS (ZONE_HEIGHT_PIXELS / (BLOCK_HEIGHT * 2))  // 每个区域的4x4大块行数
 #define MINI_CODEBOOK_SIZE 15  // 每个分段码本的大小
+#define MEDIUM_CODEBOOK_SIZE 63  // 每个中等码本的大小
 #define SKIP_MARKER_4BIT 0xF   // 4bit跳过标记
+#define SKIP_MARKER_6BIT 0x3F  // 6bit跳过标记
 
 // EWRAM 单缓冲
 EWRAM_BSS u16 ewramBuffer[PIXELS_PER_FRAME];
@@ -183,6 +185,34 @@ IWRAM_CODE void decode_segmented_block(const YUV_Struct* mini_codebook, u8 packe
     }
 }
 
+// 解码中等分段纹理块的辅助函数
+IWRAM_CODE void decode_medium_segmented_block(const YUV_Struct* medium_codebook, u8 packed_byte1, u8 packed_byte2, u8 packed_byte3, u16* big_block_dst)
+{
+    // 从3个u8重建24bit数据
+    u32 packed_24bit = packed_byte1 | (packed_byte2 << 8) | (packed_byte3 << 16);
+    
+    // 解包4个6bit索引
+    u8 indices[4];
+    indices[0] = packed_24bit & 0x3F;
+    indices[1] = (packed_24bit >> 6) & 0x3F;
+    indices[2] = (packed_24bit >> 12) & 0x3F;
+    indices[3] = (packed_24bit >> 18) & 0x3F;
+    
+    // 解码每个2x2子块，如果索引是0x3F则跳过
+    if (indices[0] != SKIP_MARKER_6BIT) {
+        decode_block(medium_codebook[indices[0]], big_block_dst, 0);
+    }
+    if (indices[1] != SKIP_MARKER_6BIT) {
+        decode_block(medium_codebook[indices[1]], big_block_dst + 2, 1);
+    }
+    if (indices[2] != SKIP_MARKER_6BIT) {
+        decode_block(medium_codebook[indices[2]], big_block_dst + SCREEN_WIDTH * 2, 2);
+    }
+    if (indices[3] != SKIP_MARKER_6BIT) {
+        decode_block(medium_codebook[indices[3]], big_block_dst + SCREEN_WIDTH * 2 + 2, 3);
+    }
+}
+
 // DMA拷贝码本的辅助函数
 IWRAM_CODE void copy_unified_codebook(u8* dst_raw, const u8* src, YUV_Struct** codebook_ptr, int codebook_size)
 {
@@ -267,7 +297,7 @@ IWRAM_CODE void decode_p_frame_unified(const u8* src, u16* dst)
     u16 color_zone_bitmap = src[2] | (src[3] << 8);
     src += 4; // 跳过两个bitmap的四个字节
     
-    // 处理纹理块更新（混合编码模式）
+    // 处理纹理块更新（三级混合编码模式）
     u8 zone_idx = 0;
     u16 temp_bitmap = detail_zone_bitmap;
     while (temp_bitmap) {
@@ -276,10 +306,10 @@ IWRAM_CODE void decode_p_frame_unified(const u8* src, u16* dst)
             u16 zone_base_offset = zone_idx * ZONE_HEIGHT_PIXELS * SCREEN_WIDTH;
             u16* zone_dst = dst + zone_base_offset;
             
-            // 读取启用段bitmap
+            // 读取小码表启用段bitmap
             u8 enabled_segments_bitmap = *src++;
             
-            // 处理启用的段（分段编码）
+            // 处理启用的小码表段
             for (u8 seg_idx = 0; seg_idx < 8; seg_idx++) {
                 if (enabled_segments_bitmap & (1 << seg_idx)) {
                     const YUV_Struct* mini_codebook = unified_codebook + (seg_idx * MINI_CODEBOOK_SIZE);
@@ -292,6 +322,27 @@ IWRAM_CODE void decode_p_frame_unified(const u8* src, u16* dst)
                         
                         u16* big_block_dst = zone_dst + zone_block_relative_offsets[zone_relative_idx];
                         decode_segmented_block(mini_codebook, packed_byte1, packed_byte2, big_block_dst);
+                    }
+                }
+            }
+            
+            // 读取中码表启用段bitmap
+            u8 enabled_medium_segments_bitmap = *src++;
+            
+            // 处理启用的中码表段
+            for (u8 seg_idx = 0; seg_idx < 4; seg_idx++) {
+                if (enabled_medium_segments_bitmap & (1 << seg_idx)) {
+                    const YUV_Struct* medium_codebook = unified_codebook + (seg_idx * MEDIUM_CODEBOOK_SIZE);
+                    u8 seg_blocks_to_update = *src++;
+                    
+                    for (u8 i = 0; i < seg_blocks_to_update; i++) {
+                        u8 zone_relative_idx = *src++;
+                        u8 packed_byte1 = *src++;
+                        u8 packed_byte2 = *src++;
+                        u8 packed_byte3 = *src++;
+                        
+                        u16* big_block_dst = zone_dst + zone_block_relative_offsets[zone_relative_idx];
+                        decode_medium_segmented_block(medium_codebook, packed_byte1, packed_byte2, packed_byte3, big_block_dst);
                     }
                 }
             }
