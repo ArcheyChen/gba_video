@@ -1,0 +1,730 @@
+#!/usr/bin/env python3
+
+import numpy as np
+import struct
+from sklearn.cluster import MiniBatchKMeans
+from numba import jit, njit, types
+from numba.typed import List
+
+from dither_opt import apply_dither_optimized
+
+# 常量定义
+WIDTH, HEIGHT = 240, 160
+DEFAULT_UNIFIED_CODEBOOK_SIZE = 256   # 统一码本大小
+EFFECTIVE_UNIFIED_CODEBOOK_SIZE = 254  # 有效码本大小（0xFF保留）
+
+# 标记常量
+COLOR_BLOCK_MARKER = 0xFF
+
+Y_COEFF  = np.array([0.28571429,  0.57142857,  0.14285714])
+CB_COEFF = np.array([-0.14285714, -0.28571429,  0.42857143])
+CR_COEFF = np.array([ 0.35714286, -0.28571429, -0.07142857])
+BLOCK_W, BLOCK_H = 2, 2
+BYTES_PER_BLOCK  = 7  # 4Y + d_r + d_g + d_b
+
+# 新增常量
+ZONE_HEIGHT_PIXELS = 16  # 每个区域的像素高度
+ZONE_HEIGHT_BIG_BLOCKS = ZONE_HEIGHT_PIXELS // (BLOCK_H * 2)  # 每个区域的4x4大块行数 (16像素 = 4行4x4大块)
+
+MINI_CODEBOOK_SIZE = 15  # 每个分段码本的大小
+DEFAULT_ENABLED_SEGMENTS_BITMAP = 0xFF  # 默认启用前8段的bitmap (11111111)
+SKIP_MARKER_4BIT = 0xF   # 4bit跳过标记
+
+# 帧类型标识
+FRAME_TYPE_I = 0x00  # I帧（关键帧）
+FRAME_TYPE_P = 0x01  # P帧（差分帧）
+
+@njit
+def clip_value(value, min_val, max_val):
+    """Numba兼容的clip函数"""
+    if value < min_val:
+        return min_val
+    elif value > max_val:
+        return max_val
+    else:
+        return value
+
+@njit
+def pack_yuv420_frame_numba(bgr_frame):
+    """Numba加速的整帧YUV420转换"""
+    blocks_h = HEIGHT // BLOCK_H
+    blocks_w = WIDTH // BLOCK_W
+    
+    block_array = np.zeros((blocks_h, blocks_w, BYTES_PER_BLOCK), dtype=np.uint8)
+    
+    for by in range(blocks_h):
+        for bx in range(blocks_w):
+            # 提取2x2块
+            y_start = by * BLOCK_H
+            x_start = bx * BLOCK_W
+            
+            # BGR to YUV conversion for 2x2 block
+            cb_sum = 0.0
+            cr_sum = 0.0
+            y_values = np.zeros(4, dtype=np.uint8)
+            
+            idx = 0
+            for dy in range(BLOCK_H):
+                for dx in range(BLOCK_W):
+                    if y_start + dy < HEIGHT and x_start + dx < WIDTH:
+                        b = float(bgr_frame[y_start + dy, x_start + dx, 0])
+                        g = float(bgr_frame[y_start + dy, x_start + dx, 1])  
+                        r = float(bgr_frame[y_start + dy, x_start + dx, 2])
+                        
+                        y = r * 0.28571429 + g * 0.57142857 + b * 0.14285714
+                        cb = r * (-0.14285714) + g * (-0.28571429) + b * 0.42857143
+                        cr = r * 0.35714286 + g * (-0.28571429) + b * (-0.07142857)
+                        
+                        y_values[idx] = np.uint8(clip_value(y / 2.0, 0.0, 255.0))
+                        cb_sum += cb
+                        cr_sum += cr
+                        idx += 1
+            
+            # Store Y values
+            block_array[by, bx, 0:4] = y_values
+            
+            # Compute and store chroma
+            cb_mean = cb_sum / 4.0
+            cr_mean = cr_sum / 4.0
+            
+            d_r = clip_value(cr_mean, -128.0, 127.0)
+            d_g = clip_value((-(cb_mean/2.0) - cr_mean) / 2.0, -128.0, 127.0)  
+            d_b = clip_value(cb_mean, -128.0, 127.0)
+            
+            # 将有符号值转换为无符号字节存储
+            block_array[by, bx, 4] = np.uint8(np.int8(d_r).view(np.uint8))
+            block_array[by, bx, 5] = np.uint8(np.int8(d_g).view(np.uint8))
+            block_array[by, bx, 6] = np.uint8(np.int8(d_b).view(np.uint8))
+    
+    return block_array
+
+def pack_yuv420_frame(frame_bgr: np.ndarray) -> np.ndarray:
+    """使用Numba加速的整帧YUV转换包装函数"""
+    return pack_yuv420_frame_numba(frame_bgr)
+
+@njit
+def calculate_block_variance_numba(y_values):
+    """Numba加速的方差计算"""
+    mean_val = np.mean(y_values)
+    variance = 0.0
+    for val in y_values:
+        diff = val - mean_val
+        variance += diff * diff
+    return variance / len(y_values)
+
+def calculate_2x2_block_variance(block: np.ndarray) -> float:
+    """计算单个2x2块的方差，用于判断是否为纯色"""
+    y_values = block[:4].astype(np.float64)
+    return calculate_block_variance_numba(y_values)
+
+def classify_4x4_blocks_unified(blocks: np.ndarray, variance_threshold: float = 5.0) -> tuple:
+    """将4x4块分类为大色块和纹理块，用于统一码本"""
+    blocks_h, blocks_w = blocks.shape[:2]
+    big_blocks_h = blocks_h // 2
+    big_blocks_w = blocks_w // 2
+    
+    all_blocks = []  # 所有2x2块
+    block_types = {}   # 记录每个4x4块的类型和对应的2x2块索引
+    
+    for big_by in range(big_blocks_h):
+        for big_bx in range(big_blocks_w):
+            # 收集4x4大块内的4个2x2小块
+            blocks_4x4 = []
+            for sub_by in range(2):
+                for sub_bx in range(2):
+                    by = big_by * 2 + sub_by
+                    bx = big_bx * 2 + sub_bx
+                    if by < blocks_h and bx < blocks_w:
+                        blocks_4x4.append(blocks[by, bx])
+                    else:
+                        blocks_4x4.append(np.zeros(BYTES_PER_BLOCK, dtype=np.uint8))
+            
+            # 检查每个2x2子块是否内部一致（而非整个4x4块）
+            all_2x2_blocks_are_uniform = True
+            for block in blocks_4x4:
+                if calculate_2x2_block_variance(block) > variance_threshold:
+                    all_2x2_blocks_are_uniform = False
+                    break
+            
+            if all_2x2_blocks_are_uniform:
+                # 大色块：每个2x2子块内部都一致，用下采样的2x2块表示
+                downsampled_block = np.zeros(BYTES_PER_BLOCK, dtype=np.uint8)
+                
+                y_values = []
+                d_r_values = []
+                d_g_values = []
+                d_b_values = []
+                
+                for block in blocks_4x4:
+                    # 每个2x2块内部一致，取其内部平均值
+                    avg_y = np.mean(block[:4])
+                    y_values.append(int(avg_y))
+                    d_r_values.append(block[4].view(np.int8))
+                    d_g_values.append(block[5].view(np.int8))
+                    d_b_values.append(block[6].view(np.int8))
+                
+                # 用4个2x2子块的平均值构成下采样块
+                downsampled_block[:4] = np.array(y_values, dtype=np.uint8)
+                downsampled_block[4] = np.clip(np.mean(d_r_values), -128, 127).astype(np.int8).view(np.uint8)
+                downsampled_block[5] = np.clip(np.mean(d_g_values), -128, 127).astype(np.int8).view(np.uint8)
+                downsampled_block[6] = np.clip(np.mean(d_b_values), -128, 127).astype(np.int8).view(np.uint8)
+                
+                block_idx = len(all_blocks)
+                all_blocks.append(downsampled_block)
+                block_types[(big_by, big_bx)] = ('color', [block_idx])
+            else:
+                # 纹理块：至少有一个2x2子块内部不一致，保留所有4个2x2块
+                block_indices = []
+                for block in blocks_4x4:
+                    block_idx = len(all_blocks)
+                    all_blocks.append(block)
+                    block_indices.append(block_idx)
+                block_types[(big_by, big_bx)] = ('detail', block_indices)
+    
+    return all_blocks, block_types
+
+def generate_codebook(blocks_data: np.ndarray, codebook_size: int, max_iter: int = 100) -> tuple:
+    """使用K-Means聚类生成码表"""
+    if len(blocks_data) == 0:
+        return np.zeros((codebook_size, BYTES_PER_BLOCK), dtype=np.uint8), 0
+    
+    if blocks_data.ndim > 2:
+        blocks_data = blocks_data.reshape(-1, BYTES_PER_BLOCK)
+    
+    # 移除去重操作，直接使用原始数据进行聚类
+    # 这样K-Means可以基于数据的真实分布（包括频次）进行更好的聚类
+    effective_size = min(len(blocks_data), codebook_size)
+    
+    if len(blocks_data) <= codebook_size:
+        # 如果数据量小于码本大小，需要去重避免重复
+        blocks_as_tuples = [tuple(block) for block in blocks_data]
+        unique_tuples = list(set(blocks_as_tuples))
+        unique_blocks = np.array(unique_tuples, dtype=np.uint8)
+        
+        codebook = np.zeros((codebook_size, BYTES_PER_BLOCK), dtype=np.uint8)
+        codebook[:len(unique_blocks)] = unique_blocks
+        if len(unique_blocks) > 0:
+            for i in range(len(unique_blocks), codebook_size):
+                codebook[i] = unique_blocks[-1]
+        return codebook, len(unique_blocks)
+    
+    # 对于大数据集，直接进行K-Means聚类
+    kmeans = MiniBatchKMeans(
+        n_clusters=codebook_size,
+        random_state=42,
+        batch_size=min(1000, len(blocks_data)),
+        max_iter=max_iter,
+        n_init=3
+    )
+    blocks_for_clustering = convert_blocks_for_clustering(blocks_data)
+    kmeans.fit(blocks_for_clustering)
+    codebook = convert_codebook_from_clustering(kmeans.cluster_centers_)
+    
+    return codebook, codebook_size
+
+def generate_unified_codebook(all_blocks: list, codebook_size: int = DEFAULT_UNIFIED_CODEBOOK_SIZE,
+                             kmeans_max_iter: int = 100) -> np.ndarray:
+    """生成统一码本（保留0xFF作为特殊标记）"""
+    if all_blocks:
+        blocks_array = np.array(all_blocks)
+        # 只使用255项有效码本，保留0xFF
+        effective_size = min(codebook_size - 1, EFFECTIVE_UNIFIED_CODEBOOK_SIZE)
+        codebook, _ = generate_codebook(blocks_array, effective_size, kmeans_max_iter)
+        
+        # 创建完整的256项码本
+        full_codebook = np.zeros((codebook_size, BYTES_PER_BLOCK), dtype=np.uint8)
+        full_codebook[:effective_size] = codebook[:effective_size]
+        # 第255项（索引255/0xFF）复制最后一个有效项作为占位
+        if effective_size > 0:
+            full_codebook[255] = full_codebook[effective_size - 1]
+    else:
+        full_codebook = np.zeros((codebook_size, BYTES_PER_BLOCK), dtype=np.uint8)
+    
+    return full_codebook
+
+@njit
+def quantize_blocks_distance_numba(blocks_for_clustering, codebook_for_clustering):
+    """Numba加速的块量化距离计算"""
+    n_blocks = blocks_for_clustering.shape[0]
+    n_codebook = codebook_for_clustering.shape[0]
+    indices = np.zeros(n_blocks, dtype=np.uint8)
+    
+    for i in range(n_blocks):
+        min_dist = np.inf
+        best_idx = 0
+        
+        for j in range(n_codebook):
+            dist = 0.0
+            for k in range(BYTES_PER_BLOCK):
+                diff = blocks_for_clustering[i, k] - codebook_for_clustering[j, k]
+                dist += diff * diff
+            
+            if dist < min_dist:
+                min_dist = dist
+                best_idx = j
+        
+        indices[i] = best_idx
+    
+    return indices
+
+def quantize_blocks_unified(blocks_data: np.ndarray, codebook: np.ndarray) -> np.ndarray:
+    """使用统一码表对块进行量化（避免产生0xFF）"""
+    if len(blocks_data) == 0:
+        return np.array([], dtype=np.uint8)
+    
+    # 只使用前255项进行量化
+    effective_codebook = codebook[:EFFECTIVE_UNIFIED_CODEBOOK_SIZE]
+    
+    blocks_for_clustering = convert_blocks_for_clustering(blocks_data)
+    codebook_for_clustering = convert_blocks_for_clustering(effective_codebook)
+    
+    # 使用Numba加速的距离计算
+    indices = quantize_blocks_distance_numba(blocks_for_clustering, codebook_for_clustering)
+    
+    return indices
+
+def quantize_blocks_unified_segmented(blocks_data: np.ndarray, codebook: np.ndarray) -> tuple:
+    """使用分段码本对块进行量化，返回段索引和段内索引"""
+    if len(blocks_data) == 0:
+        return np.array([], dtype=np.uint8), np.array([], dtype=np.uint8)
+    
+    # 只使用前255项进行量化
+    effective_codebook = codebook[:EFFECTIVE_UNIFIED_CODEBOOK_SIZE]
+    
+    blocks_for_clustering = convert_blocks_for_clustering(blocks_data)
+    codebook_for_clustering = convert_blocks_for_clustering(effective_codebook)
+    
+    # 使用Numba加速的距离计算
+    indices = quantize_blocks_distance_numba(blocks_for_clustering, codebook_for_clustering)
+    
+    # 将索引转换为段索引和段内索引
+    segment_indices = indices // MINI_CODEBOOK_SIZE
+    within_segment_indices = indices % MINI_CODEBOOK_SIZE
+    
+    return segment_indices, within_segment_indices
+
+@njit
+def compute_2x2_block_differences_numba(current_flat, prev_flat, blocks_h, blocks_w):
+    """Numba加速的2x2块差异计算"""
+    block_diffs = np.zeros((blocks_h, blocks_w), dtype=np.float64)
+    
+    for i in range(blocks_h * blocks_w):
+        y_diff_sum = 0.0
+        for j in range(4):  # 只计算Y分量差异
+            current_val = int(current_flat[i, j])
+            prev_val = int(prev_flat[i, j])
+            if current_val >= prev_val:
+                diff = current_val - prev_val
+            else:
+                diff = prev_val - current_val
+            y_diff_sum += diff
+        block_diffs[i // blocks_w, i % blocks_w] = y_diff_sum / 4.0
+    
+    return block_diffs
+
+@njit
+def identify_updated_blocks_numba(block_diffs, diff_threshold, blocks_h, blocks_w):
+    """Numba加速的更新块识别"""
+    big_blocks_h = blocks_h // 2
+    big_blocks_w = blocks_w // 2
+    updated_positions = []
+    
+    for big_by in range(big_blocks_h):
+        for big_bx in range(big_blocks_w):
+            needs_update = False
+            
+            # 检查4个2x2子块的位置
+            for sub_by in range(2):
+                for sub_bx in range(2):
+                    by = big_by * 2 + sub_by
+                    bx = big_bx * 2 + sub_bx
+                    
+                    if by < blocks_h and bx < blocks_w:
+                        if block_diffs[by, bx] > diff_threshold:
+                            needs_update = True
+                            break
+                if needs_update:
+                    break
+            
+            if needs_update:
+                updated_positions.append((big_by, big_bx))
+    
+    return updated_positions
+
+def identify_updated_big_blocks(current_blocks: np.ndarray, prev_blocks: np.ndarray,
+                               diff_threshold: float) -> set:
+    """识别需要更新的4x4大块位置 - Numba加速版本"""
+    if prev_blocks is None or current_blocks.shape != prev_blocks.shape:
+        # 如果没有前一帧，所有大块都需要更新
+        blocks_h, blocks_w = current_blocks.shape[:2]
+        big_blocks_h = blocks_h // 2
+        big_blocks_w = blocks_w // 2
+        return {(big_by, big_bx) for big_by in range(big_blocks_h) for big_bx in range(big_blocks_w)}
+    
+    blocks_h, blocks_w = current_blocks.shape[:2]
+    
+    # 使用Numba加速的块差异计算
+    current_flat = current_blocks.reshape(-1, BYTES_PER_BLOCK)
+    prev_flat = prev_blocks.reshape(-1, BYTES_PER_BLOCK)
+    block_diffs = compute_2x2_block_differences_numba(current_flat, prev_flat, blocks_h, blocks_w)
+    
+    # 使用Numba加速的更新块识别
+    updated_list = identify_updated_blocks_numba(block_diffs, diff_threshold, blocks_h, blocks_w)
+    
+    return set(updated_list)
+
+def convert_blocks_for_clustering(blocks_data: np.ndarray) -> np.ndarray:
+    """将块数据转换为正确的聚类格式"""
+    if len(blocks_data) == 0:
+        return blocks_data.astype(np.float32)
+    
+    if blocks_data.ndim > 2:
+        blocks_data = blocks_data.reshape(-1, BYTES_PER_BLOCK)
+    
+    blocks_float = blocks_data.astype(np.float32)
+    
+    for i in range(4, BYTES_PER_BLOCK):
+        blocks_float[:, i] = blocks_data[:, i].view(np.int8).astype(np.float32)
+    
+    return blocks_float
+
+def convert_codebook_from_clustering(codebook_float: np.ndarray) -> np.ndarray:
+    """将聚类结果转换回正确的块格式"""
+    codebook = np.zeros_like(codebook_float, dtype=np.uint8)
+    
+    codebook[:, 0:4] = np.clip(codebook_float[:, 0:4].round(), 0, 255).astype(np.uint8)
+    
+    for i in range(4, BYTES_PER_BLOCK):
+        clipped_values = np.clip(codebook_float[:, i].round(), -128, 127).astype(np.int8)
+        codebook[:, i] = clipped_values.view(np.uint8)
+    
+    return codebook
+
+def encode_i_frame_unified(blocks: np.ndarray, unified_codebook: np.ndarray, 
+                          block_types: dict) -> bytes:
+    """编码I帧（统一码本）"""
+    data = bytearray()
+    data.append(FRAME_TYPE_I)
+    
+    if blocks.size > 0:
+        blocks_h, blocks_w = blocks.shape[:2]
+        big_blocks_h = blocks_h // 2
+        big_blocks_w = blocks_w // 2
+        
+        # 存储统一码本
+        data.extend(unified_codebook.flatten().tobytes())
+        
+        # 按4x4大块的顺序编码
+        for big_by in range(big_blocks_h):
+            for big_bx in range(big_blocks_w):
+                # 处理block_types为None的情况
+                if block_types is None or (big_by, big_bx) not in block_types:
+                    # 默认为纹理块处理
+                    for sub_by in range(2):
+                        for sub_bx in range(2):
+                            by = big_by * 2 + sub_by
+                            bx = big_bx * 2 + sub_bx
+                            if by < blocks_h and bx < blocks_w:
+                                block = blocks[by, bx]
+                                unified_idx = quantize_blocks_unified(block.reshape(1, -1), unified_codebook)[0]
+                                data.append(unified_idx)
+                            else:
+                                data.append(0)
+                else:
+                    block_type, block_indices = block_types[(big_by, big_bx)]
+                    
+                    if block_type == 'color':
+                        # 色块：标记0xFF + 1个码本索引
+                        data.append(COLOR_BLOCK_MARKER)
+                        
+                        # 从原始blocks重建平均块
+                        blocks_4x4 = []
+                        for sub_by in range(2):
+                            for sub_bx in range(2):
+                                by = big_by * 2 + sub_by
+                                bx = big_bx * 2 + sub_bx
+                                if by < blocks_h and bx < blocks_w:
+                                    blocks_4x4.append(blocks[by, bx])
+                        
+                        avg_block = np.mean(blocks_4x4, axis=0).round().astype(np.uint8)
+                        for i in range(4, 7):
+                            avg_val = np.mean([b[i].view(np.int8) for b in blocks_4x4])
+                            avg_block[i] = np.clip(avg_val, -128, 127).astype(np.int8).view(np.uint8)
+                        
+                        unified_idx = quantize_blocks_unified(avg_block.reshape(1, -1), unified_codebook)[0]
+                        data.append(unified_idx)
+                    else:
+                        # 纹理块：4个码本索引
+                        for sub_by in range(2):
+                            for sub_bx in range(2):
+                                by = big_by * 2 + sub_by
+                                bx = big_bx * 2 + sub_bx
+                                if by < blocks_h and bx < blocks_w:
+                                    block = blocks[by, bx]
+                                    unified_idx = quantize_blocks_unified(block.reshape(1, -1), unified_codebook)[0]
+                                    data.append(unified_idx)
+                                else:
+                                    data.append(0)
+    
+    return bytes(data)
+
+def encode_p_frame_unified(current_blocks: np.ndarray, prev_blocks: np.ndarray,
+                          unified_codebook: np.ndarray, block_types: dict,
+                          diff_threshold: float, force_i_threshold: float = 0.7,
+                          enabled_segments_bitmap: int = DEFAULT_ENABLED_SEGMENTS_BITMAP) -> tuple:
+    """差分编码P帧（统一码本，混合分段编码）- 使用段启用bitmap"""
+    if prev_blocks is None or current_blocks.shape != prev_blocks.shape:
+        i_frame_data = encode_i_frame_unified(current_blocks, unified_codebook, block_types)
+        return i_frame_data, True, 0, 0, 0
+    
+    blocks_h, blocks_w = current_blocks.shape[:2]
+    total_blocks = blocks_h * blocks_w
+    
+    if total_blocks == 0:
+        return b'', True, 0, 0, 0
+    
+    # 使用Numba加速的2x2块差异计算
+    current_flat = current_blocks.reshape(-1, BYTES_PER_BLOCK)
+    prev_flat = prev_blocks.reshape(-1, BYTES_PER_BLOCK)
+    block_diffs = compute_2x2_block_differences_numba(current_flat, prev_flat, blocks_h, blocks_w)
+    
+    big_blocks_h = blocks_h // 2
+    big_blocks_w = blocks_w // 2
+    
+    # 计算区域数量
+    zones_count = (big_blocks_h + ZONE_HEIGHT_BIG_BLOCKS - 1) // ZONE_HEIGHT_BIG_BLOCKS
+    
+    # 获取启用的段索引列表
+    enabled_segments = []
+    for seg_idx in range(8):  # 最多8段
+        if enabled_segments_bitmap & (1 << seg_idx):
+            enabled_segments.append(seg_idx)
+    
+    # 计算最大启用段索引
+    max_enabled_segment = max(enabled_segments) if enabled_segments else -1
+    
+    # 按区域组织更新
+    zone_detail_updates = [[] for _ in range(zones_count)]
+    zone_color_updates = [[] for _ in range(zones_count)]
+    total_updated_blocks = 0
+    
+    for big_by in range(big_blocks_h):
+        for big_bx in range(big_blocks_w):
+            # 检查4x4大块内每个2x2子块是否需要更新
+            positions = [
+                (big_by * 2, big_bx * 2),
+                (big_by * 2, big_bx * 2 + 1),
+                (big_by * 2 + 1, big_bx * 2),
+                (big_by * 2 + 1, big_bx * 2 + 1)
+            ]
+            
+            # 检查每个2x2子块是否需要更新
+            subblock_needs_update = []
+            any_subblock_needs_update = False
+            
+            for by, bx in positions:
+                if by < blocks_h and bx < blocks_w:
+                    needs_update = block_diffs[by, bx] > diff_threshold
+                    subblock_needs_update.append(needs_update)
+                    if needs_update:
+                        any_subblock_needs_update = True
+                else:
+                    subblock_needs_update.append(False)
+            
+            if any_subblock_needs_update:
+                # 计算属于哪个区域
+                zone_idx = min(big_by // ZONE_HEIGHT_BIG_BLOCKS, zones_count - 1)
+                # 计算在区域内的相对坐标
+                zone_relative_by = big_by % ZONE_HEIGHT_BIG_BLOCKS
+                zone_relative_idx = zone_relative_by * big_blocks_w + big_bx
+                
+                # 统计实际更新的子块数
+                actual_updated_subblocks = sum(subblock_needs_update)
+                total_updated_blocks += actual_updated_subblocks
+                
+                # 检查block_types是否为None或不包含当前块
+                is_color_block = (block_types is not None and 
+                                (big_by, big_bx) in block_types and 
+                                block_types[(big_by, big_bx)][0] == 'color')
+                
+                if is_color_block:
+                    # 色块更新：如果任何子块需要更新，就更新整个色块
+                    blocks_4x4 = []
+                    for by, bx in positions:
+                        if by < blocks_h and bx < blocks_w:
+                            blocks_4x4.append(current_blocks[by, bx])
+                    
+                    avg_block = np.mean(blocks_4x4, axis=0).round().astype(np.uint8)
+                    for i in range(4, 7):
+                        avg_val = np.mean([b[i].view(np.int8) for b in blocks_4x4])
+                        avg_block[i] = np.clip(avg_val, -128, 127).astype(np.int8).view(np.uint8)
+                    
+                    color_idx = quantize_blocks_unified(avg_block.reshape(1, -1), unified_codebook)[0]
+                    zone_color_updates[zone_idx].append((zone_relative_idx, color_idx))
+                else:
+                    # 纹理块更新：修复后的编码模式选择逻辑
+                    segment_indices = []
+                    within_indices = []
+                    full_indices = []
+                    
+                    # 先计算所有子块的编码信息
+                    for i, (by, bx) in enumerate(positions):
+                        if by < blocks_h and bx < blocks_w and subblock_needs_update[i]:
+                            # 需要更新的子块：量化并获取分段索引
+                            block = current_blocks[by, bx]
+                            seg_idx, within_idx = quantize_blocks_unified_segmented(block.reshape(1, -1), unified_codebook)
+                            segment_indices.append(seg_idx[0])
+                            within_indices.append(within_idx[0])
+                            # 同时获取完整索引用于兜底
+                            full_idx = quantize_blocks_unified(block.reshape(1, -1), unified_codebook)[0]
+                            full_indices.append(full_idx)
+                        else:
+                            # 不需要更新的子块：使用跳过标记
+                            segment_indices.append(0)  # 段索引任意
+                            within_indices.append(SKIP_MARKER_4BIT)  # 0xF
+                            full_indices.append(COLOR_BLOCK_MARKER)  # 0xFF用于完整索引跳过
+                    
+                    # 检查所有需要更新的子块是否都能用启用的小码表编码
+                    can_use_small_codebook = True
+                    used_segments = set()
+                    has_updates = False
+                    
+                    for i, (seg_idx, within_idx) in enumerate(zip(segment_indices, within_indices)):
+                        if within_idx != SKIP_MARKER_4BIT:  # 这是需要更新的子块
+                            has_updates = True
+                            # 检查段是否在启用的bitmap中，且在前8段范围内
+                            if seg_idx >= 8 or not (enabled_segments_bitmap & (1 << seg_idx)):
+                                can_use_small_codebook = False
+                                break
+                            used_segments.add(seg_idx)
+                    
+                    # 进一步检查：避免段过于分散（可选的优化，避免一个4x4块跨太多段）
+                    if can_use_small_codebook and len(used_segments) > 2:
+                        can_use_small_codebook = False
+                    
+                    # 根据检查结果选择编码模式（关键：每个4x4块只选择一种模式）
+                    if can_use_small_codebook and has_updates and used_segments:
+                        # 所有需要更新的子块都能用小码表编码，使用小码表模式
+                        zone_detail_updates[zone_idx].append({
+                            'type': 'small',
+                            'zone_relative_idx': zone_relative_idx,
+                            'segment_indices': segment_indices,
+                            'within_indices': within_indices,
+                            'used_segments': used_segments
+                        })
+                    elif has_updates:
+                        # 至少有一个子块需要大码表，整个4x4块使用完整索引模式
+                        zone_detail_updates[zone_idx].append({
+                            'type': 'full',
+                            'zone_relative_idx': zone_relative_idx,
+                            'full_indices': full_indices
+                        })
+    
+    # 判断是否需要I帧
+    update_ratio = total_updated_blocks / total_blocks
+    if update_ratio > force_i_threshold:
+        i_frame_data = encode_i_frame_unified(current_blocks, unified_codebook, block_types)
+        return i_frame_data, True, 0, 0, 0
+    
+    # 编码P帧
+    data = bytearray()
+    data.append(FRAME_TYPE_P)
+    
+    # 统计使用的区域数量
+    used_zones = 0
+    total_color_updates = 0
+    total_detail_updates = 0
+    
+    # 生成两个区域bitmap
+    detail_zone_bitmap = 0
+    color_zone_bitmap = 0
+    
+    for zone_idx in range(zones_count):
+        if zone_detail_updates[zone_idx]:
+            detail_zone_bitmap |= (1 << zone_idx)
+            total_detail_updates += len(zone_detail_updates[zone_idx])
+        if zone_color_updates[zone_idx]:
+            color_zone_bitmap |= (1 << zone_idx)
+            total_color_updates += len(zone_color_updates[zone_idx])
+    
+    # 计算实际使用的区域数（两个bitmap的并集）
+    combined_bitmap = detail_zone_bitmap | color_zone_bitmap
+    used_zones = bin(combined_bitmap).count('1')
+    
+    # 写入两个u16 bitmap
+    data.extend(struct.pack('<H', detail_zone_bitmap))
+    data.extend(struct.pack('<H', color_zone_bitmap))
+    
+    # 按区域编码纹理块更新（修复后的混合编码模式）
+    for zone_idx in range(zones_count):
+        if detail_zone_bitmap & (1 << zone_idx):
+            detail_updates = zone_detail_updates[zone_idx]
+            
+            # 分离小码表编码和完整索引编码
+            small_codebook_updates = [[] for _ in range(8)]  # 最多8段
+            full_index_updates = []
+            
+            for update_info in detail_updates:
+                if update_info['type'] == 'small':
+                    # 小码表编码：按段分组
+                    zone_relative_idx = update_info['zone_relative_idx']
+                    segment_indices = update_info['segment_indices']
+                    within_indices = update_info['within_indices']
+                    
+                    for seg_idx in update_info['used_segments']:
+                        small_codebook_updates[seg_idx].append((zone_relative_idx, segment_indices, within_indices))
+                        
+                elif update_info['type'] == 'full':
+                    # 完整索引编码
+                    zone_relative_idx = update_info['zone_relative_idx']
+                    full_indices = update_info['full_indices']
+                    full_index_updates.append((zone_relative_idx, full_indices))
+            
+            # 计算实际有数据的段，动态生成bitmap
+            actual_enabled_segments_bitmap = 0
+            for seg_idx in range(8):
+                if (enabled_segments_bitmap & (1 << seg_idx)) and len(small_codebook_updates[seg_idx]) > 0:
+                    actual_enabled_segments_bitmap |= (1 << seg_idx)
+            
+            # 写入实际启用段bitmap（只包含有数据的段）
+            data.append(actual_enabled_segments_bitmap)
+            
+            # 处理实际启用的小码表编码段
+            for seg_idx in range(8):
+                if actual_enabled_segments_bitmap & (1 << seg_idx):
+                    seg_updates = small_codebook_updates[seg_idx]
+                    data.append(len(seg_updates))
+                    for zone_relative_idx, segment_indices, within_indices in seg_updates:
+                        data.append(zone_relative_idx)
+                        # 只编码属于当前段的索引
+                        filtered_within_indices = []
+                        for seg_i, within_i in zip(segment_indices, within_indices):
+                            if seg_i == seg_idx and within_i != SKIP_MARKER_4BIT:
+                                filtered_within_indices.append(within_i)
+                            else:
+                                filtered_within_indices.append(SKIP_MARKER_4BIT)
+                        
+                        packed_byte1 = (filtered_within_indices[0] & 0xF) | ((filtered_within_indices[1] & 0xF) << 4)
+                        packed_byte2 = (filtered_within_indices[2] & 0xF) | ((filtered_within_indices[3] & 0xF) << 4)
+                        data.append(packed_byte1)
+                        data.append(packed_byte2)
+            
+            # 处理完整索引编码
+            data.append(len(full_index_updates))
+            for zone_relative_idx, full_indices in full_index_updates:
+                data.append(zone_relative_idx)
+                for idx in full_indices:
+                    data.append(idx)
+    
+    # 按区域编码色块更新（逻辑不变）
+    for zone_idx in range(zones_count):
+        if color_zone_bitmap & (1 << zone_idx):
+            color_updates = zone_color_updates[zone_idx]
+            data.append(len(color_updates))
+            
+            # 存储色块更新
+            for relative_idx, unified_idx in color_updates:
+                data.append(relative_idx)
+                data.append(unified_idx)
+    
+    return bytes(data), False, used_zones, total_color_updates, total_detail_updates
