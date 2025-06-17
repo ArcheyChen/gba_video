@@ -93,11 +93,11 @@ class EncodingStats:
         
         # 段使用统计
         if small_segments:
-            for seg_idx in small_segments:
-                self.small_segment_usage[seg_idx] += 1
+            for seg_idx, count in small_segments.items():
+                self.small_segment_usage[seg_idx] += count
         if medium_segments:
-            for seg_idx in medium_segments:
-                self.medium_segment_usage[seg_idx] += 1
+            for seg_idx, count in medium_segments.items():
+                self.medium_segment_usage[seg_idx] += count
         
         # 效率统计
         if small_blocks_per_update:
@@ -169,17 +169,31 @@ class EncodingStats:
         # 段使用统计
         if self.small_segment_usage:
             print(f"\n🔢 小码表段使用分布:")
+            total_small_updates = sum(self.small_segment_usage.values())
             for seg_idx in sorted(self.small_segment_usage.keys()):
                 usage_count = self.small_segment_usage[seg_idx]
                 if self.small_codebook_updates > 0:
                     print(f"   段{seg_idx}: {usage_count}次 ({usage_count/self.small_codebook_updates*100:.1f}%)")
+            
+            # 验证排序效果：前4段应该占大部分使用
+            if total_small_updates > 0:
+                first_4_segments_usage = sum(self.small_segment_usage.get(i, 0) for i in range(4))
+                first_4_percentage = first_4_segments_usage / total_small_updates * 100
+                print(f"   前4段使用率: {first_4_percentage:.1f}% (排序效果指标)")
         
         if self.medium_segment_usage:
             print(f"\n🔢 中码表段使用分布:")
+            total_medium_updates = sum(self.medium_segment_usage.values())
             for seg_idx in sorted(self.medium_segment_usage.keys()):
                 usage_count = self.medium_segment_usage[seg_idx]
                 if self.medium_codebook_updates > 0:
                     print(f"   段{seg_idx}: {usage_count}次 ({usage_count/self.medium_codebook_updates*100:.1f}%)")
+            
+            # 验证排序效果：前2段应该占大部分使用
+            if total_medium_updates > 0:
+                first_2_segments_usage = sum(self.medium_segment_usage.get(i, 0) for i in range(2))
+                first_2_percentage = first_2_segments_usage / total_medium_updates * 100
+                print(f"   前2段使用率: {first_2_percentage:.1f}% (排序效果指标)")
         
         # P帧更新统计
         if self.p_frame_updates:
@@ -299,11 +313,16 @@ def main():
 
     # 基于 GOP 内 P 帧纹理块使用频次，对每个码本项降序重排
     import numpy as _np
+    print("正在根据使用频次对码本进行排序...")
+    
     for gop_start, gop_data in gop_codebooks.items():
         codebook = gop_data['unified_codebook']
         counts = _np.zeros(len(codebook), dtype=int)
+        
         # GOP 范围：起始帧下一个到下一个 I 帧
         gop_end = min(gop_start + args.i_frame_interval, len(frames))
+        
+        # 统计每个码本项的使用频次
         for fid in range(gop_start + 1, gop_end):
             cur = frames[fid]
             prev = frames[fid - 1]
@@ -325,9 +344,51 @@ def main():
                                 b = cur[y, x]
                                 idx = quantize_blocks_unified(b.reshape(1, -1), codebook)[0]
                                 counts[idx] += 1
-        # 根据 counts 降序排序，stable 保持相同频次项原序
-        order = _np.argsort(-counts, kind='stable')
-        gop_data['unified_codebook'] = codebook[order]
+        
+        # 检查是否有使用频次差异
+        max_count = counts.max()
+        min_count = counts.min()
+        total_usage = counts.sum()
+        
+        if max_count > min_count and total_usage > 0:
+            print(f"  GOP {gop_start}: 最大使用频次 {max_count}, 最小使用频次 {min_count}, 总使用次数 {total_usage}")
+            
+            # 显示排序前的前10个最常用项
+            top_indices_before = _np.argsort(-counts)[:10]
+            print(f"    排序前前10个最常用项: {top_indices_before.tolist()}")
+            print(f"    对应使用频次: {counts[top_indices_before].tolist()}")
+            
+            # 根据 counts 降序排序，stable 保持相同频次项原序
+            order = _np.argsort(-counts, kind='stable')
+            gop_data['unified_codebook'] = codebook[order]
+            
+            # 创建索引映射表（旧索引 -> 新索引）
+            index_mapping = _np.zeros(len(codebook), dtype=int)
+            for new_idx, old_idx in enumerate(order):
+                index_mapping[old_idx] = new_idx
+            
+            # 显示排序后的前10个项（应该对应原来的最常用项）
+            print(f"    排序后前10个项对应原索引: {order[:10].tolist()}")
+            
+            # 验证排序效果：检查排序后前几个索引的使用情况
+            print(f"    排序后前15个索引的使用频次: {counts[order[:15]].tolist()}")
+            print(f"    排序后前15个索引的段分布: {[i//15 for i in range(15)]}")
+            
+            # 更新 block_types 中的索引
+            for fid, bt in gop_data['block_types_list']:
+                if bt is not None:
+                    for (big_by, big_bx), (block_type, block_indices) in bt.items():
+                        if block_type == 'detail':
+                            # 更新纹理块的索引
+                            new_indices = []
+                            for old_idx in block_indices:
+                                if old_idx < len(index_mapping):
+                                    new_indices.append(index_mapping[old_idx])
+                                else:
+                                    new_indices.append(old_idx)
+                            bt[(big_by, big_bx)] = (block_type, new_indices)
+        else:
+            print(f"  GOP {gop_start}: 所有码本项使用频次相同或总使用次数为0，跳过排序")
     
     # 编码所有帧
     print("正在编码帧...")

@@ -5,6 +5,7 @@ import struct
 from sklearn.cluster import MiniBatchKMeans
 from numba import jit, njit, types
 from numba.typed import List
+from collections import defaultdict
 
 from dither_opt import apply_dither_optimized
 
@@ -698,8 +699,8 @@ def encode_p_frame_unified(current_blocks: np.ndarray, prev_blocks: np.ndarray,
     small_bytes = 0
     medium_bytes = 0
     full_bytes = 0
-    small_segments = set()
-    medium_segments = set()
+    small_segments = defaultdict(int)  # 改为defaultdict(int)来统计使用次数
+    medium_segments = defaultdict(int)  # 改为defaultdict(int)来统计使用次数
     small_blocks_per_update = []
     medium_blocks_per_update = []
     full_blocks_per_update = []
@@ -779,7 +780,9 @@ def encode_p_frame_unified(current_blocks: np.ndarray, prev_blocks: np.ndarray,
                 if actual_enabled_segments_bitmap & (1 << seg_idx):
                     seg_updates = small_codebook_updates[seg_idx]
                     small_updates += len(seg_updates)
-                    small_segments.add(seg_idx)
+                    # 修复：基于每次更新统计段使用，而不是基于每个区域
+                    for _ in range(len(seg_updates)):
+                        small_segments[seg_idx] += 1
                     data.append(len(seg_updates))
                     
                     for zone_relative_idx, segment_indices, within_indices in seg_updates:
@@ -810,7 +813,9 @@ def encode_p_frame_unified(current_blocks: np.ndarray, prev_blocks: np.ndarray,
                 if actual_enabled_medium_segments_bitmap & (1 << seg_idx):
                     seg_updates = medium_codebook_updates[seg_idx]
                     medium_updates += len(seg_updates)
-                    medium_segments.add(seg_idx)
+                    # 修复：基于每次更新统计段使用，而不是基于每个区域
+                    for _ in range(len(seg_updates)):
+                        medium_segments[seg_idx] += 1
                     data.append(len(seg_updates))
                     
                     for zone_relative_idx, segment_indices, within_indices in seg_updates:
