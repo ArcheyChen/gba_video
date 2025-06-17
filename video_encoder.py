@@ -31,7 +31,7 @@ ZONE_HEIGHT_PIXELS = 16  # 每个区域的像素高度
 ZONE_HEIGHT_BIG_BLOCKS = ZONE_HEIGHT_PIXELS // (BLOCK_H * 2)  # 每个区域的4x4大块行数 (16像素 = 4行4x4大块)
 
 MINI_CODEBOOK_SIZE = 15  # 每个分段码本的大小
-DEFAULT_FORCED_SEGMENTS = 2  # 默认强制处理的段数
+DEFAULT_ENABLED_SEGMENTS_BITMAP = 0xFF  # 默认启用前8段的bitmap (11111111)
 SKIP_MARKER_4BIT = 0xF   # 4bit跳过标记
 
 # 帧类型标识
@@ -474,8 +474,8 @@ def encode_i_frame_unified(blocks: np.ndarray, unified_codebook: np.ndarray,
 def encode_p_frame_unified(current_blocks: np.ndarray, prev_blocks: np.ndarray,
                           unified_codebook: np.ndarray, block_types: dict,
                           diff_threshold: float, force_i_threshold: float = 0.7,
-                          forced_segments: int = DEFAULT_FORCED_SEGMENTS) -> tuple:
-    """差分编码P帧（统一码本，混合分段编码）- 修复重复编码问题"""
+                          enabled_segments_bitmap: int = DEFAULT_ENABLED_SEGMENTS_BITMAP) -> tuple:
+    """差分编码P帧（统一码本，混合分段编码）- 使用段启用bitmap"""
     if prev_blocks is None or current_blocks.shape != prev_blocks.shape:
         i_frame_data = encode_i_frame_unified(current_blocks, unified_codebook, block_types)
         return i_frame_data, True, 0, 0, 0
@@ -496,6 +496,15 @@ def encode_p_frame_unified(current_blocks: np.ndarray, prev_blocks: np.ndarray,
     
     # 计算区域数量
     zones_count = (big_blocks_h + ZONE_HEIGHT_BIG_BLOCKS - 1) // ZONE_HEIGHT_BIG_BLOCKS
+    
+    # 获取启用的段索引列表
+    enabled_segments = []
+    for seg_idx in range(8):  # 最多8段
+        if enabled_segments_bitmap & (1 << seg_idx):
+            enabled_segments.append(seg_idx)
+    
+    # 计算最大启用段索引
+    max_enabled_segment = max(enabled_segments) if enabled_segments else -1
     
     # 按区域组织更新
     zone_detail_updates = [[] for _ in range(zones_count)]
@@ -578,7 +587,7 @@ def encode_p_frame_unified(current_blocks: np.ndarray, prev_blocks: np.ndarray,
                             within_indices.append(SKIP_MARKER_4BIT)  # 0xF
                             full_indices.append(COLOR_BLOCK_MARKER)  # 0xFF用于完整索引跳过
                     
-                    # 【关键修复】：检查所有需要更新的子块是否都能用小码表编码
+                    # 【关键修复】：检查所有需要更新的子块是否都能用启用的小码表编码
                     can_use_small_codebook = True
                     used_segments = set()
                     has_updates = False
@@ -586,7 +595,8 @@ def encode_p_frame_unified(current_blocks: np.ndarray, prev_blocks: np.ndarray,
                     for i, (seg_idx, within_idx) in enumerate(zip(segment_indices, within_indices)):
                         if within_idx != SKIP_MARKER_4BIT:  # 这是需要更新的子块
                             has_updates = True
-                            if seg_idx >= forced_segments:  # 超出强制段范围，必须用大码表
+                            # 检查段是否在启用的bitmap中，且在前8段范围内
+                            if seg_idx >= 8 or not (enabled_segments_bitmap & (1 << seg_idx)):
                                 can_use_small_codebook = False
                                 break
                             used_segments.add(seg_idx)
@@ -654,7 +664,7 @@ def encode_p_frame_unified(current_blocks: np.ndarray, prev_blocks: np.ndarray,
             detail_updates = zone_detail_updates[zone_idx]
             
             # 分离小码表编码和完整索引编码
-            small_codebook_updates = [[] for _ in range(forced_segments)]
+            small_codebook_updates = [[] for _ in range(8)]  # 最多8段
             full_index_updates = []
             
             for update_info in detail_updates:
@@ -673,27 +683,28 @@ def encode_p_frame_unified(current_blocks: np.ndarray, prev_blocks: np.ndarray,
                     full_indices = update_info['full_indices']
                     full_index_updates.append((zone_relative_idx, full_indices))
             
-            # 写入强制段数
-            data.append(forced_segments)
+            # 写入启用段bitmap
+            data.append(enabled_segments_bitmap)
             
-            # 处理小码表编码段
-            for seg_idx in range(forced_segments):
-                seg_updates = small_codebook_updates[seg_idx]
-                data.append(len(seg_updates))
-                for zone_relative_idx, segment_indices, within_indices in seg_updates:
-                    data.append(zone_relative_idx)
-                    # 只编码属于当前段的索引
-                    filtered_within_indices = []
-                    for seg_i, within_i in zip(segment_indices, within_indices):
-                        if seg_i == seg_idx and within_i != SKIP_MARKER_4BIT:
-                            filtered_within_indices.append(within_i)
-                        else:
-                            filtered_within_indices.append(SKIP_MARKER_4BIT)
-                    
-                    packed_byte1 = (filtered_within_indices[0] & 0xF) | ((filtered_within_indices[1] & 0xF) << 4)
-                    packed_byte2 = (filtered_within_indices[2] & 0xF) | ((filtered_within_indices[3] & 0xF) << 4)
-                    data.append(packed_byte1)
-                    data.append(packed_byte2)
+            # 处理启用的小码表编码段
+            for seg_idx in range(8):
+                if enabled_segments_bitmap & (1 << seg_idx):
+                    seg_updates = small_codebook_updates[seg_idx]
+                    data.append(len(seg_updates))
+                    for zone_relative_idx, segment_indices, within_indices in seg_updates:
+                        data.append(zone_relative_idx)
+                        # 只编码属于当前段的索引
+                        filtered_within_indices = []
+                        for seg_i, within_i in zip(segment_indices, within_indices):
+                            if seg_i == seg_idx and within_i != SKIP_MARKER_4BIT:
+                                filtered_within_indices.append(within_i)
+                            else:
+                                filtered_within_indices.append(SKIP_MARKER_4BIT)
+                        
+                        packed_byte1 = (filtered_within_indices[0] & 0xF) | ((filtered_within_indices[1] & 0xF) << 4)
+                        packed_byte2 = (filtered_within_indices[2] & 0xF) | ((filtered_within_indices[3] & 0xF) << 4)
+                        data.append(packed_byte1)
+                        data.append(packed_byte2)
             
             # 处理完整索引编码
             data.append(len(full_index_updates))
@@ -1102,8 +1113,8 @@ def main():
                    help="GOP处理的最大进程数（默认为CPU核心数-1）")
     pa.add_argument("--dither", action="store_true",
                    help="启用Floyd-Steinberg抖动算法提升画质")
-    pa.add_argument("--forced-segments", type=int, default=DEFAULT_FORCED_SEGMENTS,
-                   help=f"强制处理的分段数量（默认{DEFAULT_FORCED_SEGMENTS}）")
+    pa.add_argument("--enabled-segments-bitmap", type=int, default=DEFAULT_ENABLED_SEGMENTS_BITMAP,
+                   help=f"启用段的bitmap，每位表示对应段是否启用小码表模式（默认0x{DEFAULT_ENABLED_SEGMENTS_BITMAP:02X}）")
     args = pa.parse_args()
 
     cap = cv2.VideoCapture(args.input)
@@ -1246,7 +1257,7 @@ def main():
             frame_data, is_i_frame, used_zones, color_updates, detail_updates = encode_p_frame_unified(
                 current_frame, prev_frame,
                 unified_codebook, block_types,
-                args.diff_threshold, args.force_i_threshold, args.forced_segments
+                args.diff_threshold, args.force_i_threshold, args.enabled_segments_bitmap
             )
             
             if is_i_frame:

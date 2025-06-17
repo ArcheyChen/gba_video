@@ -17,7 +17,6 @@ constexpr int PIXELS_PER_FRAME = SCREEN_WIDTH * SCREEN_HEIGHT;
 #define ZONE_HEIGHT_PIXELS 16  // 每个区域的像素高度
 #define ZONE_HEIGHT_BIG_BLOCKS (ZONE_HEIGHT_PIXELS / (BLOCK_HEIGHT * 2))  // 每个区域的4x4大块行数
 #define MINI_CODEBOOK_SIZE 15  // 每个分段码本的大小
-#define DEFAULT_FORCED_SEGMENTS 2  // 默认强制处理的段数
 #define SKIP_MARKER_4BIT 0xF   // 4bit跳过标记
 
 // EWRAM 单缓冲
@@ -277,21 +276,23 @@ IWRAM_CODE void decode_p_frame_unified(const u8* src, u16* dst)
             u16 zone_base_offset = zone_idx * ZONE_HEIGHT_PIXELS * SCREEN_WIDTH;
             u16* zone_dst = dst + zone_base_offset;
             
-            // 读取强制段数
-            u8 forced_segments = *src++;
+            // 读取启用段bitmap
+            u8 enabled_segments_bitmap = *src++;
             
-            // 处理前N段（分段编码）
-            for (u8 seg_idx = 0; seg_idx < forced_segments; seg_idx++) {
-                const YUV_Struct* mini_codebook = unified_codebook + (seg_idx * MINI_CODEBOOK_SIZE);
-                u8 seg_blocks_to_update = *src++;
-                
-                for (u8 i = 0; i < seg_blocks_to_update; i++) {
-                    u8 zone_relative_idx = *src++;
-                    u8 packed_byte1 = *src++;
-                    u8 packed_byte2 = *src++;
+            // 处理启用的段（分段编码）
+            for (u8 seg_idx = 0; seg_idx < 8; seg_idx++) {
+                if (enabled_segments_bitmap & (1 << seg_idx)) {
+                    const YUV_Struct* mini_codebook = unified_codebook + (seg_idx * MINI_CODEBOOK_SIZE);
+                    u8 seg_blocks_to_update = *src++;
                     
-                    u16* big_block_dst = zone_dst + zone_block_relative_offsets[zone_relative_idx];
-                    decode_segmented_block(mini_codebook, packed_byte1, packed_byte2, big_block_dst);
+                    for (u8 i = 0; i < seg_blocks_to_update; i++) {
+                        u8 zone_relative_idx = *src++;
+                        u8 packed_byte1 = *src++;
+                        u8 packed_byte2 = *src++;
+                        
+                        u16* big_block_dst = zone_dst + zone_block_relative_offsets[zone_relative_idx];
+                        decode_segmented_block(mini_codebook, packed_byte1, packed_byte2, big_block_dst);
+                    }
                 }
             }
             
