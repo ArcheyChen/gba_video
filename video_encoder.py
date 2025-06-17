@@ -34,6 +34,23 @@ class EncodingStats:
         self.detail_block_bytes = 0
         self.color_update_count = 0
         self.detail_update_count = 0
+        
+        # 码表使用统计
+        self.small_codebook_updates = 0      # 小码表更新次数
+        self.medium_codebook_updates = 0     # 中码表更新次数
+        self.full_codebook_updates = 0       # 大码表更新次数
+        self.small_codebook_bytes = 0        # 小码表数据大小
+        self.medium_codebook_bytes = 0       # 中码表数据大小
+        self.full_codebook_bytes = 0         # 大码表数据大小
+        
+        # 码表段使用统计
+        self.small_segment_usage = defaultdict(int)  # 小码表各段使用次数
+        self.medium_segment_usage = defaultdict(int) # 中码表各段使用次数
+        
+        # 码表效率统计
+        self.small_codebook_blocks_per_update = []  # 每次小码表更新的块数
+        self.medium_codebook_blocks_per_update = [] # 每次中码表更新的块数
+        self.full_codebook_blocks_per_update = []   # 每次大码表更新的块数
     
     def add_i_frame(self, size_bytes, is_forced=True, codebook_size=0, index_size=0):
         self.total_frames_processed += 1
@@ -48,7 +65,11 @@ class EncodingStats:
         self.total_index_bytes += index_size
     
     def add_p_frame(self, size_bytes, updates_count, zone_count, 
-                   color_updates=0, detail_updates=0):
+                   color_updates=0, detail_updates=0,
+                   small_updates=0, medium_updates=0, full_updates=0,
+                   small_bytes=0, medium_bytes=0, full_bytes=0,
+                   small_segments=None, medium_segments=None,
+                   small_blocks_per_update=None, medium_blocks_per_update=None, full_blocks_per_update=None):
         self.total_frames_processed += 1
         self.total_p_frames += 1
         self.total_p_frame_bytes += size_bytes
@@ -61,6 +82,30 @@ class EncodingStats:
         
         self.color_update_count += color_updates
         self.detail_update_count += detail_updates
+        
+        # 码表使用统计
+        self.small_codebook_updates += small_updates
+        self.medium_codebook_updates += medium_updates
+        self.full_codebook_updates += full_updates
+        self.small_codebook_bytes += small_bytes
+        self.medium_codebook_bytes += medium_bytes
+        self.full_codebook_bytes += full_bytes
+        
+        # 段使用统计
+        if small_segments:
+            for seg_idx in small_segments:
+                self.small_segment_usage[seg_idx] += 1
+        if medium_segments:
+            for seg_idx in medium_segments:
+                self.medium_segment_usage[seg_idx] += 1
+        
+        # 效率统计
+        if small_blocks_per_update:
+            self.small_codebook_blocks_per_update.extend(small_blocks_per_update)
+        if medium_blocks_per_update:
+            self.medium_codebook_blocks_per_update.extend(medium_blocks_per_update)
+        if full_blocks_per_update:
+            self.full_codebook_blocks_per_update.extend(full_blocks_per_update)
     
     def print_summary(self, total_frames, total_bytes):
         print(f"\n📊 编码统计报告")
@@ -94,6 +139,47 @@ class EncodingStats:
         p_frame_data_bytes = self.total_p_frame_bytes - self.total_p_overhead_bytes
         print(f"   P帧更新数据: {p_frame_data_bytes:,} bytes ({p_frame_data_bytes/total_bytes*100:.1f}%)")
         print(f"   P帧开销: {self.total_p_overhead_bytes:,} bytes ({self.total_p_overhead_bytes/total_bytes*100:.1f}%)")
+        
+        # 码表使用统计
+        total_detail_updates = self.small_codebook_updates + self.medium_codebook_updates + self.full_codebook_updates
+        if total_detail_updates > 0:
+            print(f"\n📚 码表使用分析:")
+            print(f"   小码表更新: {self.small_codebook_updates:,} 次 ({self.small_codebook_updates/total_detail_updates*100:.1f}%)")
+            print(f"   中码表更新: {self.medium_codebook_updates:,} 次 ({self.medium_codebook_updates/total_detail_updates*100:.1f}%)")
+            print(f"   大码表更新: {self.full_codebook_updates:,} 次 ({self.full_codebook_updates/total_detail_updates*100:.1f}%)")
+            
+            print(f"\n💾 码表数据大小:")
+            total_codebook_data = self.small_codebook_bytes + self.medium_codebook_bytes + self.full_codebook_bytes
+            if total_codebook_data > 0:
+                print(f"   小码表数据: {self.small_codebook_bytes:,} bytes ({self.small_codebook_bytes/total_codebook_data*100:.1f}%)")
+                print(f"   中码表数据: {self.medium_codebook_bytes:,} bytes ({self.medium_codebook_bytes/total_codebook_data*100:.1f}%)")
+                print(f"   大码表数据: {self.full_codebook_bytes:,} bytes ({self.full_codebook_bytes/total_codebook_data*100:.1f}%)")
+            
+            # 码表效率统计
+            if self.small_codebook_blocks_per_update:
+                avg_small_blocks = statistics.mean(self.small_codebook_blocks_per_update)
+                print(f"   小码表平均每次更新块数: {avg_small_blocks:.1f}")
+            if self.medium_codebook_blocks_per_update:
+                avg_medium_blocks = statistics.mean(self.medium_codebook_blocks_per_update)
+                print(f"   中码表平均每次更新块数: {avg_medium_blocks:.1f}")
+            if self.full_codebook_blocks_per_update:
+                avg_full_blocks = statistics.mean(self.full_codebook_blocks_per_update)
+                print(f"   大码表平均每次更新块数: {avg_full_blocks:.1f}")
+        
+        # 段使用统计
+        if self.small_segment_usage:
+            print(f"\n🔢 小码表段使用分布:")
+            for seg_idx in sorted(self.small_segment_usage.keys()):
+                usage_count = self.small_segment_usage[seg_idx]
+                if self.small_codebook_updates > 0:
+                    print(f"   段{seg_idx}: {usage_count}次 ({usage_count/self.small_codebook_updates*100:.1f}%)")
+        
+        if self.medium_segment_usage:
+            print(f"\n🔢 中码表段使用分布:")
+            for seg_idx in sorted(self.medium_segment_usage.keys()):
+                usage_count = self.medium_segment_usage[seg_idx]
+                if self.medium_codebook_updates > 0:
+                    print(f"   段{seg_idx}: {usage_count}次 ({usage_count/self.medium_codebook_updates*100:.1f}%)")
         
         # P帧更新统计
         if self.p_frame_updates:
@@ -291,7 +377,7 @@ def main():
                 index_size=max(0, index_size)
             )
         else:
-            frame_data, is_i_frame, used_zones, color_updates, detail_updates = encode_p_frame_unified(
+            frame_data, is_i_frame, used_zones, color_updates, detail_updates, small_updates, medium_updates, full_updates, small_bytes, medium_bytes, full_bytes, small_segments, medium_segments, small_blocks_per_update, medium_blocks_per_update, full_blocks_per_update = encode_p_frame_unified(
                 current_frame, prev_frame,
                 unified_codebook, block_types,
                 args.diff_threshold, args.force_i_threshold, args.enabled_segments_bitmap,
@@ -313,7 +399,11 @@ def main():
                 
                 encoding_stats.add_p_frame(
                     len(frame_data), total_updates, used_zones,
-                    color_updates, detail_updates
+                    color_updates, detail_updates,
+                    small_updates, medium_updates, full_updates,
+                    small_bytes, medium_bytes, full_bytes,
+                    small_segments, medium_segments,
+                    small_blocks_per_update, medium_blocks_per_update, full_blocks_per_update
                 )
         
         encoded_frames.append(frame_data)

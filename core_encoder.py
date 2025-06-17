@@ -500,13 +500,13 @@ def encode_p_frame_unified(current_blocks: np.ndarray, prev_blocks: np.ndarray,
     """差分编码P帧（统一码本，三级分段编码）- 小码表→中码表→大码表"""
     if prev_blocks is None or current_blocks.shape != prev_blocks.shape:
         i_frame_data = encode_i_frame_unified(current_blocks, unified_codebook, block_types)
-        return i_frame_data, True, 0, 0, 0
+        return i_frame_data, True, 0, 0, 0, 0, 0, 0, 0, 0, 0, set(), set(), [], [], []
     
     blocks_h, blocks_w = current_blocks.shape[:2]
     total_blocks = blocks_h * blocks_w
     
     if total_blocks == 0:
-        return b'', True, 0, 0, 0
+        return b'', True, 0, 0, 0, 0, 0, 0, 0, 0, 0, set(), set(), [], [], []
     
     # 使用Numba加速的2x2块差异计算
     current_flat = current_blocks.reshape(-1, BYTES_PER_BLOCK)
@@ -680,7 +680,7 @@ def encode_p_frame_unified(current_blocks: np.ndarray, prev_blocks: np.ndarray,
     update_ratio = total_updated_blocks / total_blocks
     if update_ratio > force_i_threshold:
         i_frame_data = encode_i_frame_unified(current_blocks, unified_codebook, block_types)
-        return i_frame_data, True, 0, 0, 0
+        return i_frame_data, True, 0, 0, 0, 0, 0, 0, 0, 0, 0, set(), set(), [], [], []
     
     # 编码P帧
     data = bytearray()
@@ -690,6 +690,19 @@ def encode_p_frame_unified(current_blocks: np.ndarray, prev_blocks: np.ndarray,
     used_zones = 0
     total_color_updates = 0
     total_detail_updates = 0
+    
+    # 码表使用统计
+    small_updates = 0
+    medium_updates = 0
+    full_updates = 0
+    small_bytes = 0
+    medium_bytes = 0
+    full_bytes = 0
+    small_segments = set()
+    medium_segments = set()
+    small_blocks_per_update = []
+    medium_blocks_per_update = []
+    full_blocks_per_update = []
     
     # 生成两个区域bitmap
     detail_zone_bitmap = 0
@@ -765,21 +778,29 @@ def encode_p_frame_unified(current_blocks: np.ndarray, prev_blocks: np.ndarray,
             for seg_idx in range(8):
                 if actual_enabled_segments_bitmap & (1 << seg_idx):
                     seg_updates = small_codebook_updates[seg_idx]
+                    small_updates += len(seg_updates)
+                    small_segments.add(seg_idx)
                     data.append(len(seg_updates))
+                    
                     for zone_relative_idx, segment_indices, within_indices in seg_updates:
                         data.append(zone_relative_idx)
                         # 编码4bit索引
                         filtered_within_indices = []
+                        actual_blocks_count = 0
                         for seg_i, within_i in zip(segment_indices, within_indices):
                             if seg_i == seg_idx and within_i != SKIP_MARKER_4BIT:
                                 filtered_within_indices.append(within_i)
+                                actual_blocks_count += 1
                             else:
                                 filtered_within_indices.append(SKIP_MARKER_4BIT)
+                        
+                        small_blocks_per_update.append(actual_blocks_count)
                         
                         packed_byte1 = (filtered_within_indices[0] & 0xF) | ((filtered_within_indices[1] & 0xF) << 4)
                         packed_byte2 = (filtered_within_indices[2] & 0xF) | ((filtered_within_indices[3] & 0xF) << 4)
                         data.append(packed_byte1)
                         data.append(packed_byte2)
+                        small_bytes += 3  # zone_relative_idx + 2 bytes
             
             # 写入中码表启用bitmap
             data.append(actual_enabled_medium_segments_bitmap)
@@ -788,16 +809,23 @@ def encode_p_frame_unified(current_blocks: np.ndarray, prev_blocks: np.ndarray,
             for seg_idx in range(4):
                 if actual_enabled_medium_segments_bitmap & (1 << seg_idx):
                     seg_updates = medium_codebook_updates[seg_idx]
+                    medium_updates += len(seg_updates)
+                    medium_segments.add(seg_idx)
                     data.append(len(seg_updates))
+                    
                     for zone_relative_idx, segment_indices, within_indices in seg_updates:
                         data.append(zone_relative_idx)
                         # 编码6bit索引到24bit，用uint32避免溢出
                         filtered_within_indices = []
+                        actual_blocks_count = 0
                         for seg_i, within_i in zip(segment_indices, within_indices):
                             if seg_i == seg_idx and within_i != SKIP_MARKER_6BIT:
                                 filtered_within_indices.append(within_i)
+                                actual_blocks_count += 1
                             else:
                                 filtered_within_indices.append(SKIP_MARKER_6BIT)
+                        
+                        medium_blocks_per_update.append(actual_blocks_count)
                         
                         # 使用uint32打包4个6bit = 24bit
                         packed_24bit = np.uint32(0)
@@ -810,13 +838,21 @@ def encode_p_frame_unified(current_blocks: np.ndarray, prev_blocks: np.ndarray,
                         data.append(np.uint8(packed_24bit & 0xFF))
                         data.append(np.uint8((packed_24bit >> 8) & 0xFF))
                         data.append(np.uint8((packed_24bit >> 16) & 0xFF))
+                        medium_bytes += 4  # zone_relative_idx + 3 bytes
             
             # 处理完整索引编码
             data.append(len(full_index_updates))
+            full_updates += len(full_index_updates)
+            
             for zone_relative_idx, full_indices in full_index_updates:
                 data.append(zone_relative_idx)
+                actual_blocks_count = 0
                 for idx in full_indices:
+                    if idx != COLOR_BLOCK_MARKER:
+                        actual_blocks_count += 1
                     data.append(idx)
+                full_blocks_per_update.append(actual_blocks_count)
+                full_bytes += 1 + len(full_indices)  # zone_relative_idx + indices
     
     # 按区域编码色块更新（逻辑不变）
     for zone_idx in range(zones_count):
@@ -829,4 +865,4 @@ def encode_p_frame_unified(current_blocks: np.ndarray, prev_blocks: np.ndarray,
                 data.append(relative_idx)
                 data.append(unified_idx)
     
-    return bytes(data), False, used_zones, total_color_updates, total_detail_updates
+    return bytes(data), False, used_zones, total_color_updates, total_detail_updates, small_updates, medium_updates, full_updates, small_bytes, medium_bytes, full_bytes, small_segments, medium_segments, small_blocks_per_update, medium_blocks_per_update, full_blocks_per_update
