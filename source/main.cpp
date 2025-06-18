@@ -9,6 +9,7 @@
 #include <cstring>
 
 #include "video_data.h"
+#include "bit_reader.h"
 #include <tuple>
 
 constexpr int PIXELS_PER_FRAME = SCREEN_WIDTH * SCREEN_HEIGHT;
@@ -160,15 +161,15 @@ IWRAM_CODE void decode_big_block(const YUV_Struct* codebook, const u8 quant_indi
     }
 }
 
-// 解码分段纹理块的辅助函数
-IWRAM_CODE void decode_segmented_block(const YUV_Struct* mini_codebook, u8 packed_byte1, u8 packed_byte2, u16* big_block_dst)
+// 解码分段纹理块的辅助函数 - 使用位读取器
+IWRAM_CODE void decode_segmented_block_bitreader(const YUV_Struct* mini_codebook, BitReader& reader, u16* big_block_dst)
 {
-    // 解包4个4bit索引
+    // 读取4个4bit索引
     u8 indices[4];
-    indices[0] = packed_byte1 & 0xF;
-    indices[1] = (packed_byte1 >> 4) & 0xF;
-    indices[2] = packed_byte2 & 0xF;
-    indices[3] = (packed_byte2 >> 4) & 0xF;
+    indices[0] = reader.read4();
+    indices[1] = reader.read4();
+    indices[2] = reader.read4();
+    indices[3] = reader.read4();
     
     // 解码每个2x2子块，如果索引是0xF则跳过
     if (indices[0] != SKIP_MARKER_4BIT) {
@@ -185,18 +186,15 @@ IWRAM_CODE void decode_segmented_block(const YUV_Struct* mini_codebook, u8 packe
     }
 }
 
-// 解码中等分段纹理块的辅助函数
-IWRAM_CODE void decode_medium_segmented_block(const YUV_Struct* medium_codebook, u8 packed_byte1, u8 packed_byte2, u8 packed_byte3, u16* big_block_dst)
+// 解码中等分段纹理块的辅助函数 - 使用位读取器
+IWRAM_CODE void decode_medium_segmented_block_bitreader(const YUV_Struct* medium_codebook, BitReader& reader, u16* big_block_dst)
 {
-    // 从3个u8重建24bit数据
-    u32 packed_24bit = packed_byte1 | (packed_byte2 << 8) | (packed_byte3 << 16);
-    
-    // 解包4个6bit索引
+    // 读取4个6bit索引
     u8 indices[4];
-    indices[0] = packed_24bit & 0x3F;
-    indices[1] = (packed_24bit >> 6) & 0x3F;
-    indices[2] = (packed_24bit >> 12) & 0x3F;
-    indices[3] = (packed_24bit >> 18) & 0x3F;
+    indices[0] = reader.read6();
+    indices[1] = reader.read6();
+    indices[2] = reader.read6();
+    indices[3] = reader.read6();
     
     // 解码每个2x2子块，如果索引是0x3F则跳过
     if (indices[0] != SKIP_MARKER_6BIT) {
@@ -310,45 +308,48 @@ IWRAM_CODE void decode_p_frame_unified(const u8* src, u16* dst)
             u16 enabled_segments_bitmap = src[0] | (src[1] << 8);
             src += 2; // 跳过启用段bitmap的两个字节
             
-            // 处理启用的小码表段 - 从8个修改为16个
+            // 处理启用的小码表段 - 使用位读取器
             for (u16 seg_idx = 0; seg_idx < 16; seg_idx++) {
                 if (enabled_segments_bitmap & (1 << seg_idx)) {
                     const YUV_Struct* mini_codebook = unified_codebook + (seg_idx * MINI_CODEBOOK_SIZE);
                     u8 seg_blocks_to_update = *src++;
                     
+                    // 创建位读取器，传入src指针的地址
+                    BitReader reader(&src);
+                    
                     for (u8 i = 0; i < seg_blocks_to_update; i++) {
-                        u8 zone_relative_idx = *src++;
-                        u8 packed_byte1 = *src++;
-                        u8 packed_byte2 = *src++;
+                        u8 zone_relative_idx = reader.read8();
                         
                         u16* big_block_dst = zone_dst + zone_block_relative_offsets[zone_relative_idx];
-                        decode_segmented_block(mini_codebook, packed_byte1, packed_byte2, big_block_dst);
+                        decode_segmented_block_bitreader(mini_codebook, reader, big_block_dst);
                     }
+                    // BitReader析构时会自动更新src指针
                 }
             }
             
             // 读取中码表启用段bitmap
             u8 enabled_medium_segments_bitmap = *src++;
             
-            // 处理启用的中码表段
+            // 处理启用的中码表段 - 使用位读取器
             for (u8 seg_idx = 0; seg_idx < 4; seg_idx++) {
                 if (enabled_medium_segments_bitmap & (1 << seg_idx)) {
                     const YUV_Struct* medium_codebook = unified_codebook + (seg_idx * MEDIUM_CODEBOOK_SIZE);
                     u8 seg_blocks_to_update = *src++;
                     
+                    // 创建位读取器，传入src指针的地址
+                    BitReader reader(&src);
+                    
                     for (u8 i = 0; i < seg_blocks_to_update; i++) {
-                        u8 zone_relative_idx = *src++;
-                        u8 packed_byte1 = *src++;
-                        u8 packed_byte2 = *src++;
-                        u8 packed_byte3 = *src++;
+                        u8 zone_relative_idx = reader.read8();
                         
                         u16* big_block_dst = zone_dst + zone_block_relative_offsets[zone_relative_idx];
-                        decode_medium_segmented_block(medium_codebook, packed_byte1, packed_byte2, packed_byte3, big_block_dst);
+                        decode_medium_segmented_block_bitreader(medium_codebook, reader, big_block_dst);
                     }
+                    // BitReader析构时会自动更新src指针
                 }
             }
             
-            // 处理剩余更新（完整索引）
+            // 处理剩余更新（完整索引）- 保持原有方式
             u8 remaining_blocks_to_update = *src++;
             for (u8 i = 0; i < remaining_blocks_to_update; i++) {
                 u8 zone_relative_idx = *src++;
