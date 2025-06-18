@@ -295,7 +295,7 @@ IWRAM_CODE void decode_p_frame_unified(const u8* src, u16* dst)
     u16 color_zone_bitmap = src[2] | (src[3] << 8);
     src += 4; // 跳过两个bitmap的四个字节
     
-    // 处理纹理块更新（三级混合编码模式）
+    // 处理纹理块更新（新的bitmap+bitstream格式）
     u8 zone_idx = 0;
     u16 temp_bitmap = detail_zone_bitmap;
     while (temp_bitmap) {
@@ -308,20 +308,84 @@ IWRAM_CODE void decode_p_frame_unified(const u8* src, u16* dst)
             u16 enabled_segments_bitmap = src[0] | (src[1] << 8);
             src += 2; // 跳过启用段bitmap的两个字节
             
-            // 处理启用的小码表段 - 使用位读取器
+            // 处理启用的小码表段 - 新格式
             for (u16 seg_idx = 0; seg_idx < 16; seg_idx++) {
                 if (enabled_segments_bitmap & (1 << seg_idx)) {
                     const YUV_Struct* mini_codebook = unified_codebook + (seg_idx * MINI_CODEBOOK_SIZE);
-                    u8 seg_blocks_to_update = *src++;
                     
-                    // 创建位读取器，传入src指针的地址
+                    u8 num_blocks = *src++;
+                    
+                    // 记录bitmap和位置数据的起始位置
+                    const u8* bitmap_and_indices_ptr = src;
+                    
+                    // 跳过bitmap和位置数据
+                    src += (num_blocks >> 1) * 3;  // 每2个块用3字节
+                    if (num_blocks & 1) {
+                        src += 2;  // 最后一个奇数块用2字节
+                    }
+                    
+                    // 现在src指向bitstream开始位置
                     BitReader reader(&src);
                     
-                    for (u8 i = 0; i < seg_blocks_to_update; i++) {
-                        u8 zone_relative_idx = reader.read8();
+                    // 解码每2个块为一组
+                    const u8* bitmap_ptr = bitmap_and_indices_ptr;
+                    for (u8 i = 0; i < (num_blocks >> 1); i++) {
+                        u8 valid_bitmap = *bitmap_ptr++;
+                        u8 zone_relative_idx1 = *bitmap_ptr++;
+                        u8 zone_relative_idx2 = *bitmap_ptr++;
                         
-                        u16* big_block_dst = zone_dst + zone_block_relative_offsets[zone_relative_idx];
-                        decode_segmented_block_bitreader(mini_codebook, reader, big_block_dst);
+                        // 解码第一个4x4块 - 按bitmap位顺序读取
+                        u16* big_block_dst1 = zone_dst + zone_block_relative_offsets[zone_relative_idx1];
+                        for (u8 sub_idx = 0; sub_idx < 4; sub_idx++) {
+                            if (valid_bitmap & (1 << sub_idx)) {
+                                u8 codebook_idx = reader.read4();
+                                u16* subblock_dst = big_block_dst1;
+                                switch (sub_idx) {
+                                    case 0: /* 左上 */ break;
+                                    case 1: subblock_dst += 2; break; /* 右上 */
+                                    case 2: subblock_dst += SCREEN_WIDTH * 2; break; /* 左下 */
+                                    case 3: subblock_dst += SCREEN_WIDTH * 2 + 2; break; /* 右下 */
+                                }
+                                decode_block(mini_codebook[codebook_idx], subblock_dst, sub_idx);
+                            }
+                        }
+                        
+                        // 解码第二个4x4块 - 按bitmap位顺序读取
+                        u16* big_block_dst2 = zone_dst + zone_block_relative_offsets[zone_relative_idx2];
+                        for (u8 sub_idx = 0; sub_idx < 4; sub_idx++) {
+                            if (valid_bitmap & (1 << (sub_idx + 4))) {
+                                u8 codebook_idx = reader.read4();
+                                u16* subblock_dst = big_block_dst2;
+                                switch (sub_idx) {
+                                    case 0: /* 左上 */ break;
+                                    case 1: subblock_dst += 2; break; /* 右上 */
+                                    case 2: subblock_dst += SCREEN_WIDTH * 2; break; /* 左下 */
+                                    case 3: subblock_dst += SCREEN_WIDTH * 2 + 2; break; /* 右下 */
+                                }
+                                decode_block(mini_codebook[codebook_idx], subblock_dst, sub_idx);
+                            }
+                        }
+                    }
+                    
+                    // 处理最后一个奇数块（如果存在）
+                    if (num_blocks & 1) {
+                        u8 valid_bitmap = *bitmap_ptr++;
+                        u8 zone_relative_idx1 = *bitmap_ptr++;
+                        
+                        u16* big_block_dst1 = zone_dst + zone_block_relative_offsets[zone_relative_idx1];
+                        for (u8 sub_idx = 0; sub_idx < 4; sub_idx++) {
+                            if (valid_bitmap & (1 << sub_idx)) {
+                                u8 codebook_idx = reader.read4();
+                                u16* subblock_dst = big_block_dst1;
+                                switch (sub_idx) {
+                                    case 0: /* 左上 */ break;
+                                    case 1: subblock_dst += 2; break; /* 右上 */
+                                    case 2: subblock_dst += SCREEN_WIDTH * 2; break; /* 左下 */
+                                    case 3: subblock_dst += SCREEN_WIDTH * 2 + 2; break; /* 右下 */
+                                }
+                                decode_block(mini_codebook[codebook_idx], subblock_dst, sub_idx);
+                            }
+                        }
                     }
                     // BitReader析构时会自动更新src指针
                 }
@@ -330,37 +394,165 @@ IWRAM_CODE void decode_p_frame_unified(const u8* src, u16* dst)
             // 读取中码表启用段bitmap
             u8 enabled_medium_segments_bitmap = *src++;
             
-            // 处理启用的中码表段 - 使用位读取器
+            // 处理启用的中码表段 - 新格式（修复逻辑相同）
             for (u8 seg_idx = 0; seg_idx < 4; seg_idx++) {
                 if (enabled_medium_segments_bitmap & (1 << seg_idx)) {
                     const YUV_Struct* medium_codebook = unified_codebook + (seg_idx * MEDIUM_CODEBOOK_SIZE);
-                    u8 seg_blocks_to_update = *src++;
                     
-                    // 创建位读取器，传入src指针的地址
+                    u8 num_blocks = *src++;
+                    
+                    // 记录bitmap和位置数据的起始位置
+                    const u8* bitmap_and_indices_ptr = src;
+                    
+                    // 跳过bitmap和位置数据
+                    src += (num_blocks >> 1) * 3;  // 每2个块用3字节
+                    if (num_blocks & 1) {
+                        src += 2;  // 最后一个奇数块用2字节
+                    }
+                    
+                    // 现在src指向bitstream开始位置
                     BitReader reader(&src);
                     
-                    for (u8 i = 0; i < seg_blocks_to_update; i++) {
-                        u8 zone_relative_idx = reader.read8();
+                    // 解码每2个块为一组 - 按bitmap位顺序读取
+                    const u8* bitmap_ptr = bitmap_and_indices_ptr;
+                    for (u8 i = 0; i < (num_blocks >> 1); i++) {
+                        u8 valid_bitmap = *bitmap_ptr++;
+                        u8 zone_relative_idx1 = *bitmap_ptr++;
+                        u8 zone_relative_idx2 = *bitmap_ptr++;
                         
-                        u16* big_block_dst = zone_dst + zone_block_relative_offsets[zone_relative_idx];
-                        decode_medium_segmented_block_bitreader(medium_codebook, reader, big_block_dst);
+                        // 解码第一个4x4块
+                        u16* big_block_dst1 = zone_dst + zone_block_relative_offsets[zone_relative_idx1];
+                        for (u8 sub_idx = 0; sub_idx < 4; sub_idx++) {
+                            if (valid_bitmap & (1 << sub_idx)) {
+                                u8 codebook_idx = reader.read6();
+                                u16* subblock_dst = big_block_dst1;
+                                switch (sub_idx) {
+                                    case 0: /* 左上 */ break;
+                                    case 1: subblock_dst += 2; break; /* 右上 */
+                                    case 2: subblock_dst += SCREEN_WIDTH * 2; break; /* 左下 */
+                                    case 3: subblock_dst += SCREEN_WIDTH * 2 + 2; break; /* 右下 */
+                                }
+                                decode_block(medium_codebook[codebook_idx], subblock_dst, sub_idx);
+                            }
+                        }
+                        
+                        // 解码第二个4x4块
+                        u16* big_block_dst2 = zone_dst + zone_block_relative_offsets[zone_relative_idx2];
+                        for (u8 sub_idx = 0; sub_idx < 4; sub_idx++) {
+                            if (valid_bitmap & (1 << (sub_idx + 4))) {
+                                u8 codebook_idx = reader.read6();
+                                u16* subblock_dst = big_block_dst2;
+                                switch (sub_idx) {
+                                    case 0: /* 左上 */ break;
+                                    case 1: subblock_dst += 2; break; /* 右上 */
+                                    case 2: subblock_dst += SCREEN_WIDTH * 2; break; /* 左下 */
+                                    case 3: subblock_dst += SCREEN_WIDTH * 2 + 2; break; /* 右下 */
+                                }
+                                decode_block(medium_codebook[codebook_idx], subblock_dst, sub_idx);
+                            }
+                        }
+                    }
+                    
+                    // 处理最后一个奇数块（如果存在）
+                    if (num_blocks & 1) {
+                        u8 valid_bitmap = *bitmap_ptr++;
+                        u8 zone_relative_idx1 = *bitmap_ptr++;
+                        
+                        u16* big_block_dst1 = zone_dst + zone_block_relative_offsets[zone_relative_idx1];
+                        for (u8 sub_idx = 0; sub_idx < 4; sub_idx++) {
+                            if (valid_bitmap & (1 << sub_idx)) {
+                                u8 codebook_idx = reader.read6();
+                                u16* subblock_dst = big_block_dst1;
+                                switch (sub_idx) {
+                                    case 0: /* 左上 */ break;
+                                    case 1: subblock_dst += 2; break; /* 右上 */
+                                    case 2: subblock_dst += SCREEN_WIDTH * 2; break; /* 左下 */
+                                    case 3: subblock_dst += SCREEN_WIDTH * 2 + 2; break; /* 右下 */
+                                }
+                                decode_block(medium_codebook[codebook_idx], subblock_dst, sub_idx);
+                            }
+                        }
                     }
                     // BitReader析构时会自动更新src指针
                 }
             }
             
-            // 处理剩余更新（完整索引）- 保持原有方式
-            u8 remaining_blocks_to_update = *src++;
-            for (u8 i = 0; i < remaining_blocks_to_update; i++) {
-                u8 zone_relative_idx = *src++;
-                u8 quant_indices[4];
-                quant_indices[0] = *src++;
-                quant_indices[1] = *src++;
-                quant_indices[2] = *src++;
-                quant_indices[3] = *src++;
+            // 处理剩余更新（完整索引）- 新格式（修复逻辑相同）
+            u8 num_full_blocks = *src++;
+            if (num_full_blocks > 0) {
+                // 记录bitmap和位置数据的起始位置
+                const u8* bitmap_and_indices_ptr = src;
                 
-                u16* big_block_dst = zone_dst + zone_block_relative_offsets[zone_relative_idx];
-                decode_big_block(unified_codebook, quant_indices, big_block_dst);
+                // 跳过bitmap和位置数据
+                src += (num_full_blocks >> 1) * 3;  // 每2个块用3字节
+                if (num_full_blocks & 1) {
+                    src += 2;  // 最后一个奇数块用2字节
+                }
+                
+                // 现在src指向bitstream开始位置
+                BitReader reader(&src);
+                
+                // 解码每2个块为一组 - 按bitmap位顺序读取
+                const u8* bitmap_ptr = bitmap_and_indices_ptr;
+                for (u8 i = 0; i < (num_full_blocks >> 1); i++) {
+                    u8 valid_bitmap = *bitmap_ptr++;
+                    u8 zone_relative_idx1 = *bitmap_ptr++;
+                    u8 zone_relative_idx2 = *bitmap_ptr++;
+                    
+                    // 解码第一个4x4块
+                    u16* big_block_dst1 = zone_dst + zone_block_relative_offsets[zone_relative_idx1];
+                    for (u8 sub_idx = 0; sub_idx < 4; sub_idx++) {
+                        if (valid_bitmap & (1 << sub_idx)) {
+                            u8 codebook_idx = reader.read8();
+                            u16* subblock_dst = big_block_dst1;
+                            switch (sub_idx) {
+                                case 0: /* 左上 */ break;
+                                case 1: subblock_dst += 2; break; /* 右上 */
+                                case 2: subblock_dst += SCREEN_WIDTH * 2; break; /* 左下 */
+                                case 3: subblock_dst += SCREEN_WIDTH * 2 + 2; break; /* 右下 */
+                            }
+                            decode_block(unified_codebook[codebook_idx], subblock_dst, sub_idx);
+                        }
+                    }
+                    
+                    // 解码第二个4x4块
+                    u16* big_block_dst2 = zone_dst + zone_block_relative_offsets[zone_relative_idx2];
+                    for (u8 sub_idx = 0; sub_idx < 4; sub_idx++) {
+                        if (valid_bitmap & (1 << (sub_idx + 4))) {
+                            u8 codebook_idx = reader.read8();
+                            u16* subblock_dst = big_block_dst2;
+                            switch (sub_idx) {
+                                case 0: /* 左上 */ break;
+                                case 1: subblock_dst += 2; break; /* 右上 */
+                                case 2: subblock_dst += SCREEN_WIDTH * 2; break; /* 左下 */
+                                case 3: subblock_dst += SCREEN_WIDTH * 2 + 2; break; /* 右下 */
+                            }
+                            decode_block(unified_codebook[codebook_idx], subblock_dst, sub_idx);
+                        }
+                    }
+                }
+                
+                // 处理最后一个奇数块（如果存在）
+                if (num_full_blocks & 1) {
+                    u8 valid_bitmap = *bitmap_ptr++;
+                    u8 zone_relative_idx1 = *bitmap_ptr++;
+                    
+                    u16* big_block_dst1 = zone_dst + zone_block_relative_offsets[zone_relative_idx1];
+                    for (u8 sub_idx = 0; sub_idx < 4; sub_idx++) {
+                        if (valid_bitmap & (1 << sub_idx)) {
+                            u8 codebook_idx = reader.read8();
+                            u16* subblock_dst = big_block_dst1;
+                            switch (sub_idx) {
+                                case 0: /* 左上 */ break;
+                                case 1: subblock_dst += 2; break; /* 右上 */
+                                case 2: subblock_dst += SCREEN_WIDTH * 2; break; /* 左下 */
+                                case 3: subblock_dst += SCREEN_WIDTH * 2 + 2; break; /* 右下 */
+                            }
+                            decode_block(unified_codebook[codebook_idx], subblock_dst, sub_idx);
+                        }
+                    }
+                }
+                // BitReader析构时会自动更新src指针
             }
         }
         temp_bitmap >>= 1;
