@@ -307,10 +307,11 @@ IWRAM_CODE void decode_p_frame_unified(const u8* src, u16* dst)
             u16* zone_dst = dst + zone_base_offset;
             
             // 读取小码表启用段bitmap
-            u8 enabled_segments_bitmap = *src++;
+            u16 enabled_segments_bitmap = src[0] | (src[1] << 8);
+            src += 2; // 跳过启用段bitmap的两个字节
             
-            // 处理启用的小码表段
-            for (u8 seg_idx = 0; seg_idx < 8; seg_idx++) {
+            // 处理启用的小码表段 - 从8个修改为16个
+            for (u16 seg_idx = 0; seg_idx < 16; seg_idx++) {
                 if (enabled_segments_bitmap & (1 << seg_idx)) {
                     const YUV_Struct* mini_codebook = unified_codebook + (seg_idx * MINI_CODEBOOK_SIZE);
                     u8 seg_blocks_to_update = *src++;

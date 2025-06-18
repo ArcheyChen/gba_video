@@ -29,7 +29,7 @@ ZONE_HEIGHT_BIG_BLOCKS = ZONE_HEIGHT_PIXELS // (BLOCK_H * 2)  # 每个区域的4
 
 MINI_CODEBOOK_SIZE = 15  # 每个分段码本的大小
 MEDIUM_CODEBOOK_SIZE = 63  # 每个中等码本的大小
-DEFAULT_ENABLED_SEGMENTS_BITMAP = 0xFF  # 默认启用前8段的bitmap (11111111)
+DEFAULT_ENABLED_SEGMENTS_BITMAP = 0xFFFF  # 默认启用前16段的bitmap (1111111111111111)
 DEFAULT_ENABLED_MEDIUM_SEGMENTS_BITMAP = 0x0F  # 默认启用前4个中码表段的bitmap (00001111)
 SKIP_MARKER_4BIT = 0xF   # 4bit跳过标记
 SKIP_MARKER_6BIT = 0x3F  # 6bit跳过标记（63）
@@ -499,6 +499,10 @@ def encode_p_frame_unified(current_blocks: np.ndarray, prev_blocks: np.ndarray,
                           enabled_segments_bitmap: int = DEFAULT_ENABLED_SEGMENTS_BITMAP,
                           enabled_medium_segments_bitmap: int = DEFAULT_ENABLED_MEDIUM_SEGMENTS_BITMAP) -> tuple:
     """差分编码P帧（统一码本，三级分段编码）- 小码表→中码表→大码表"""
+    # 将bitmap参数转换为np.uint16类型
+    enabled_segments_bitmap = np.uint16(enabled_segments_bitmap)
+    enabled_medium_segments_bitmap = np.uint8(enabled_medium_segments_bitmap)
+    
     if prev_blocks is None or current_blocks.shape != prev_blocks.shape:
         i_frame_data = encode_i_frame_unified(current_blocks, unified_codebook, block_types)
         return i_frame_data, True, 0, 0, 0, 0, 0, 0, 0, 0, 0, set(), set(), [], [], []
@@ -522,8 +526,9 @@ def encode_p_frame_unified(current_blocks: np.ndarray, prev_blocks: np.ndarray,
     
     # 获取启用的段索引列表
     enabled_segments = []
-    for seg_idx in range(8):  # 最多8段
-        if enabled_segments_bitmap & (1 << seg_idx):
+    for seg_idx in range(16):  # 最多16段
+        # 使用np.uint16确保位运算安全
+        if enabled_segments_bitmap & (np.uint16(1) << np.uint16(seg_idx)):
             enabled_segments.append(seg_idx)
     
     # 计算最大启用段索引
@@ -626,7 +631,8 @@ def encode_p_frame_unified(current_blocks: np.ndarray, prev_blocks: np.ndarray,
                     for i, (seg_idx, within_idx) in enumerate(zip(small_segment_indices, small_within_indices)):
                         if within_idx != SKIP_MARKER_4BIT:
                             has_updates = True
-                            if seg_idx >= 8 or not (enabled_segments_bitmap & (1 << seg_idx)):
+                            # 使用np.uint16确保位运算安全
+                            if seg_idx >= 16 or not (enabled_segments_bitmap & (np.uint16(1) << np.uint16(seg_idx))):
                                 can_use_small_codebook = False
                                 break
                             small_used_segments.add(seg_idx)
@@ -641,7 +647,8 @@ def encode_p_frame_unified(current_blocks: np.ndarray, prev_blocks: np.ndarray,
                         can_use_medium_codebook = True
                         for i, (seg_idx, within_idx) in enumerate(zip(medium_segment_indices, medium_within_indices)):
                             if within_idx != SKIP_MARKER_6BIT:
-                                if seg_idx >= 4 or not (enabled_medium_segments_bitmap & (1 << seg_idx)):
+                                # 使用np.uint8确保位运算安全
+                                if seg_idx >= 4 or not (enabled_medium_segments_bitmap & (np.uint8(1) << np.uint8(seg_idx))):
                                     can_use_medium_codebook = False
                                     break
                                 medium_used_segments.add(seg_idx)
@@ -731,7 +738,7 @@ def encode_p_frame_unified(current_blocks: np.ndarray, prev_blocks: np.ndarray,
             detail_updates = zone_detail_updates[zone_idx]
             
             # 分离三种编码模式
-            small_codebook_updates = [[] for _ in range(8)]
+            small_codebook_updates = [[] for _ in range(16)]  # 修改为16
             medium_codebook_updates = [[] for _ in range(4)]
             full_index_updates = []
             
@@ -761,23 +768,26 @@ def encode_p_frame_unified(current_blocks: np.ndarray, prev_blocks: np.ndarray,
                     full_index_updates.append((zone_relative_idx, full_indices))
             
             # 计算实际有数据的小码表段
-            actual_enabled_segments_bitmap = 0
-            for seg_idx in range(8):
-                if (enabled_segments_bitmap & (1 << seg_idx)) and len(small_codebook_updates[seg_idx]) > 0:
-                    actual_enabled_segments_bitmap |= (1 << seg_idx)
+            actual_enabled_segments_bitmap = np.uint16(0)
+            for seg_idx in range(16):
+                # 使用np.uint16确保位运算安全
+                if (enabled_segments_bitmap & (np.uint16(1) << np.uint16(seg_idx))) and len(small_codebook_updates[seg_idx]) > 0:
+                    actual_enabled_segments_bitmap |= (np.uint16(1) << np.uint16(seg_idx))
             
             # 计算实际有数据的中码表段
-            actual_enabled_medium_segments_bitmap = 0
+            actual_enabled_medium_segments_bitmap = np.uint8(0)
             for seg_idx in range(4):
-                if (enabled_medium_segments_bitmap & (1 << seg_idx)) and len(medium_codebook_updates[seg_idx]) > 0:
-                    actual_enabled_medium_segments_bitmap |= (1 << seg_idx)
+                # 使用np.uint8确保位运算安全
+                if (enabled_medium_segments_bitmap & (np.uint8(1) << np.uint8(seg_idx))) and len(medium_codebook_updates[seg_idx]) > 0:
+                    actual_enabled_medium_segments_bitmap |= (np.uint8(1) << np.uint8(seg_idx))
             
-            # 写入小码表启用bitmap
-            data.append(actual_enabled_segments_bitmap)
+            # 写入小码表启用bitmap（使用u16而非u8）
+            data.extend(struct.pack('<H', actual_enabled_segments_bitmap))
             
             # 处理小码表编码段
-            for seg_idx in range(8):
-                if actual_enabled_segments_bitmap & (1 << seg_idx):
+            for seg_idx in range(16):
+                # 使用np.uint16确保位运算安全
+                if actual_enabled_segments_bitmap & (np.uint16(1) << np.uint16(seg_idx)):
                     seg_updates = small_codebook_updates[seg_idx]
                     small_updates += len(seg_updates)
                     # 修复：基于每次更新统计段使用，而不是基于每个区域
