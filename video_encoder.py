@@ -387,7 +387,7 @@ def main():
                                 else:
                                     new_indices.append(old_idx)
                             bt[(big_by, big_bx)] = (block_type, new_indices)
-        else:
+        # else:
             # print(f"  GOP {gop_start}: 所有码本项使用频次相同或总使用次数为0，跳过排序")
     
     # 编码所有帧
