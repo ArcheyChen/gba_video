@@ -355,8 +355,8 @@ def main():
             
             # 显示排序前的前10个最常用项
             top_indices_before = _np.argsort(-counts)[:10]
-            print(f"    排序前前10个最常用项: {top_indices_before.tolist()}")
-            print(f"    对应使用频次: {counts[top_indices_before].tolist()}")
+            # print(f"    排序前前10个最常用项: {top_indices_before.tolist()}")
+            # print(f"    对应使用频次: {counts[top_indices_before].tolist()}")
             
             # 根据 counts 降序排序，stable 保持相同频次项原序
             order = _np.argsort(-counts, kind='stable')
@@ -368,11 +368,11 @@ def main():
                 index_mapping[old_idx] = new_idx
             
             # 显示排序后的前10个项（应该对应原来的最常用项）
-            print(f"    排序后前10个项对应原索引: {order[:10].tolist()}")
+            # print(f"    排序后前10个项对应原索引: {order[:10].tolist()}")
             
-            # 验证排序效果：检查排序后前几个索引的使用情况
-            print(f"    排序后前15个索引的使用频次: {counts[order[:15]].tolist()}")
-            print(f"    排序后前15个索引的段分布: {[i//15 for i in range(15)]}")
+            # # 验证排序效果：检查排序后前几个索引的使用情况
+            # print(f"    排序后前15个索引的使用频次: {counts[order[:15]].tolist()}")
+            # print(f"    排序后前15个索引的段分布: {[i//15 for i in range(15)]}")
             
             # 更新 block_types 中的索引
             for fid, bt in gop_data['block_types_list']:
@@ -388,7 +388,7 @@ def main():
                                     new_indices.append(old_idx)
                             bt[(big_by, big_bx)] = (block_type, new_indices)
         else:
-            print(f"  GOP {gop_start}: 所有码本项使用频次相同或总使用次数为0，跳过排序")
+            # print(f"  GOP {gop_start}: 所有码本项使用频次相同或总使用次数为0，跳过排序")
     
     # 编码所有帧
     print("正在编码帧...")
