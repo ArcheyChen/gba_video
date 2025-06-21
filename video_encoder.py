@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import pathlib
 
 from video_encoder_core import VideoEncoderCore
 from video_encoder_utils import extract_frames_from_video
@@ -34,12 +35,37 @@ def main():
                    help=f"启用中码表段的bitmap，每位表示对应段是否启用中码表模式（默认0x{DEFAULT_ENABLED_MEDIUM_SEGMENTS_BITMAP:02X}）")
     pa.add_argument("--no-parallel", action="store_true",
                    help="禁用并行处理，使用串行模式")
+    pa.add_argument("--audio-sample-rate", type=int, default=16000,
+                   help="音频采样率（默认16000 Hz）")
+    pa.add_argument("--no-audio", action="store_true",
+                   help="禁用音频提取")
     args = pa.parse_args()
 
     # 提取帧
     frames, actual_output_fps = extract_frames_from_video(
         args.input, args.duration, args.fps, args.full_duration, args.dither
     )
+
+    # 音频处理
+    audio_data = None
+    if not args.no_audio:
+        from audio_encoder import AudioEncoder
+        audio_encoder = AudioEncoder(sample_rate=args.audio_sample_rate)
+        
+        # 计算实际音频时长
+        if args.full_duration:
+            import cv2
+            cap = cv2.VideoCapture(args.input)
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            src_fps = cap.get(cv2.CAP_PROP_FPS) or 30
+            audio_duration = total_frames / src_fps
+            cap.release()
+        else:
+            audio_duration = args.duration
+        
+        audio_data = audio_encoder.extract_audio_from_video(args.input, audio_duration)
+        if audio_data is None:
+            print("⚠️ 音频提取失败，继续处理视频...")
 
     # 创建编码器核心
     encoder = VideoEncoderCore()
@@ -60,6 +86,16 @@ def main():
         enabled_medium_segments_bitmap=args.enabled_medium_segments_bitmap,
         use_parallel=not args.no_parallel
     )
+    
+    # 生成音频文件
+    if audio_data is not None:
+        output_base = pathlib.Path(args.out)
+        audio_header_path = output_base.parent / f"audio_data.h"
+        audio_source_path = output_base.parent / f"audio_data.c"
+        
+        audio_encoder.write_audio_header(audio_header_path, audio_data, audio_duration)
+        audio_encoder.write_audio_source(audio_source_path, audio_data)
+        print(f"✓ 已生成音频文件: {audio_header_path.name} / {audio_source_path.name}")
 
 if __name__ == "__main__":
     main()

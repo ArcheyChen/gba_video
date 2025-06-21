@@ -6,10 +6,10 @@
 // 视频渲染器类
 class VideoRenderer {
 private:
-    // EWRAM 单缓冲
-    static u16 ewramBuffer[SCREEN_WIDTH * SCREEN_HEIGHT];
     
 public:
+    // EWRAM 单缓冲
+    static u16 ewramBuffer[SCREEN_WIDTH * SCREEN_HEIGHT];
     // 初始化函数
     static void init();
     

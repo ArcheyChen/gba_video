@@ -21,9 +21,6 @@ void VideoRenderer::init() {
 void VideoRenderer::render_frame(const u8* frame_data) {
     // 解码帧到缓冲区
     VideoDecoder::decode_frame(frame_data, ewramBuffer);
-    
-    // 拷贝到VRAM
-    DMA3COPY(ewramBuffer, VRAM, (SCREEN_WIDTH * SCREEN_HEIGHT >> 1) | DMA32);
 }
 
 void VideoRenderer::clear_buffer() {

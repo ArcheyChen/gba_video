@@ -60,13 +60,13 @@ IWRAM_CODE inline u32 yuv_to_rgb555_2pix(u8 _y0, u8 _y1, s8 d_r, s8 d_g, s8 d_b,
 {
     s8 y0 = _y0 + bayer_bias[0];
     s8 y1 = _y1 + bayer_bias[1];
-    u32 result = VideoDecoder::clip_lookup_table[y0 + d_r + 128];
-    result |= (VideoDecoder::clip_lookup_table[y0 + d_g + 128] << 5);
-    result |= (VideoDecoder::clip_lookup_table[y0 + d_b + 128] << 10);
-
-    result |= (VideoDecoder::clip_lookup_table[y1 + d_r + 128] << 16);
-    result |= (VideoDecoder::clip_lookup_table[y1 + d_g + 128] << 21);
-    result |= (VideoDecoder::clip_lookup_table[y1 + d_b + 128] << 26);
+    auto lookup_table = VideoDecoder::clip_lookup_table + 128;
+    u32 result = lookup_table[y0 + d_r];
+    result |= (lookup_table[y0 + d_g] << 5);
+    result |= (lookup_table[y0 + d_b] << 10);
+    result |= (lookup_table[y1 + d_r] << 16);
+    result |= (lookup_table[y1 + d_g] << 21);
+    result |= (lookup_table[y1 + d_b] << 26);
     
     return result;
 }
