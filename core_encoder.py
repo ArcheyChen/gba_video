@@ -121,6 +121,23 @@ def calculate_2x2_block_variance(block: np.ndarray) -> float:
     y_values = block[:4].astype(np.float64)
     return calculate_block_variance_numba(y_values)
 
+def calculate_color_block_distance(color_block: np.ndarray, codebook_entry: np.ndarray) -> float:
+    """计算色块与码本项的距离"""
+    # 将色度分量转换为有符号值进行比较
+    color_block_float = color_block.astype(np.float32)
+    codebook_float = codebook_entry.astype(np.float32)
+    
+    # 色度分量需要转换为有符号值
+    for i in range(4, BYTES_PER_BLOCK):
+        color_block_float[i] = color_block[i].view(np.int8).astype(np.float32)
+        codebook_float[i] = codebook_entry[i].view(np.int8).astype(np.float32)
+    
+    # 计算欧几里得距离
+    diff = color_block_float - codebook_float
+    distance = np.sqrt(np.sum(diff * diff))
+    
+    return distance
+
 def classify_4x4_blocks_unified(blocks: np.ndarray, variance_threshold: float = 5.0) -> tuple:
     """将4x4块分类为大色块和纹理块，用于统一码本"""
     blocks_h, blocks_w = blocks.shape[:2]
@@ -432,7 +449,7 @@ def convert_codebook_from_clustering(codebook_float: np.ndarray) -> np.ndarray:
     return codebook
 
 def encode_i_frame_unified(blocks: np.ndarray, unified_codebook: np.ndarray, 
-                          block_types: dict) -> bytes:
+                          block_types: dict, color_fallback_threshold: float = 50.0) -> bytes:
     """编码I帧（统一码本）"""
     data = bytearray()
     data.append(FRAME_TYPE_I)
@@ -465,9 +482,7 @@ def encode_i_frame_unified(blocks: np.ndarray, unified_codebook: np.ndarray,
                     block_type, block_indices = block_types[(big_by, big_bx)]
                     
                     if block_type == 'color':
-                        # 色块：标记0xFF + 1个码本索引
-                        data.append(COLOR_BLOCK_MARKER)
-                        
+                        # 色块：先尝试色块编码，如果距离过大则回退到纹理块
                         # 从原始blocks重建平均块
                         blocks_4x4 = []
                         for sub_by in range(2):
@@ -482,8 +497,28 @@ def encode_i_frame_unified(blocks: np.ndarray, unified_codebook: np.ndarray,
                             avg_val = np.mean([b[i].view(np.int8) for b in blocks_4x4])
                             avg_block[i] = np.clip(avg_val, -128, 127).astype(np.int8).view(np.uint8)
                         
+                        # 计算色块与最佳码本项的距离
                         unified_idx = quantize_blocks_unified(avg_block.reshape(1, -1), unified_codebook)[0]
-                        data.append(unified_idx)
+                        best_codebook_entry = unified_codebook[unified_idx]
+                        color_distance = calculate_color_block_distance(avg_block, best_codebook_entry)
+                        
+                        # 如果距离过大（阈值设为50），回退到纹理块模式
+                        if color_distance > color_fallback_threshold:
+                            # 回退到纹理块：4个码本索引
+                            for sub_by in range(2):
+                                for sub_bx in range(2):
+                                    by = big_by * 2 + sub_by
+                                    bx = big_bx * 2 + sub_bx
+                                    if by < blocks_h and bx < blocks_w:
+                                        block = blocks[by, bx]
+                                        unified_idx = quantize_blocks_unified(block.reshape(1, -1), unified_codebook)[0]
+                                        data.append(unified_idx)
+                                    else:
+                                        data.append(0)
+                        else:
+                            # 色块编码：标记0xFF + 1个码本索引
+                            data.append(COLOR_BLOCK_MARKER)
+                            data.append(unified_idx)
                     else:
                         # 纹理块：4个码本索引
                         for sub_by in range(2):
@@ -503,7 +538,8 @@ def encode_p_frame_unified(current_blocks: np.ndarray, prev_blocks: np.ndarray,
                           unified_codebook: np.ndarray, block_types: dict,
                           diff_threshold: float, force_i_threshold: float = 0.7,
                           enabled_segments_bitmap: int = DEFAULT_ENABLED_SEGMENTS_BITMAP,
-                          enabled_medium_segments_bitmap: int = DEFAULT_ENABLED_MEDIUM_SEGMENTS_BITMAP) -> tuple:
+                          enabled_medium_segments_bitmap: int = DEFAULT_ENABLED_MEDIUM_SEGMENTS_BITMAP,
+                          color_fallback_threshold: float = 50.0) -> tuple:
     """差分编码P帧（统一码本，三级分段编码）- 新的bitmap+bitstream格式"""
     # 将bitmap参数转换为np.uint16类型
     enabled_segments_bitmap = np.uint16(enabled_segments_bitmap)
@@ -596,8 +632,61 @@ def encode_p_frame_unified(current_blocks: np.ndarray, prev_blocks: np.ndarray,
                         avg_val = np.mean([b[i].view(np.int8) for b in blocks_4x4])
                         avg_block[i] = np.clip(avg_val, -128, 127).astype(np.int8).view(np.uint8)
                     
+                    # 计算色块与最佳码本项的距离
                     color_idx = quantize_blocks_unified(avg_block.reshape(1, -1), unified_codebook)[0]
-                    zone_color_updates[zone_idx].append((zone_relative_idx, color_idx))
+                    best_codebook_entry = unified_codebook[color_idx]
+                    color_distance = calculate_color_block_distance(avg_block, best_codebook_entry)
+                    
+                    # 如果距离过大（阈值设为50），回退到纹理块模式
+                    if color_distance > color_fallback_threshold:
+                        # 回退到纹理块：收集更新信息
+                        update_info = {
+                            'zone_relative_idx': zone_relative_idx,
+                            'subblock_needs_update': subblock_needs_update,
+                            'positions': positions
+                        }
+                        
+                        # 计算所有子块的编码信息
+                        small_segment_indices = []
+                        small_within_indices = []
+                        medium_segment_indices = []
+                        medium_within_indices = []
+                        full_indices = []
+                        
+                        for i, (by, bx) in enumerate(positions):
+                            if by < blocks_h and bx < blocks_w:
+                                block = current_blocks[by, bx]
+                                # 小码表编码
+                                small_seg_idx, small_within_idx = quantize_blocks_unified_segmented(block.reshape(1, -1), unified_codebook)
+                                small_segment_indices.append(small_seg_idx[0])
+                                small_within_indices.append(small_within_idx[0])
+                                # 中码表编码
+                                medium_seg_idx, medium_within_idx = quantize_blocks_unified_medium(block.reshape(1, -1), unified_codebook)
+                                medium_segment_indices.append(medium_seg_idx[0])
+                                medium_within_indices.append(medium_within_idx[0])
+                                # 完整索引
+                                full_idx = quantize_blocks_unified(block.reshape(1, -1), unified_codebook)[0]
+                                full_indices.append(full_idx)
+                            else:
+                                # 无效位置
+                                small_segment_indices.append(0)
+                                small_within_indices.append(0)
+                                medium_segment_indices.append(0)
+                                medium_within_indices.append(0)
+                                full_indices.append(0)
+                        
+                        update_info.update({
+                            'small_segment_indices': small_segment_indices,
+                            'small_within_indices': small_within_indices,
+                            'medium_segment_indices': medium_segment_indices,
+                            'medium_within_indices': medium_within_indices,
+                            'full_indices': full_indices
+                        })
+                        
+                        zone_detail_updates[zone_idx].append(update_info)
+                    else:
+                        # 色块编码：添加到色块更新列表
+                        zone_color_updates[zone_idx].append((zone_relative_idx, color_idx))
                 else:
                     # 纹理块更新：收集更新信息
                     update_info = {

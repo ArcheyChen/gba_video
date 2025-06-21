@@ -112,7 +112,7 @@ class SimpleStats:
 
 def encode_frame_chunk_worker(args):
     """帧编码chunk的worker函数"""
-    start_idx, end_idx, frames_chunk, gop_codebooks_chunk, i_frame_interval, diff_threshold, force_i_threshold, enabled_segments_bitmap, enabled_medium_segments_bitmap, codebook_size = args
+    start_idx, end_idx, frames_chunk, gop_codebooks_chunk, i_frame_interval, diff_threshold, force_i_threshold, enabled_segments_bitmap, enabled_medium_segments_bitmap, codebook_size, color_fallback_threshold = args
     
     encoded_frames = []
     frame_offsets = []
@@ -158,7 +158,7 @@ def encode_frame_chunk_worker(args):
         
         if force_i_frame or prev_frame is None:
             frame_data = encode_i_frame_unified(
-                current_frame, unified_codebook, block_types
+                current_frame, unified_codebook, block_types, color_fallback_threshold
             )
             is_i_frame = True
             
@@ -181,7 +181,7 @@ def encode_frame_chunk_worker(args):
                 current_frame, prev_frame,
                 unified_codebook, block_types,
                 diff_threshold, force_i_threshold, enabled_segments_bitmap,
-                enabled_medium_segments_bitmap
+                enabled_medium_segments_bitmap, color_fallback_threshold
             )
             
             if is_i_frame:
@@ -247,7 +247,7 @@ class VideoEncoderCore:
         self.encoding_stats = EncodingStats()
     
     def encode_video(self, frames, output_path, i_frame_interval=60, diff_threshold=2.0, 
-                    force_i_threshold=0.7, variance_threshold=5.0, codebook_size=256,
+                    force_i_threshold=0.7, variance_threshold=5.0, color_fallback_threshold=50.0, codebook_size=256,
                     kmeans_max_iter=200, i_frame_weight=3, max_workers=None,
                     enabled_segments_bitmap=0xFFFF, enabled_medium_segments_bitmap=0x0F,
                     use_parallel=True):
@@ -282,7 +282,7 @@ class VideoEncoderCore:
                 print("正在编码帧...")
                 encoded_frames, frame_offsets = self._parallel_encode_frames(
                     frames, sorted_gop_codebooks, i_frame_interval, diff_threshold, force_i_threshold,
-                    enabled_segments_bitmap, enabled_medium_segments_bitmap, codebook_size, max_workers
+                    enabled_segments_bitmap, enabled_medium_segments_bitmap, codebook_size, color_fallback_threshold, max_workers
                 )
                 
                 end_time = time.time()
@@ -305,7 +305,7 @@ class VideoEncoderCore:
             print("正在编码帧...")
             encoded_frames, frame_offsets = self._encode_all_frames(
                 frames, gop_codebooks, i_frame_interval, diff_threshold, force_i_threshold,
-                enabled_segments_bitmap, enabled_medium_segments_bitmap, codebook_size
+                enabled_segments_bitmap, enabled_medium_segments_bitmap, codebook_size, color_fallback_threshold
             )
             
             end_time = time.time()
@@ -355,7 +355,7 @@ class VideoEncoderCore:
         return sorted_gop_codebooks
     
     def _parallel_encode_frames(self, frames, gop_codebooks, i_frame_interval, diff_threshold, 
-                               force_i_threshold, enabled_segments_bitmap, enabled_medium_segments_bitmap, codebook_size, max_workers):
+                               force_i_threshold, enabled_segments_bitmap, enabled_medium_segments_bitmap, codebook_size, color_fallback_threshold, max_workers):
         """并行帧编码"""
         # 优化分块策略：按GOP分组，减少通信开销
         num_frames = len(frames)
@@ -381,7 +381,7 @@ class VideoEncoderCore:
                 
                 chunk_data = (start_frame, end_frame, frames_chunk, gop_codebooks_chunk, i_frame_interval, 
                             diff_threshold, force_i_threshold, enabled_segments_bitmap, 
-                            enabled_medium_segments_bitmap, codebook_size)
+                            enabled_medium_segments_bitmap, codebook_size, color_fallback_threshold)
                 chunk_data_list.append(chunk_data)
         else:
             # 如果GOP数量很多，按帧数分组，但确保每个分块包含完整的GOP
@@ -406,7 +406,7 @@ class VideoEncoderCore:
                 
                 chunk_data = (i, end_frame, frames_chunk, gop_codebooks_chunk, i_frame_interval, 
                             diff_threshold, force_i_threshold, enabled_segments_bitmap, 
-                            enabled_medium_segments_bitmap, codebook_size)
+                            enabled_medium_segments_bitmap, codebook_size, color_fallback_threshold)
                 chunk_data_list.append(chunk_data)
         
         print(f"  并行编码：{len(chunk_data_list)}个分块，每个分块约{len(frames) // len(chunk_data_list)}帧")
@@ -536,7 +536,7 @@ class VideoEncoderCore:
                                 bt[(big_by, big_bx)] = (block_type, new_indices)
     
     def _encode_all_frames(self, frames, gop_codebooks, i_frame_interval, diff_threshold, 
-                          force_i_threshold, enabled_segments_bitmap, enabled_medium_segments_bitmap, codebook_size):
+                          force_i_threshold, enabled_segments_bitmap, enabled_medium_segments_bitmap, codebook_size, color_fallback_threshold):
         """编码所有帧（原始串行版本）"""
         encoded_frames = []
         frame_offsets = []
@@ -569,7 +569,7 @@ class VideoEncoderCore:
             
             if force_i_frame or prev_frame is None:
                 frame_data = encode_i_frame_unified(
-                    current_frame, unified_codebook, block_types
+                    current_frame, unified_codebook, block_types, color_fallback_threshold
                 )
                 is_i_frame = True
                 
@@ -588,7 +588,7 @@ class VideoEncoderCore:
                     current_frame, prev_frame,
                     unified_codebook, block_types,
                     diff_threshold, force_i_threshold, enabled_segments_bitmap,
-                    enabled_medium_segments_bitmap
+                    enabled_medium_segments_bitmap, color_fallback_threshold
                 )
                 
                 if is_i_frame:
