@@ -14,12 +14,6 @@ bool VideoDecoder::code_book_preloaded = false;
 
 // 查找表定义
 u8 VideoDecoder::clip_lookup_table[512];
-s8 VideoDecoder::bayer_bias_4_2x2[4][4] = {
-    {-2, 0, 1, -1},
-    {-1, 0, 1, 0},
-    {0, -1, 0,1},
-    {0, -1, 1, -2}
-};
 u16 VideoDecoder::big_block_relative_offsets[240/4*160/4];
 u16 VideoDecoder::zone_block_relative_offsets[240];
 
@@ -56,23 +50,21 @@ void VideoDecoder::init() {
     }
 }
 
-IWRAM_CODE inline u32 yuv_to_rgb555_2pix(u8 _y0, u8 _y1, s8 d_r, s8 d_g, s8 d_b, const s8* bayer_bias)
+IWRAM_CODE inline u32 yuv_to_rgb555_2pix(u8 _y0, u8 _y1, s8 d_r, s8 d_g, s8 d_b)
 {
-    s8 y0 = _y0 + bayer_bias[0];
-    s8 y1 = _y1 + bayer_bias[1];
     auto lookup_table = VideoDecoder::clip_lookup_table + 128;
-    u32 result = lookup_table[y0 + d_r];
-    result |= (lookup_table[y0 + d_g] << 5);
-    result |= (lookup_table[y0 + d_b] << 10);
-    result |= (lookup_table[y1 + d_r] << 16);
-    result |= (lookup_table[y1 + d_g] << 21);
-    result |= (lookup_table[y1 + d_b] << 26);
+    u32 result = lookup_table[_y0 + d_r];
+    result |= (lookup_table[_y0 + d_g] << 5);
+    result |= (lookup_table[_y0 + d_b] << 10);
+    result |= (lookup_table[_y1 + d_r] << 16);
+    result |= (lookup_table[_y1 + d_g] << 21);
+    result |= (lookup_table[_y1 + d_b] << 26);
     
     return result;
 }
 
 // 解码单个2x2块
-IWRAM_CODE void VideoDecoder::decode_block(const YUV_Struct &yuv_data, u16* dst, u8 bayer_idx)
+IWRAM_CODE void VideoDecoder::decode_block(const YUV_Struct &yuv_data, u16* dst)
 {
     const s8 &d_r = yuv_data.d_r;
     const s8 &d_g = yuv_data.d_g;
@@ -81,9 +73,9 @@ IWRAM_CODE void VideoDecoder::decode_block(const YUV_Struct &yuv_data, u16* dst,
     u32* dst_row = (u32*)dst;
     auto const &y = yuv_data.y;
     *dst_row = yuv_to_rgb555_2pix(
-        y[0][0],y[0][1], d_r, d_g, d_b, bayer_bias_4_2x2[bayer_idx]);
+        y[0][0],y[0][1], d_r, d_g, d_b);
     *(dst_row + SCREEN_WIDTH/2) = yuv_to_rgb555_2pix(
-        y[1][0],y[1][1], d_r, d_g, d_b,bayer_bias_4_2x2[bayer_idx]+2);
+        y[1][0],y[1][1], d_r, d_g, d_b);
 }
 
 // 解码色块（2x2上采样到4x4）
@@ -97,41 +89,35 @@ IWRAM_CODE void VideoDecoder::decode_color_block(const YUV_Struct &yuv_data, u16
     u32* dst_row = (u32*)dst;
     
     // 第一行：1122
-    *dst_row = yuv_to_rgb555_2pix(y[0][0],y[0][0], d_r, d_g, d_b,bayer_bias_4_2x2[0]);;
-    *(dst_row + 1) = yuv_to_rgb555_2pix(y[0][1],y[0][1], d_r, d_g, d_b,bayer_bias_4_2x2[1]);
+    *dst_row = yuv_to_rgb555_2pix(y[0][0],y[0][0], d_r, d_g, d_b);
+    *(dst_row + 1) = yuv_to_rgb555_2pix(y[0][1],y[0][1], d_r, d_g, d_b);
     
     // 第二行：1122
     dst_row += SCREEN_WIDTH/2;
-    *dst_row = yuv_to_rgb555_2pix(y[0][0],y[0][0], d_r, d_g, d_b,bayer_bias_4_2x2[2]);;
-    *(dst_row + 1) = yuv_to_rgb555_2pix(y[0][1],y[0][1], d_r, d_g, d_b,bayer_bias_4_2x2[3]);
+    *dst_row = yuv_to_rgb555_2pix(y[0][0],y[0][0], d_r, d_g, d_b);
+    *(dst_row + 1) = yuv_to_rgb555_2pix(y[0][1],y[0][1], d_r, d_g, d_b);
     
     // 第三行：3344
     dst_row += SCREEN_WIDTH/2;
-    *dst_row = yuv_to_rgb555_2pix(y[1][0],y[1][0], d_r, d_g, d_b,bayer_bias_4_2x2[0]);
-    *(dst_row + 1) = yuv_to_rgb555_2pix(y[1][1],y[1][1], d_r, d_g, d_b,bayer_bias_4_2x2[1]);
+    *dst_row = yuv_to_rgb555_2pix(y[1][0],y[1][0], d_r, d_g, d_b);
+    *(dst_row + 1) = yuv_to_rgb555_2pix(y[1][1],y[1][1], d_r, d_g, d_b);
     
     // 第四行：3344
     dst_row += SCREEN_WIDTH/2;
-    *dst_row = yuv_to_rgb555_2pix(y[1][0],y[1][0], d_r, d_g, d_b,bayer_bias_4_2x2[2]);
-    *(dst_row + 1) = yuv_to_rgb555_2pix(y[1][1],y[1][1], d_r, d_g, d_b,bayer_bias_4_2x2[3]);
+    *dst_row = yuv_to_rgb555_2pix(y[1][0],y[1][0], d_r, d_g, d_b);
+    *(dst_row + 1) = yuv_to_rgb555_2pix(y[1][1],y[1][1], d_r, d_g, d_b);
 }
 
 // 通用的4x4大块解码函数（纹理块）- 支持跳过标记
 IWRAM_CODE void VideoDecoder::decode_big_block(const YUV_Struct* codebook, const u8 quant_indices[4], u16* big_block_dst)
 {
-    // 解码每个2x2子块，如果索引是0xFF则跳过
-    if (quant_indices[0] != 0xFF) {
-        decode_block(codebook[quant_indices[0]], big_block_dst, 0);
-    }
-    if (quant_indices[1] != 0xFF) {
-        decode_block(codebook[quant_indices[1]], big_block_dst + 2, 1);
-    }
-    if (quant_indices[2] != 0xFF) {
-        decode_block(codebook[quant_indices[2]], big_block_dst + SCREEN_WIDTH * 2, 2);
-    }
-    if (quant_indices[3] != 0xFF) {
-        decode_block(codebook[quant_indices[3]], big_block_dst + SCREEN_WIDTH * 2 + 2, 3);
-    }
+        decode_block(codebook[quant_indices[0]], big_block_dst);
+
+        decode_block(codebook[quant_indices[1]], big_block_dst + 2);
+
+        decode_block(codebook[quant_indices[2]], big_block_dst + SCREEN_WIDTH * 2);
+
+        decode_block(codebook[quant_indices[3]], big_block_dst + SCREEN_WIDTH * 2 + 2);
 }
 
 // DMA拷贝码本的辅助函数
@@ -221,7 +207,7 @@ IWRAM_CODE void VideoDecoder::decode_small_codebook_4x4_block(u8 &valid_bitmap,B
                 case 2: subblock_dst += SCREEN_WIDTH * 2; break; /* 左下 */
                 case 3: subblock_dst += SCREEN_WIDTH * 2 + 2; break; /* 右下 */
             }
-            decode_block(mini_codebook[codebook_idx], subblock_dst, sub_idx);
+            decode_block(mini_codebook[codebook_idx], subblock_dst);
         }
         valid_bitmap >>= 1;
     }
@@ -239,7 +225,7 @@ IWRAM_CODE void VideoDecoder::decode_medium_codebook_4x4_block(u8 &valid_bitmap,
                 case 2: subblock_dst += SCREEN_WIDTH * 2; break; /* 左下 */
                 case 3: subblock_dst += SCREEN_WIDTH * 2 + 2; break; /* 右下 */
             }
-            decode_block(medium_codebook[codebook_idx], subblock_dst, sub_idx);
+            decode_block(medium_codebook[codebook_idx], subblock_dst);
         }
         valid_bitmap >>= 1;
     }
@@ -257,7 +243,7 @@ IWRAM_CODE void VideoDecoder::decode_full_index_4x4_block(u8 &valid_bitmap, BitR
                 case 2: subblock_dst += SCREEN_WIDTH * 2; break; /* 左下 */
                 case 3: subblock_dst += SCREEN_WIDTH * 2 + 2; break; /* 右下 */
             }
-            decode_block(unified_codebook[codebook_idx], subblock_dst, sub_idx);
+            decode_block(unified_codebook[codebook_idx], subblock_dst);
         }
         valid_bitmap >>= 1;
     }

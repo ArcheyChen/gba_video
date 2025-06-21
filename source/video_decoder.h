@@ -34,7 +34,6 @@ private:
     static u16 zone_block_relative_offsets[240];
     
     // 私有解码函数
-    static void decode_block(const YUV_Struct &yuv_data, u16* dst, u8 bayer_idx);
     static void decode_color_block(const YUV_Struct &yuv_data, u16* dst);
     static void decode_big_block(const YUV_Struct* codebook, const u8 quant_indices[4], u16* big_block_dst);
     
@@ -57,7 +56,6 @@ private:
 public:
     // 查找表（移到public以便外部函数访问）
     static u8 clip_lookup_table[512];
-    static s8 bayer_bias_4_2x2[4][4];
     
     // 初始化函数
     static void init();
@@ -71,6 +69,8 @@ public:
     
     // 获取码本状态
     static bool is_codebook_preloaded() { return code_book_preloaded; }
+
+    static void decode_block(const YUV_Struct &yuv_data, u16* dst);
 };
 
 #endif // VIDEO_DECODER_H 
