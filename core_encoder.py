@@ -27,12 +27,12 @@ BYTES_PER_BLOCK  = 7  # 4Y + d_r + d_g + d_b
 ZONE_HEIGHT_PIXELS = 16  # 每个区域的像素高度
 ZONE_HEIGHT_BIG_BLOCKS = ZONE_HEIGHT_PIXELS // (BLOCK_H * 2)  # 每个区域的4x4大块行数 (16像素 = 4行4x4大块)
 
-MINI_CODEBOOK_SIZE = 15  # 每个分段码本的大小
-MEDIUM_CODEBOOK_SIZE = 63  # 每个中等码本的大小
+MINI_CODEBOOK_SIZE = 16  # 每个分段码本的大小
+MEDIUM_CODEBOOK_SIZE = 64  # 每个中等码本的大小
 DEFAULT_ENABLED_SEGMENTS_BITMAP = 0xFFFF  # 默认启用前16段的bitmap (1111111111111111)
 DEFAULT_ENABLED_MEDIUM_SEGMENTS_BITMAP = 0x0F  # 默认启用前4个中码表段的bitmap (00001111)
-SKIP_MARKER_4BIT = 0xF   # 4bit跳过标记
-SKIP_MARKER_6BIT = 0x3F  # 6bit跳过标记（63）
+SKIP_MARKER_4BIT = 0xF   # 4bit跳过标记（已废弃）
+SKIP_MARKER_6BIT = 0x3F  # 6bit跳过标记（已废弃）
 
 # 帧类型标识
 FRAME_TYPE_I = 0x00  # I帧（关键帧）
@@ -312,7 +312,7 @@ def quantize_blocks_unified_medium(blocks_data: np.ndarray, codebook: np.ndarray
     if len(blocks_data) == 0:
         return np.array([], dtype=np.uint8), np.array([], dtype=np.uint8)
     
-    # 只使用前252项进行量化（4个中码表 × 63项）
+    # 只使用前255项进行量化（4个中码表 × 64项，最后一段可能不满）
     max_medium_items = min(4 * MEDIUM_CODEBOOK_SIZE, EFFECTIVE_UNIFIED_CODEBOOK_SIZE)
     effective_codebook = codebook[:max_medium_items]
     
@@ -325,6 +325,12 @@ def quantize_blocks_unified_medium(blocks_data: np.ndarray, codebook: np.ndarray
     # 将索引转换为段索引和段内索引
     segment_indices = indices // MEDIUM_CODEBOOK_SIZE
     within_segment_indices = indices % MEDIUM_CODEBOOK_SIZE
+    
+    # 修正最后一段的越界（最后一段实际项数可能小于64）
+    last_segment = (max_medium_items - 1) // MEDIUM_CODEBOOK_SIZE
+    last_segment_size = max_medium_items - last_segment * MEDIUM_CODEBOOK_SIZE
+    mask = (segment_indices == last_segment) & (within_segment_indices >= last_segment_size)
+    within_segment_indices[mask] = last_segment_size - 1  # 越界的都指向最后一个有效项
     
     return segment_indices, within_segment_indices
 
@@ -934,7 +940,14 @@ def encode_p_frame_unified(current_blocks: np.ndarray, prev_blocks: np.ndarray,
             for seg_idx in range(4):
                 if actual_enabled_medium_segments_bitmap & (np.uint8(1) << np.uint8(seg_idx)):
                     seg_updates = medium_segments_grouped[seg_idx]
-                    # 修复：直接传递seg_updates列表，而不是嵌套在列表中
+                    # 计算本段实际项数
+                    if seg_idx == 3:
+                        # 最后一段
+                        max_medium_items = min(4 * MEDIUM_CODEBOOK_SIZE, EFFECTIVE_UNIFIED_CODEBOOK_SIZE)
+                        last_segment_size = max_medium_items - 3 * MEDIUM_CODEBOOK_SIZE
+                    else:
+                        last_segment_size = MEDIUM_CODEBOOK_SIZE
+                    # 传递本段实际项数给encode_zone_with_new_format（如需用到）
                     encode_zone_with_new_format(seg_updates, lambda x: (seg_idx, {seg_idx}), 
                                               lambda update_info, s_idx: get_medium_indices(update_info, s_idx), 6, 'medium')
             
