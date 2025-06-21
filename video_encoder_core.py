@@ -80,6 +80,32 @@ def sort_single_gop_worker(args):
     
     return gop_start, gop_data
 
+# 简化的统计数据结构，用于多进程
+class SimpleStats:
+    """简化的统计数据结构，用于多进程传输"""
+    def __init__(self):
+        self.total_frames = 0
+        self.i_frames = 0
+        self.p_frames = 0
+        self.forced_i_frames = 0
+        self.threshold_i_frames = 0
+        self.i_frame_bytes = 0
+        self.p_frame_bytes = 0
+        self.codebook_bytes = 0
+        self.index_bytes = 0
+        self.p_overhead_bytes = 0
+        self.small_updates = 0
+        self.medium_updates = 0
+        self.full_updates = 0
+        self.small_bytes = 0
+        self.medium_bytes = 0
+        self.full_bytes = 0
+        self.small_segments = {}
+        self.medium_segments = {}
+        self.small_blocks_per_update = []
+        self.medium_blocks_per_update = []
+        self.full_blocks_per_update = []
+
 def encode_frame_chunk_worker(args):
     """帧编码chunk的worker函数"""
     start_idx, end_idx, frames_chunk, gop_codebooks_chunk, i_frame_interval, diff_threshold, force_i_threshold, enabled_segments_bitmap, enabled_medium_segments_bitmap, codebook_size = args
@@ -88,6 +114,9 @@ def encode_frame_chunk_worker(args):
     frame_offsets = []
     current_offset = 0
     prev_frame = None
+    
+    # 使用简化的统计对象
+    local_stats = SimpleStats()
     
     for frame_idx in range(start_idx, end_idx):
         if frame_idx >= len(frames_chunk) + start_idx:
@@ -127,6 +156,22 @@ def encode_frame_chunk_worker(args):
             frame_data = encode_i_frame_unified(
                 current_frame, unified_codebook, block_types
             )
+            is_i_frame = True
+            
+            # 计算码本和索引大小
+            codebook_size_bytes = codebook_size * 7  # BYTES_PER_BLOCK
+            index_size = len(frame_data) - 1 - codebook_size_bytes
+            
+            # 更新统计
+            local_stats.total_frames += 1
+            local_stats.i_frames += 1
+            if force_i_frame:
+                local_stats.forced_i_frames += 1
+            else:
+                local_stats.threshold_i_frames += 1
+            local_stats.i_frame_bytes += len(frame_data)
+            local_stats.codebook_bytes += codebook_size_bytes
+            local_stats.index_bytes += max(0, index_size)
         else:
             frame_data, is_i_frame, used_zones, color_updates, detail_updates, small_updates, medium_updates, full_updates, small_bytes, medium_bytes, full_bytes, small_segments, medium_segments, small_blocks_per_update, medium_blocks_per_update, full_blocks_per_update = encode_p_frame_unified(
                 current_frame, prev_frame,
@@ -134,6 +179,40 @@ def encode_frame_chunk_worker(args):
                 diff_threshold, force_i_threshold, enabled_segments_bitmap,
                 enabled_medium_segments_bitmap
             )
+            
+            if is_i_frame:
+                codebook_size_bytes = codebook_size * 7  # BYTES_PER_BLOCK
+                index_size = len(frame_data) - 1 - codebook_size_bytes
+                
+                # 更新统计
+                local_stats.total_frames += 1
+                local_stats.i_frames += 1
+                local_stats.threshold_i_frames += 1
+                local_stats.i_frame_bytes += len(frame_data)
+                local_stats.codebook_bytes += codebook_size_bytes
+                local_stats.index_bytes += max(0, index_size)
+            else:
+                # 更新统计
+                local_stats.total_frames += 1
+                local_stats.p_frames += 1
+                local_stats.p_frame_bytes += len(frame_data)
+                local_stats.small_updates += small_updates
+                local_stats.medium_updates += medium_updates
+                local_stats.full_updates += full_updates
+                local_stats.small_bytes += small_bytes
+                local_stats.medium_bytes += medium_bytes
+                local_stats.full_bytes += full_bytes
+                
+                # 合并段使用统计
+                for seg_idx, count in small_segments.items():
+                    local_stats.small_segments[seg_idx] = local_stats.small_segments.get(seg_idx, 0) + count
+                for seg_idx, count in medium_segments.items():
+                    local_stats.medium_segments[seg_idx] = local_stats.medium_segments.get(seg_idx, 0) + count
+                
+                # 合并块数统计
+                local_stats.small_blocks_per_update.extend(small_blocks_per_update)
+                local_stats.medium_blocks_per_update.extend(medium_blocks_per_update)
+                local_stats.full_blocks_per_update.extend(full_blocks_per_update)
         
         encoded_frames.append(frame_data)
         current_offset += len(frame_data)
@@ -143,7 +222,8 @@ def encode_frame_chunk_worker(args):
         if frame_idx % 30 == 0 or frame_idx == end_idx - 1:
             print(f"  已编码 {frame_idx + 1} 帧")
     
-    return encoded_frames, frame_offsets, start_idx
+    # 返回编码结果和统计信息
+    return encoded_frames, frame_offsets, start_idx, local_stats
 
 class VideoEncoderCore:
     """视频编码器核心类"""
@@ -320,17 +400,46 @@ class VideoEncoderCore:
             # 按start_idx排序
             results.sort(key=lambda x: x[2])
             
-            # 合并结果
+            # 合并结果和统计信息
             all_encoded_frames = []
             all_frame_offsets = []
             current_offset = 0
             
-            for encoded_frames, frame_offsets, _ in results:
+            # 合并所有进程的统计信息
+            for encoded_frames, frame_offsets, _, local_stats in results:
                 all_encoded_frames.extend(encoded_frames)
                 # 调整偏移量
                 adjusted_offsets = [current_offset + offset for offset in frame_offsets]
                 all_frame_offsets.extend(adjusted_offsets)
                 current_offset += sum(len(frame_data) for frame_data in encoded_frames)
+                
+                # 合并简化的统计信息
+                self.encoding_stats.total_frames_processed += local_stats.total_frames
+                self.encoding_stats.total_i_frames += local_stats.i_frames
+                self.encoding_stats.total_p_frames += local_stats.p_frames
+                self.encoding_stats.forced_i_frames += local_stats.forced_i_frames
+                self.encoding_stats.threshold_i_frames += local_stats.threshold_i_frames
+                self.encoding_stats.total_i_frame_bytes += local_stats.i_frame_bytes
+                self.encoding_stats.total_p_frame_bytes += local_stats.p_frame_bytes
+                self.encoding_stats.total_codebook_bytes += local_stats.codebook_bytes
+                self.encoding_stats.total_index_bytes += local_stats.index_bytes
+                self.encoding_stats.small_codebook_updates += local_stats.small_updates
+                self.encoding_stats.medium_codebook_updates += local_stats.medium_updates
+                self.encoding_stats.full_codebook_updates += local_stats.full_updates
+                self.encoding_stats.small_codebook_bytes += local_stats.small_bytes
+                self.encoding_stats.medium_codebook_bytes += local_stats.medium_bytes
+                self.encoding_stats.full_codebook_bytes += local_stats.full_bytes
+                
+                # 合并段使用统计
+                for seg_idx, count in local_stats.small_segments.items():
+                    self.encoding_stats.small_segment_usage[seg_idx] += count
+                for seg_idx, count in local_stats.medium_segments.items():
+                    self.encoding_stats.medium_segment_usage[seg_idx] += count
+                
+                # 合并块数统计
+                self.encoding_stats.small_codebook_blocks_per_update.extend(local_stats.small_blocks_per_update)
+                self.encoding_stats.medium_codebook_blocks_per_update.extend(local_stats.medium_blocks_per_update)
+                self.encoding_stats.full_codebook_blocks_per_update.extend(local_stats.full_blocks_per_update)
         
         return all_encoded_frames, all_frame_offsets
     

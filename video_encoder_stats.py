@@ -199,7 +199,7 @@ class EncodingStats:
             
             print(f"\n⚡ P帧更新分析:")
             print(f"   平均更新块数: {avg_updates:.1f}")
-            print(f"   中位数更新块数: {median_updates}")
+            print(f"   中位数更新块数: {median_updates:.1f}")
             print(f"   最大更新块数: {max_updates}")
             print(f"   最小更新块数: {min_updates}")
             print(f"   色块更新总数: {self.color_update_count:,}")
@@ -207,16 +207,64 @@ class EncodingStats:
         
         # 区域使用统计
         if self.zone_usage:
-            print(f"\n🗺️  区域使用分布:")
+            print(f"\n🗺️ 区域使用分布:")
+            total_zones_used = sum(self.zone_usage.values())
             for zone_count in sorted(self.zone_usage.keys()):
-                frames_count = self.zone_usage[zone_count]
-                if self.total_p_frames > 0:
-                    print(f"   {zone_count}个区域: {frames_count}次 ({frames_count/self.total_p_frames*100:.1f}%)")
+                usage_count = self.zone_usage[zone_count]
+                print(f"   {zone_count}个区域: {usage_count}次 ({usage_count/total_zones_used*100:.1f}%)")
         
         # 压缩效率
-        raw_size = total_frames * 240 * 160 * 2  # 假设16位像素
-        compression_ratio = raw_size / total_bytes if total_bytes > 0 else 0
+        original_size = total_frames * 240 * 160 * 3  # 假设原始BGR格式
+        compression_ratio = original_size / total_bytes
+        compression_rate = (1 - total_bytes / original_size) * 100
+        
         print(f"\n📈 压缩效率:")
-        print(f"   原始大小估算: {raw_size:,} bytes ({raw_size/1024/1024:.1f} MB)")
+        print(f"   原始大小估算: {original_size:,} bytes ({original_size/1024/1024:.1f} MB)")
         print(f"   压缩比: {compression_ratio:.1f}:1")
-        print(f"   压缩率: {(1-total_bytes/raw_size)*100:.1f}%") 
+        print(f"   压缩率: {compression_rate:.1f}%")
+    
+    def merge_stats(self, other_stats):
+        """合并另一个统计对象的数据"""
+        # 帧统计
+        self.total_frames_processed += other_stats.total_frames_processed
+        self.total_i_frames += other_stats.total_i_frames
+        self.forced_i_frames += other_stats.forced_i_frames
+        self.threshold_i_frames += other_stats.threshold_i_frames
+        self.total_p_frames += other_stats.total_p_frames
+        
+        # 大小统计
+        self.total_i_frame_bytes += other_stats.total_i_frame_bytes
+        self.total_p_frame_bytes += other_stats.total_p_frame_bytes
+        self.total_codebook_bytes += other_stats.total_codebook_bytes
+        self.total_index_bytes += other_stats.total_index_bytes
+        self.total_p_overhead_bytes += other_stats.total_p_overhead_bytes
+        
+        # P帧块更新统计
+        self.p_frame_updates.extend(other_stats.p_frame_updates)
+        for zone_count, usage_count in other_stats.zone_usage.items():
+            self.zone_usage[zone_count] += usage_count
+        
+        # 细节统计
+        self.color_block_bytes += other_stats.color_block_bytes
+        self.detail_block_bytes += other_stats.detail_block_bytes
+        self.color_update_count += other_stats.color_update_count
+        self.detail_update_count += other_stats.detail_update_count
+        
+        # 码表使用统计
+        self.small_codebook_updates += other_stats.small_codebook_updates
+        self.medium_codebook_updates += other_stats.medium_codebook_updates
+        self.full_codebook_updates += other_stats.full_codebook_updates
+        self.small_codebook_bytes += other_stats.small_codebook_bytes
+        self.medium_codebook_bytes += other_stats.medium_codebook_bytes
+        self.full_codebook_bytes += other_stats.full_codebook_bytes
+        
+        # 码表段使用统计
+        for seg_idx, count in other_stats.small_segment_usage.items():
+            self.small_segment_usage[seg_idx] += count
+        for seg_idx, count in other_stats.medium_segment_usage.items():
+            self.medium_segment_usage[seg_idx] += count
+        
+        # 码表效率统计
+        self.small_codebook_blocks_per_update.extend(other_stats.small_codebook_blocks_per_update)
+        self.medium_codebook_blocks_per_update.extend(other_stats.medium_codebook_blocks_per_update)
+        self.full_codebook_blocks_per_update.extend(other_stats.full_codebook_blocks_per_update) 
