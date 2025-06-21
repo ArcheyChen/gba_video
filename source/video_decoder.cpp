@@ -12,6 +12,11 @@ u8 VideoDecoder::unified_codebook_raw[UNIFIED_CODEBOOK_SIZE*sizeof(YUV_Struct)+4
 YUV_Struct* VideoDecoder::unified_codebook;
 bool VideoDecoder::code_book_preloaded = false;
 
+// RGB555码本存储
+u8 VideoDecoder::rgb555_codebook_raw[UNIFIED_CODEBOOK_SIZE*sizeof(RGB555_Struct)+4]__attribute__((aligned(32)));
+RGB555_Struct* VideoDecoder::rgb555_codebook;
+bool VideoDecoder::rgb555_codebook_preloaded = false;
+
 // 查找表定义
 u8 VideoDecoder::clip_lookup_table[512];
 u16 VideoDecoder::big_block_relative_offsets[240/4*160/4];
@@ -108,16 +113,66 @@ IWRAM_CODE void VideoDecoder::decode_color_block(const YUV_Struct &yuv_data, u16
     *(dst_row + 1) = yuv_to_rgb555_2pix(y[1][1],y[1][1], d_r, d_g, d_b);
 }
 
+// RGB555码本解码函数 - 直接使用预计算的RGB555值
+IWRAM_CODE void VideoDecoder::decode_block_rgb555(const RGB555_Struct &rgb555_data, u16* dst)
+{
+    u16* dst_row = dst;
+    // 直接拷贝预计算的RGB555值
+    dst_row[0] = rgb555_data.rgb[0][0];
+    dst_row[1] = rgb555_data.rgb[0][1];
+    dst_row[SCREEN_WIDTH] = rgb555_data.rgb[1][0];
+    dst_row[SCREEN_WIDTH + 1] = rgb555_data.rgb[1][1];
+}
+
+// RGB555码本解码色块（2x2上采样到4x4）
+IWRAM_CODE void VideoDecoder::decode_color_block_rgb555(const RGB555_Struct &rgb555_data, u16* dst)
+{
+    u16* dst_row = dst;
+    
+    // 第一行：1122
+    dst_row[0] = rgb555_data.rgb[0][0];
+    dst_row[1] = rgb555_data.rgb[0][0];
+    dst_row[2] = rgb555_data.rgb[0][1];
+    dst_row[3] = rgb555_data.rgb[0][1];
+    
+    // 第二行：1122
+    dst_row += SCREEN_WIDTH;
+    dst_row[0] = rgb555_data.rgb[0][0];
+    dst_row[1] = rgb555_data.rgb[0][0];
+    dst_row[2] = rgb555_data.rgb[0][1];
+    dst_row[3] = rgb555_data.rgb[0][1];
+    
+    // 第三行：3344
+    dst_row += SCREEN_WIDTH;
+    dst_row[0] = rgb555_data.rgb[1][0];
+    dst_row[1] = rgb555_data.rgb[1][0];
+    dst_row[2] = rgb555_data.rgb[1][1];
+    dst_row[3] = rgb555_data.rgb[1][1];
+    
+    // 第四行：3344
+    dst_row += SCREEN_WIDTH;
+    dst_row[0] = rgb555_data.rgb[1][0];
+    dst_row[1] = rgb555_data.rgb[1][0];
+    dst_row[2] = rgb555_data.rgb[1][1];
+    dst_row[3] = rgb555_data.rgb[1][1];
+}
+
+// RGB555码本通用的4x4大块解码函数（纹理块）
+IWRAM_CODE void VideoDecoder::decode_big_block_rgb555(const RGB555_Struct* codebook, const u8 quant_indices[4], u16* big_block_dst)
+{
+    decode_block_rgb555(codebook[quant_indices[0]], big_block_dst);
+    decode_block_rgb555(codebook[quant_indices[1]], big_block_dst + 2);
+    decode_block_rgb555(codebook[quant_indices[2]], big_block_dst + SCREEN_WIDTH * 2);
+    decode_block_rgb555(codebook[quant_indices[3]], big_block_dst + SCREEN_WIDTH * 2 + 2);
+}
+
 // 通用的4x4大块解码函数（纹理块）- 支持跳过标记
 IWRAM_CODE void VideoDecoder::decode_big_block(const YUV_Struct* codebook, const u8 quant_indices[4], u16* big_block_dst)
 {
-        decode_block(codebook[quant_indices[0]], big_block_dst);
-
-        decode_block(codebook[quant_indices[1]], big_block_dst + 2);
-
-        decode_block(codebook[quant_indices[2]], big_block_dst + SCREEN_WIDTH * 2);
-
-        decode_block(codebook[quant_indices[3]], big_block_dst + SCREEN_WIDTH * 2 + 2);
+    decode_block(codebook[quant_indices[0]], big_block_dst);
+    decode_block(codebook[quant_indices[1]], big_block_dst + 2);
+    decode_block(codebook[quant_indices[2]], big_block_dst + SCREEN_WIDTH * 2);
+    decode_block(codebook[quant_indices[3]], big_block_dst + SCREEN_WIDTH * 2 + 2);
 }
 
 // DMA拷贝码本的辅助函数
@@ -150,6 +205,32 @@ IWRAM_CODE void VideoDecoder::copy_unified_codebook(u8* dst_raw, const u8* src, 
     }
 }
 
+// 将YUV码本转换为RGB555码本
+IWRAM_CODE void VideoDecoder::convert_yuv_to_rgb555_codebook(const YUV_Struct* yuv_codebook, RGB555_Struct* rgb555_codebook, int codebook_size)
+{
+    for(int i = 0; i < codebook_size; i++) {
+        const YUV_Struct& yuv = yuv_codebook[i];
+        RGB555_Struct& rgb555 = rgb555_codebook[i];
+        
+        // 转换2x2块的每个像素
+        for(int y = 0; y < 2; y++) {
+            for(int x = 0; x < 2; x++) {
+                u8 y_val = yuv.y[y][x];
+                s8 d_r = yuv.d_r;
+                s8 d_g = yuv.d_g;
+                s8 d_b = yuv.d_b;
+                
+                auto lookup_table = clip_lookup_table + 128;
+                u16 r = lookup_table[y_val + d_r];
+                u16 g = lookup_table[y_val + d_g];
+                u16 b = lookup_table[y_val + d_b];
+                
+                rgb555.rgb[y][x] = r | (g << 5) | (b << 10);
+            }
+        }
+    }
+}
+
 IWRAM_CODE void VideoDecoder::preload_codebook(const u8* src)
 {
     u8 frame_type = src[0];
@@ -157,8 +238,16 @@ IWRAM_CODE void VideoDecoder::preload_codebook(const u8* src)
         VBlankIntrWait(); // 等待VBlank，防止CPU空跑跑满
         return; // 只在I帧中预加载码本
     }
+    
+    // 加载YUV码本
     copy_unified_codebook(unified_codebook_raw, src + 1, &unified_codebook, UNIFIED_CODEBOOK_SIZE);
     code_book_preloaded = true;
+    
+    // 转换为RGB555码本
+    u8* rgb555_copy_raw_ptr = rgb555_codebook_raw + 4; // 跳过对齐填充的4字节
+    rgb555_codebook = (RGB555_Struct*)rgb555_copy_raw_ptr;
+    convert_yuv_to_rgb555_codebook(unified_codebook, rgb555_codebook, UNIFIED_CODEBOOK_SIZE);
+    rgb555_codebook_preloaded = true;
 }
 
 IWRAM_CODE void VideoDecoder::decode_i_frame_unified(const u8* src, u16* dst)
@@ -167,8 +256,15 @@ IWRAM_CODE void VideoDecoder::decode_i_frame_unified(const u8* src, u16* dst)
     if(!code_book_preloaded){
         copy_unified_codebook(unified_codebook_raw, src, 
                          &unified_codebook, UNIFIED_CODEBOOK_SIZE);
+        
+        // 转换为RGB555码本
+        u8* rgb555_copy_raw_ptr = rgb555_codebook_raw + 4; // 跳过对齐填充的4字节
+        rgb555_codebook = (RGB555_Struct*)rgb555_copy_raw_ptr;
+        convert_yuv_to_rgb555_codebook(unified_codebook, rgb555_codebook, UNIFIED_CODEBOOK_SIZE);
+        rgb555_codebook_preloaded = true;
     }
     code_book_preloaded = false;//清空标记，不然下一次的预载可能就不管用了
+    rgb555_codebook_preloaded = false;
     src += UNIFIED_CODEBOOK_SIZE * BYTES_PER_BLOCK;
     
     u16 tot_big_blocks = (VIDEO_WIDTH / (BLOCK_WIDTH * 2)) * (VIDEO_HEIGHT / (BLOCK_HEIGHT * 2));
@@ -183,7 +279,7 @@ IWRAM_CODE void VideoDecoder::decode_i_frame_unified(const u8* src, u16* dst)
         if (first_byte == COLOR_BLOCK_MARKER) {
             // 色块：读取统一码本索引
             u8 unified_idx = *src++;
-            decode_color_block(unified_codebook[unified_idx], big_block_dst);
+            decode_color_block_rgb555(rgb555_codebook[unified_idx], big_block_dst);
         } else {
             // 纹理块：当前字节是第一个统一码本索引，继续读取3个
             u8 quant_indices[4];
@@ -191,69 +287,16 @@ IWRAM_CODE void VideoDecoder::decode_i_frame_unified(const u8* src, u16* dst)
             quant_indices[1] = *src++;
             quant_indices[2] = *src++;
             quant_indices[3] = *src++;
-            decode_big_block(unified_codebook, quant_indices, big_block_dst);
+            decode_big_block_rgb555(rgb555_codebook, quant_indices, big_block_dst);
         }
     }
 }
 
-IWRAM_CODE void VideoDecoder::decode_small_codebook_4x4_block(u8 &valid_bitmap,BitReader &reader,u16* big_block_dst,const YUV_Struct * mini_codebook){
-    for (u8 sub_idx = 0; sub_idx < 4; sub_idx++) {
-        if (valid_bitmap & 1) {
-            u8 codebook_idx = reader.read4();
-            u16* subblock_dst = big_block_dst;
-            switch (sub_idx) {
-                case 0: /* 左上 */ break;
-                case 1: subblock_dst += 2; break; /* 右上 */
-                case 2: subblock_dst += SCREEN_WIDTH * 2; break; /* 左下 */
-                case 3: subblock_dst += SCREEN_WIDTH * 2 + 2; break; /* 右下 */
-            }
-            decode_block(mini_codebook[codebook_idx], subblock_dst);
-        }
-        valid_bitmap >>= 1;
-    }
-}
-
-// 解码中码表4x4块的辅助函数
-IWRAM_CODE void VideoDecoder::decode_medium_codebook_4x4_block(u8 &valid_bitmap, BitReader &reader, u16* big_block_dst, const YUV_Struct* medium_codebook) {
-    for (u8 sub_idx = 0; sub_idx < 4; sub_idx++) {
-        if (valid_bitmap & 1) {
-            u8 codebook_idx = reader.read6();
-            u16* subblock_dst = big_block_dst;
-            switch (sub_idx) {
-                case 0: /* 左上 */ break;
-                case 1: subblock_dst += 2; break; /* 右上 */
-                case 2: subblock_dst += SCREEN_WIDTH * 2; break; /* 左下 */
-                case 3: subblock_dst += SCREEN_WIDTH * 2 + 2; break; /* 右下 */
-            }
-            decode_block(medium_codebook[codebook_idx], subblock_dst);
-        }
-        valid_bitmap >>= 1;
-    }
-}
-
-// 解码完整索引4x4块的辅助函数
-IWRAM_CODE void VideoDecoder::decode_full_index_4x4_block(u8 &valid_bitmap, BitReader &reader, u16* big_block_dst, const YUV_Struct* unified_codebook) {
-    for (u8 sub_idx = 0; sub_idx < 4; sub_idx++) {
-        if (valid_bitmap & 1) {
-            u8 codebook_idx = reader.read8();
-            u16* subblock_dst = big_block_dst;
-            switch (sub_idx) {
-                case 0: /* 左上 */ break;
-                case 1: subblock_dst += 2; break; /* 右上 */
-                case 2: subblock_dst += SCREEN_WIDTH * 2; break; /* 左下 */
-                case 3: subblock_dst += SCREEN_WIDTH * 2 + 2; break; /* 右下 */
-            }
-            decode_block(unified_codebook[codebook_idx], subblock_dst);
-        }
-        valid_bitmap >>= 1;
-    }
-}
-
-// 解码小码表段的辅助函数
-IWRAM_CODE void VideoDecoder::decode_small_codebook_segment(u16 seg_idx, const u8** src, u16* zone_dst, 
-                                            const YUV_Struct* unified_codebook)
+// RGB555版本的分段解码函数
+IWRAM_CODE void VideoDecoder::decode_small_codebook_segment_rgb555(u16 seg_idx, const u8** src, u16* zone_dst, 
+                                            const RGB555_Struct* unified_codebook)
 {
-    const YUV_Struct* mini_codebook = unified_codebook + (seg_idx * MINI_CODEBOOK_SIZE);
+    const RGB555_Struct* mini_codebook = unified_codebook + (seg_idx * MINI_CODEBOOK_SIZE);
     
     u8 num_blocks = *(*src)++;
     
@@ -278,11 +321,11 @@ IWRAM_CODE void VideoDecoder::decode_small_codebook_segment(u16 seg_idx, const u
         
         // 解码第一个4x4块
         u16* big_block_dst = zone_dst + zone_block_relative_offsets[zone_relative_idx1];
-        decode_small_codebook_4x4_block(valid_bitmap, reader, big_block_dst, mini_codebook);
+        decode_small_codebook_4x4_block_rgb555(valid_bitmap, reader, big_block_dst, mini_codebook);
         
         // 解码第二个4x4块
         big_block_dst = zone_dst + zone_block_relative_offsets[zone_relative_idx2];
-        decode_small_codebook_4x4_block(valid_bitmap, reader, big_block_dst, mini_codebook);
+        decode_small_codebook_4x4_block_rgb555(valid_bitmap, reader, big_block_dst, mini_codebook);
     }
     
     // 处理最后一个奇数块（如果存在）
@@ -291,16 +334,15 @@ IWRAM_CODE void VideoDecoder::decode_small_codebook_segment(u16 seg_idx, const u
         u8 zone_relative_idx1 = *bitmap_ptr++;
         
         u16* big_block_dst = zone_dst + zone_block_relative_offsets[zone_relative_idx1];
-        decode_small_codebook_4x4_block(valid_bitmap, reader, big_block_dst, mini_codebook);
+        decode_small_codebook_4x4_block_rgb555(valid_bitmap, reader, big_block_dst, mini_codebook);
     }
     // BitReader析构时会自动更新src指针
 }
 
-// 解码中码表段的辅助函数
-IWRAM_CODE void VideoDecoder::decode_medium_codebook_segment(u8 seg_idx, const u8** src, u16* zone_dst, 
-                                             const YUV_Struct* unified_codebook)
+IWRAM_CODE void VideoDecoder::decode_medium_codebook_segment_rgb555(u8 seg_idx, const u8** src, u16* zone_dst, 
+                                             const RGB555_Struct* unified_codebook)
 {
-    const YUV_Struct* medium_codebook = unified_codebook + (seg_idx * MEDIUM_CODEBOOK_SIZE);
+    const RGB555_Struct* medium_codebook = unified_codebook + (seg_idx * MEDIUM_CODEBOOK_SIZE);
     
     u8 num_blocks = *(*src)++;
     
@@ -325,11 +367,11 @@ IWRAM_CODE void VideoDecoder::decode_medium_codebook_segment(u8 seg_idx, const u
         
         // 解码第一个4x4块
         u16* big_block_dst = zone_dst + zone_block_relative_offsets[zone_relative_idx1];
-        decode_medium_codebook_4x4_block(valid_bitmap, reader, big_block_dst, medium_codebook);
+        decode_medium_codebook_4x4_block_rgb555(valid_bitmap, reader, big_block_dst, medium_codebook);
         
         // 解码第二个4x4块
         big_block_dst = zone_dst + zone_block_relative_offsets[zone_relative_idx2];
-        decode_medium_codebook_4x4_block(valid_bitmap, reader, big_block_dst, medium_codebook);
+        decode_medium_codebook_4x4_block_rgb555(valid_bitmap, reader, big_block_dst, medium_codebook);
     }
     
     // 处理最后一个奇数块（如果存在）
@@ -338,14 +380,13 @@ IWRAM_CODE void VideoDecoder::decode_medium_codebook_segment(u8 seg_idx, const u
         u8 zone_relative_idx1 = *bitmap_ptr++;
         
         u16* big_block_dst = zone_dst + zone_block_relative_offsets[zone_relative_idx1];
-        decode_medium_codebook_4x4_block(valid_bitmap, reader, big_block_dst, medium_codebook);
+        decode_medium_codebook_4x4_block_rgb555(valid_bitmap, reader, big_block_dst, medium_codebook);
     }
     // BitReader析构时会自动更新src指针
 }
 
-// 解码完整索引段的辅助函数
-IWRAM_CODE void VideoDecoder::decode_full_index_segment(const u8** src, u16* zone_dst, 
-                                        const YUV_Struct* unified_codebook)
+IWRAM_CODE void VideoDecoder::decode_full_index_segment_rgb555(const u8** src, u16* zone_dst, 
+                                        const RGB555_Struct* unified_codebook)
 {
     u8 num_full_blocks = *(*src)++;
     if (num_full_blocks == 0) return;
@@ -371,11 +412,11 @@ IWRAM_CODE void VideoDecoder::decode_full_index_segment(const u8** src, u16* zon
         
         // 解码第一个4x4块
         u16* big_block_dst = zone_dst + zone_block_relative_offsets[zone_relative_idx1];
-        decode_full_index_4x4_block(valid_bitmap, reader, big_block_dst, unified_codebook);
+        decode_full_index_4x4_block_rgb555(valid_bitmap, reader, big_block_dst, unified_codebook);
         
         // 解码第二个4x4块
         big_block_dst = zone_dst + zone_block_relative_offsets[zone_relative_idx2];
-        decode_full_index_4x4_block(valid_bitmap, reader, big_block_dst, unified_codebook);
+        decode_full_index_4x4_block_rgb555(valid_bitmap, reader, big_block_dst, unified_codebook);
     }
     
     // 处理最后一个奇数块（如果存在）
@@ -384,12 +425,13 @@ IWRAM_CODE void VideoDecoder::decode_full_index_segment(const u8** src, u16* zon
         u8 zone_relative_idx1 = *bitmap_ptr++;
         
         u16* big_block_dst = zone_dst + zone_block_relative_offsets[zone_relative_idx1];
-        decode_full_index_4x4_block(valid_bitmap, reader, big_block_dst, unified_codebook);
+        decode_full_index_4x4_block_rgb555(valid_bitmap, reader, big_block_dst, unified_codebook);
     }
     // BitReader析构时会自动更新src指针
 }
 
-IWRAM_CODE void VideoDecoder::decode_p_frame_unified(const u8* src, u16* dst)
+// RGB555版本的P帧解码函数
+IWRAM_CODE void VideoDecoder::decode_p_frame_unified_rgb555(const u8* src, u16* dst)
 {
     // 读取两个区域bitmap：纹理块和色块
     u16 detail_zone_bitmap = src[0] | (src[1] << 8);
@@ -412,7 +454,7 @@ IWRAM_CODE void VideoDecoder::decode_p_frame_unified(const u8* src, u16* dst)
             // 处理启用的小码表段
             for (u16 seg_idx = 0; seg_idx < 16; seg_idx++) {
                 if (enabled_segments_bitmap & (1 << seg_idx)) {
-                    decode_small_codebook_segment(seg_idx, &src, zone_dst, unified_codebook);
+                    decode_small_codebook_segment_rgb555(seg_idx, &src, zone_dst, rgb555_codebook);
                 }
             }
             
@@ -422,12 +464,12 @@ IWRAM_CODE void VideoDecoder::decode_p_frame_unified(const u8* src, u16* dst)
             // 处理启用的中码表段
             for (u8 seg_idx = 0; seg_idx < 4; seg_idx++) {
                 if (enabled_medium_segments_bitmap & (1 << seg_idx)) {
-                    decode_medium_codebook_segment(seg_idx, &src, zone_dst, unified_codebook);
+                    decode_medium_codebook_segment_rgb555(seg_idx, &src, zone_dst, rgb555_codebook);
                 }
             }
             
             // 处理剩余更新（完整索引）
-            decode_full_index_segment(&src, zone_dst, unified_codebook);
+            decode_full_index_segment_rgb555(&src, zone_dst, rgb555_codebook);
         }
         temp_bitmap >>= 1;
         zone_idx++;
@@ -452,7 +494,7 @@ IWRAM_CODE void VideoDecoder::decode_p_frame_unified(const u8* src, u16* dst)
                 
                 // 直接使用查找表获取相对偏移
                 u16* big_block_dst = zone_dst + zone_block_relative_offsets[zone_relative_idx];
-                decode_color_block(unified_codebook[unified_idx], big_block_dst);
+                decode_color_block_rgb555(rgb555_codebook[unified_idx], big_block_dst);
             }
         }
         temp_bitmap >>= 1;
@@ -467,7 +509,7 @@ IWRAM_CODE void VideoDecoder::decode_frame(const u8* frame_data, u16* dst)
     if (frame_type == FRAME_TYPE_I) {
         decode_i_frame_unified(frame_data, dst);
     } else if (frame_type == FRAME_TYPE_P) {
-        decode_p_frame_unified(frame_data, dst);
+        decode_p_frame_unified_rgb555(frame_data, dst);
     }
 }
 
@@ -475,4 +517,56 @@ IWRAM_CODE bool VideoDecoder::is_i_frame(const u8* frame_data)
 {
     u8 frame_type = *frame_data;
     return frame_type == FRAME_TYPE_I;
+}
+
+// RGB555版本的4x4块解码函数
+IWRAM_CODE void VideoDecoder::decode_small_codebook_4x4_block_rgb555(u8 &valid_bitmap, BitReader &reader, u16* big_block_dst, const RGB555_Struct * mini_codebook){
+    for (u8 sub_idx = 0; sub_idx < 4; sub_idx++) {
+        if (valid_bitmap & 1) {
+            u8 codebook_idx = reader.read4();
+            u16* subblock_dst = big_block_dst;
+            switch (sub_idx) {
+                case 0: /* 左上 */ break;
+                case 1: subblock_dst += 2; break; /* 右上 */
+                case 2: subblock_dst += SCREEN_WIDTH * 2; break; /* 左下 */
+                case 3: subblock_dst += SCREEN_WIDTH * 2 + 2; break; /* 右下 */
+            }
+            decode_block_rgb555(mini_codebook[codebook_idx], subblock_dst);
+        }
+        valid_bitmap >>= 1;
+    }
+}
+
+IWRAM_CODE void VideoDecoder::decode_medium_codebook_4x4_block_rgb555(u8 &valid_bitmap, BitReader &reader, u16* big_block_dst, const RGB555_Struct* medium_codebook) {
+    for (u8 sub_idx = 0; sub_idx < 4; sub_idx++) {
+        if (valid_bitmap & 1) {
+            u8 codebook_idx = reader.read6();
+            u16* subblock_dst = big_block_dst;
+            switch (sub_idx) {
+                case 0: /* 左上 */ break;
+                case 1: subblock_dst += 2; break; /* 右上 */
+                case 2: subblock_dst += SCREEN_WIDTH * 2; break; /* 左下 */
+                case 3: subblock_dst += SCREEN_WIDTH * 2 + 2; break; /* 右下 */
+            }
+            decode_block_rgb555(medium_codebook[codebook_idx], subblock_dst);
+        }
+        valid_bitmap >>= 1;
+    }
+}
+
+IWRAM_CODE void VideoDecoder::decode_full_index_4x4_block_rgb555(u8 &valid_bitmap, BitReader &reader, u16* big_block_dst, const RGB555_Struct* unified_codebook) {
+    for (u8 sub_idx = 0; sub_idx < 4; sub_idx++) {
+        if (valid_bitmap & 1) {
+            u8 codebook_idx = reader.read8();
+            u16* subblock_dst = big_block_dst;
+            switch (sub_idx) {
+                case 0: /* 左上 */ break;
+                case 1: subblock_dst += 2; break; /* 右上 */
+                case 2: subblock_dst += SCREEN_WIDTH * 2; break; /* 左下 */
+                case 3: subblock_dst += SCREEN_WIDTH * 2 + 2; break; /* 右下 */
+            }
+            decode_block_rgb555(unified_codebook[codebook_idx], subblock_dst);
+        }
+        valid_bitmap >>= 1;
+    }
 } 
