@@ -483,4 +483,10 @@ IWRAM_CODE void VideoDecoder::decode_frame(const u8* frame_data, u16* dst)
     } else if (frame_type == FRAME_TYPE_P) {
         decode_p_frame_unified(frame_data, dst);
     }
+}
+
+IWRAM_CODE bool VideoDecoder::is_i_frame(const u8* frame_data)
+{
+    u8 frame_type = *frame_data;
+    return frame_type == FRAME_TYPE_I;
 } 

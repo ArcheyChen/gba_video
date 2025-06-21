@@ -313,15 +313,23 @@ class VideoEncoderCore:
         
         all_data = b''.join(encoded_frames)
         
+        # 计算I帧时间戳（假设30fps）
+        fps = 30.0
+        i_frame_timestamps = []
+        for frame_idx in range(len(frames)):
+            if frame_idx % i_frame_interval == 0 or frame_idx == 0:
+                timestamp = frame_idx / fps
+                i_frame_timestamps.append(timestamp)
+        
         # 写入文件
         write_header(pathlib.Path(output_path).with_suffix(".h"), len(frames), len(all_data), 
-                    codebook_size, 30.0)  # 假设30fps
+                    codebook_size, fps)
         write_source(pathlib.Path(output_path).with_suffix(".c"), all_data, frame_offsets)
         
         # 打印详细统计
         self.encoding_stats.print_summary(len(frames), len(all_data))
         
-        return all_data, frame_offsets
+        return all_data, frame_offsets, i_frame_timestamps
     
     def _parallel_sort_codebooks(self, frames, gop_codebooks, i_frame_interval, diff_threshold, max_workers):
         """并行码本排序"""

@@ -71,7 +71,7 @@ def main():
     encoder = VideoEncoderCore()
     
     # 编码视频
-    encoder.encode_video(
+    result = encoder.encode_video(
         frames=frames,
         output_path=args.out,
         i_frame_interval=args.i_frame_interval,
@@ -87,15 +87,36 @@ def main():
         use_parallel=not args.no_parallel
     )
     
+    # 解包编码结果
+    if len(result) == 3:
+        all_data, frame_offsets, i_frame_timestamps = result
+    else:
+        # 兼容旧版本
+        all_data, frame_offsets = result
+        i_frame_timestamps = None
+    
     # 生成音频文件
     if audio_data is not None:
         output_base = pathlib.Path(args.out)
         audio_header_path = output_base.parent / f"audio_data.h"
         audio_source_path = output_base.parent / f"audio_data.c"
         
-        audio_encoder.write_audio_header(audio_header_path, audio_data, audio_duration)
-        audio_encoder.write_audio_source(audio_source_path, audio_data)
-        print(f"✓ 已生成音频文件: {audio_header_path.name} / {audio_source_path.name}")
+        # 传递I帧时间戳给音频编码器
+        if i_frame_timestamps:
+            audio_data, i_frame_audio_offsets = audio_encoder.extract_audio_from_video(
+                args.input, audio_duration, i_frame_timestamps=i_frame_timestamps
+            )
+        else:
+            audio_data, i_frame_audio_offsets = audio_encoder.extract_audio_from_video(
+                args.input, audio_duration
+            )
+        
+        if audio_data is not None:
+            audio_encoder.write_audio_header(audio_header_path, audio_data, audio_duration, i_frame_audio_offsets)
+            audio_encoder.write_audio_source(audio_source_path, audio_data, i_frame_audio_offsets)
+            print(f"✓ 已生成音频文件: {audio_header_path.name} / {audio_source_path.name}")
+        else:
+            print("⚠️ 音频提取失败，跳过音频文件生成")
 
 if __name__ == "__main__":
     main()

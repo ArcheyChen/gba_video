@@ -46,22 +46,45 @@ IWRAM_CODE void doit(){
         const unsigned char* frame_data = video_data + frame_offsets[frame];
         
         // VBlankIntrWait(); // 注释掉以提高性能，让DMA自动等待
-        // while(!should_copy) {
-        //     VideoDecoder::preload_codebook(frame_data);
-        //     // 预加载码本，以消耗掉空闲时间
-        //     // 这个函数里面如果没事做，会等待VBlank，因此不用担心跑满CPU
-        // }
-        // should_copy = false;
+
         
         // 渲染帧
-        VideoRenderer::render_frame(frame_data);
-
+        int i_frame_index = VideoRenderer::render_frame(frame_data);
+        
+        while(!should_copy) {
+            VideoDecoder::preload_codebook(frame_data);
+            // 预加载码本，以消耗掉空闲时间
+            // 这个函数里面如果没事做，会等待VBlank，因此不用担心跑满CPU
+        }
+        should_copy = false;
+        
         // 拷贝到VRAM
         DMA3COPY(VideoRenderer::ewramBuffer, VRAM, (SCREEN_WIDTH * SCREEN_HEIGHT >> 1) | DMA32);
+        
+        // 音画同步：如果是I帧，重新同步音频播放
+        #ifdef I_FRAME_AUDIO_OFFSET_COUNT
+        if (i_frame_index >= 0 && audio_playing && i_frame_index < I_FRAME_AUDIO_OFFSET_COUNT) {
+            // 停止当前音频播放
+            sound_stop();
+            
+            // 从I帧对应的音频偏移处重新开始播放
+            const u8* audio_offset = (const u8*)audio_data + i_frame_audio_offsets[i_frame_index];
+            u32 remaining_audio_size = audio_data_len - i_frame_audio_offsets[i_frame_index];
+            
+            if (remaining_audio_size > 0) {
+                sound_play(audio_offset, remaining_audio_size, SAMPLE_RATE, true);
+            } else {
+                // 如果剩余音频不足，重新开始播放
+                sound_play((const u8*)audio_data, audio_data_len, SAMPLE_RATE, true);
+            }
+        }
+        #endif
         
         frame++;
         if(frame >= VIDEO_FRAME_COUNT) {
             frame = 0;
+            // 重置I帧计数器
+            VideoRenderer::reset_i_frame_counter();
             // 视频循环时，音频也应该重新开始
             if (audio_playing) {
                 sound_stop();

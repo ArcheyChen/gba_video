@@ -66,6 +66,9 @@ public:
     static void decode_frame(const u8* frame_data, u16* dst);
     static void preload_codebook(const u8* src);
     
+    // 检查是否为I帧
+    static bool is_i_frame(const u8* frame_data);
+    
     // 获取码本状态
     static bool is_codebook_preloaded() { return code_book_preloaded; }
 };
