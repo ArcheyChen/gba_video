@@ -14,24 +14,35 @@ constexpr int PIXELS_PER_FRAME = SCREEN_WIDTH * SCREEN_HEIGHT;
 // EWRAM 单缓冲
 EWRAM_BSS u16 ewramBuffer[PIXELS_PER_FRAME];
 
+
+IWRAM_DATA static u8 clip_table_raw[1024];
+
+u8* clip_lookup_table = clip_table_raw + 256;
+
+void init_clip_table(){
+    for(int i=-256;i<1024-256;i++){
+        u8 raw_val;
+        if(i<=0)
+            raw_val = 0;
+        else if(i>=255)
+            raw_val = 255;
+        else
+            raw_val = static_cast<u8>(i);
+        clip_lookup_table[i] = raw_val>>3;
+    }
+}
 // 近似整数 YUV→RGB (Y:0-255, Cb/Cr:-128..127) → 5-bit packed
 inline u16 yuv_to_rgb555(u8 y   ,s16 d_r
                                 ,s16 d_g
                                 ,s16 d_b)
 {
-    s16 r = y + d_r;                // Y + d_r
-    s16 g = y + d_g;                // Y + d_g
-    s16 b = y + d_b;                // Y + d_b
+    s16 r = clip_lookup_table[y + d_r];                // Y + d_r
+    s16 g = clip_lookup_table[y + d_g];                // Y + d_g
+    s16 b = clip_lookup_table[y + d_b];                // Y + d_b
 
-    // // // 裁剪至 0-255
-    if (r < 0) r = 0; else if (r > 255) r = 255;
-    if (g < 0) g = 0; else if (g > 255) g = 255;
-    if (b < 0) b = 0; else if (b > 255) b = 255;
-
-
-    return  (r >> 3)          |
-           ((g >> 3) << 5)    |
-           ((b >> 3) << 10);  // RGB555
+    return  (r)          |
+           ((g) << 5)    |
+           ((b) << 10);  // RGB555
 }
 
 
@@ -101,6 +112,7 @@ int main()
 
     int frame = 0;
     const unsigned char *vdata_ptr = movie;
+    init_clip_table();
     while (1)
     {
         // const unsigned char* src = movie + frame * stride;
