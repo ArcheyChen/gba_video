@@ -32,6 +32,8 @@ def main():
                    help=f"启用段的bitmap，每位表示对应段是否启用小码表模式（默认0x{DEFAULT_ENABLED_SEGMENTS_BITMAP:04X}）")
     pa.add_argument("--enabled-medium-segments-bitmap", type=int, default=DEFAULT_ENABLED_MEDIUM_SEGMENTS_BITMAP,
                    help=f"启用中码表段的bitmap，每位表示对应段是否启用中码表模式（默认0x{DEFAULT_ENABLED_MEDIUM_SEGMENTS_BITMAP:02X}）")
+    pa.add_argument("--no-parallel", action="store_true",
+                   help="禁用并行处理，使用串行模式")
     args = pa.parse_args()
 
     # 提取帧
@@ -55,7 +57,8 @@ def main():
         i_frame_weight=args.i_frame_weight,
         max_workers=args.max_workers,
         enabled_segments_bitmap=args.enabled_segments_bitmap,
-        enabled_medium_segments_bitmap=args.enabled_medium_segments_bitmap
+        enabled_medium_segments_bitmap=args.enabled_medium_segments_bitmap,
+        use_parallel=not args.no_parallel
     )
 
 if __name__ == "__main__":
