@@ -34,7 +34,7 @@ def extract_effective_blocks_from_big_blocks(blocks: np.ndarray, big_block_posit
                 break
         
         if all_2x2_blocks_are_uniform:
-            # 色块：生成下采样的2x2块
+            # 色块：生成下采样的2x2块，并重复4次以增加在聚类中的权重
             downsampled_block = np.zeros(BYTES_PER_BLOCK, dtype=np.uint8)
             
             y_values = []
@@ -56,7 +56,8 @@ def extract_effective_blocks_from_big_blocks(blocks: np.ndarray, big_block_posit
             downsampled_block[5] = np.clip(np.mean(d_g_values), -128, 127).astype(np.int8).view(np.uint8)
             downsampled_block[6] = np.clip(np.mean(d_b_values), -128, 127).astype(np.int8).view(np.uint8)
             
-            effective_blocks.append(downsampled_block)
+            # 色块重复4次以增加在聚类中的权重（因为一个色块代表4个2x2块）
+            effective_blocks.extend([downsampled_block] * 4)
         else:
             # 纹理块：添加所有4个2x2块
             effective_blocks.extend(blocks_4x4)
