@@ -46,6 +46,11 @@ class EncodingStats:
         self.small_codebook_blocks_per_update = []  # 每次小码表更新的块数
         self.medium_codebook_blocks_per_update = [] # 每次中码表更新的块数
         self.full_codebook_blocks_per_update = []   # 每次大码表更新的块数
+        
+        # 新增：码表块数分布统计
+        self.small_blocks_distribution = {1: 0, 2: 0, 3: 0, 4: 0}  # 小码表：更新1/2/3/4块的个数
+        self.medium_blocks_distribution = {1: 0, 2: 0, 3: 0, 4: 0} # 中码表：更新1/2/3/4块的个数
+        self.full_blocks_distribution = {1: 0, 2: 0, 3: 0, 4: 0}   # 大码表：更新1/2/3/4块的个数
     
     def add_i_frame(self, size_bytes, is_forced=True, codebook_size=0, index_size=0):
         self.total_frames_processed += 1
@@ -96,11 +101,20 @@ class EncodingStats:
         
         # 效率统计
         if small_blocks_per_update:
-            self.small_codebook_blocks_per_update.extend(small_blocks_per_update)
+            # 统计块数分布
+            for block_count in small_blocks_per_update:
+                if 1 <= block_count <= 4:
+                    self.small_blocks_distribution[block_count] += 1
         if medium_blocks_per_update:
-            self.medium_codebook_blocks_per_update.extend(medium_blocks_per_update)
+            # 统计块数分布
+            for block_count in medium_blocks_per_update:
+                if 1 <= block_count <= 4:
+                    self.medium_blocks_distribution[block_count] += 1
         if full_blocks_per_update:
-            self.full_codebook_blocks_per_update.extend(full_blocks_per_update)
+            # 统计块数分布
+            for block_count in full_blocks_per_update:
+                if 1 <= block_count <= 4:
+                    self.full_blocks_distribution[block_count] += 1
     
     def print_summary(self, total_frames, total_bytes):
         print(f"\n📊 编码统计报告")
@@ -150,16 +164,28 @@ class EncodingStats:
                 print(f"   中码表数据: {self.medium_codebook_bytes:,} bytes ({self.medium_codebook_bytes/total_codebook_data*100:.1f}%)")
                 print(f"   大码表数据: {self.full_codebook_bytes:,} bytes ({self.full_codebook_bytes/total_codebook_data*100:.1f}%)")
             
-            # 码表效率统计
-            if self.small_codebook_blocks_per_update:
-                avg_small_blocks = statistics.mean(self.small_codebook_blocks_per_update)
-                print(f"   小码表平均每次更新块数: {avg_small_blocks:.1f}")
-            if self.medium_codebook_blocks_per_update:
-                avg_medium_blocks = statistics.mean(self.medium_codebook_blocks_per_update)
-                print(f"   中码表平均每次更新块数: {avg_medium_blocks:.1f}")
-            if self.full_codebook_blocks_per_update:
-                avg_full_blocks = statistics.mean(self.full_codebook_blocks_per_update)
-                print(f"   大码表平均每次更新块数: {avg_full_blocks:.1f}")
+            # 新增：码表块数分布统计
+            print(f"\n📊 码表块数分布:")
+            if self.small_codebook_updates > 0:
+                print(f"   小码表块数分布:")
+                for block_count in [1, 2, 3, 4]:
+                    count = self.small_blocks_distribution[block_count]
+                    percentage = count / self.small_codebook_updates * 100
+                    print(f"     {block_count}块: {count}次 ({percentage:.1f}%)")
+            
+            if self.medium_codebook_updates > 0:
+                print(f"   中码表块数分布:")
+                for block_count in [1, 2, 3, 4]:
+                    count = self.medium_blocks_distribution[block_count]
+                    percentage = count / self.medium_codebook_updates * 100
+                    print(f"     {block_count}块: {count}次 ({percentage:.1f}%)")
+            
+            if self.full_codebook_updates > 0:
+                print(f"   大码表块数分布:")
+                for block_count in [1, 2, 3, 4]:
+                    count = self.full_blocks_distribution[block_count]
+                    percentage = count / self.full_codebook_updates * 100
+                    print(f"     {block_count}块: {count}次 ({percentage:.1f}%)")
         
         # 段使用统计
         if self.small_segment_usage:
@@ -198,7 +224,6 @@ class EncodingStats:
             min_updates = min(self.p_frame_updates)
             
             print(f"\n⚡ P帧更新分析:")
-            print(f"   平均更新块数: {avg_updates:.1f}")
             print(f"   中位数更新块数: {median_updates:.1f}")
             print(f"   最大更新块数: {max_updates}")
             print(f"   最小更新块数: {min_updates}")
@@ -267,4 +292,10 @@ class EncodingStats:
         # 码表效率统计
         self.small_codebook_blocks_per_update.extend(other_stats.small_codebook_blocks_per_update)
         self.medium_codebook_blocks_per_update.extend(other_stats.medium_codebook_blocks_per_update)
-        self.full_codebook_blocks_per_update.extend(other_stats.full_codebook_blocks_per_update) 
+        self.full_codebook_blocks_per_update.extend(other_stats.full_codebook_blocks_per_update)
+        
+        # 合并块数分布统计
+        for block_count in [1, 2, 3, 4]:
+            self.small_blocks_distribution[block_count] += other_stats.small_blocks_distribution.get(block_count, 0)
+            self.medium_blocks_distribution[block_count] += other_stats.medium_blocks_distribution.get(block_count, 0)
+            self.full_blocks_distribution[block_count] += other_stats.full_blocks_distribution.get(block_count, 0) 

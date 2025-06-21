@@ -105,6 +105,10 @@ class SimpleStats:
         self.small_blocks_per_update = []
         self.medium_blocks_per_update = []
         self.full_blocks_per_update = []
+        # 新增：块数分布统计
+        self.small_blocks_distribution = {1: 0, 2: 0, 3: 0, 4: 0}
+        self.medium_blocks_distribution = {1: 0, 2: 0, 3: 0, 4: 0}
+        self.full_blocks_distribution = {1: 0, 2: 0, 3: 0, 4: 0}
 
 def encode_frame_chunk_worker(args):
     """帧编码chunk的worker函数"""
@@ -213,6 +217,17 @@ def encode_frame_chunk_worker(args):
                 local_stats.small_blocks_per_update.extend(small_blocks_per_update)
                 local_stats.medium_blocks_per_update.extend(medium_blocks_per_update)
                 local_stats.full_blocks_per_update.extend(full_blocks_per_update)
+                
+                # 统计块数分布
+                for block_count in small_blocks_per_update:
+                    if 1 <= block_count <= 4:
+                        local_stats.small_blocks_distribution[block_count] += 1
+                for block_count in medium_blocks_per_update:
+                    if 1 <= block_count <= 4:
+                        local_stats.medium_blocks_distribution[block_count] += 1
+                for block_count in full_blocks_per_update:
+                    if 1 <= block_count <= 4:
+                        local_stats.full_blocks_distribution[block_count] += 1
         
         encoded_frames.append(frame_data)
         current_offset += len(frame_data)
@@ -440,6 +455,12 @@ class VideoEncoderCore:
                 self.encoding_stats.small_codebook_blocks_per_update.extend(local_stats.small_blocks_per_update)
                 self.encoding_stats.medium_codebook_blocks_per_update.extend(local_stats.medium_blocks_per_update)
                 self.encoding_stats.full_codebook_blocks_per_update.extend(local_stats.full_blocks_per_update)
+                
+                # 合并块数分布统计
+                for block_count in [1, 2, 3, 4]:
+                    self.encoding_stats.small_blocks_distribution[block_count] += local_stats.small_blocks_distribution.get(block_count, 0)
+                    self.encoding_stats.medium_blocks_distribution[block_count] += local_stats.medium_blocks_distribution.get(block_count, 0)
+                    self.encoding_stats.full_blocks_distribution[block_count] += local_stats.full_blocks_distribution.get(block_count, 0)
         
         return all_encoded_frames, all_frame_offsets
     
