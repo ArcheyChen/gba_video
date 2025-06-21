@@ -13,8 +13,7 @@ YUV_Struct* VideoDecoder::unified_codebook;
 bool VideoDecoder::code_book_preloaded = false;
 
 // RGB555码本存储
-u8 VideoDecoder::rgb555_codebook_raw[UNIFIED_CODEBOOK_SIZE*sizeof(RGB555_Struct)+4]__attribute__((aligned(32)));
-RGB555_Struct* VideoDecoder::rgb555_codebook;
+RGB555_Struct VideoDecoder::rgb555_codebook[UNIFIED_CODEBOOK_SIZE];
 bool VideoDecoder::rgb555_codebook_preloaded = false;
 
 // 查找表定义
@@ -244,8 +243,6 @@ IWRAM_CODE void VideoDecoder::preload_codebook(const u8* src)
     code_book_preloaded = true;
     
     // 转换为RGB555码本
-    u8* rgb555_copy_raw_ptr = rgb555_codebook_raw + 4; // 跳过对齐填充的4字节
-    rgb555_codebook = (RGB555_Struct*)rgb555_copy_raw_ptr;
     convert_yuv_to_rgb555_codebook(unified_codebook, rgb555_codebook, UNIFIED_CODEBOOK_SIZE);
     rgb555_codebook_preloaded = true;
 }
@@ -258,8 +255,6 @@ IWRAM_CODE void VideoDecoder::decode_i_frame_unified(const u8* src, u16* dst)
                          &unified_codebook, UNIFIED_CODEBOOK_SIZE);
         
         // 转换为RGB555码本
-        u8* rgb555_copy_raw_ptr = rgb555_codebook_raw + 4; // 跳过对齐填充的4字节
-        rgb555_codebook = (RGB555_Struct*)rgb555_copy_raw_ptr;
         convert_yuv_to_rgb555_codebook(unified_codebook, rgb555_codebook, UNIFIED_CODEBOOK_SIZE);
         rgb555_codebook_preloaded = true;
     }

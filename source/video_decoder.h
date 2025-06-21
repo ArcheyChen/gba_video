@@ -35,8 +35,7 @@ private:
     static bool code_book_preloaded;
     
     // 解码后的RGB555码本存储（在IWRAM中）
-    static u8 rgb555_codebook_raw[UNIFIED_CODEBOOK_SIZE*sizeof(RGB555_Struct)+4]__attribute__((aligned(32)));
-    static RGB555_Struct *rgb555_codebook;
+    static RGB555_Struct rgb555_codebook[UNIFIED_CODEBOOK_SIZE];
     static bool rgb555_codebook_preloaded;
     
     // 查找表
