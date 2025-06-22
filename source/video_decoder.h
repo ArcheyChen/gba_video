@@ -41,11 +41,7 @@ private:
     // 查找表
     static u16 big_block_relative_offsets[240/4*160/4];
     static u16 zone_block_relative_offsets[240];
-    
-    // 私有解码函数
-    static void decode_color_block(const YUV_Struct &yuv_data, u16* dst);
-    static void decode_big_block(const YUV_Struct* codebook, const u8 quant_indices[4], u16* big_block_dst);
-    
+
     // 新增：RGB555码本解码函数
     static void decode_color_block_rgb555(const RGB555_Struct &rgb555_data, u16* dst);
     static void decode_big_block_rgb555(const RGB555_Struct* codebook, const u8 quant_indices[4], u16* big_block_dst);

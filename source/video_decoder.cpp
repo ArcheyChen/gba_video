@@ -57,64 +57,6 @@ void VideoDecoder::init() {
     }
 }
 
-IWRAM_CODE inline u32 yuv_to_rgb555_2pix(u8 _y0, u8 _y1, s8 d_r, s8 d_g, s8 d_b)
-{
-    auto lookup_table = VideoDecoder::clip_lookup_table + 128;
-    u32 result = lookup_table[_y0 + d_r];
-    result |= (lookup_table[_y0 + d_g] << 5);
-    result |= (lookup_table[_y0 + d_b] << 10);
-    result |= (lookup_table[_y1 + d_r] << 16);
-    result |= (lookup_table[_y1 + d_g] << 21);
-    result |= (lookup_table[_y1 + d_b] << 26);
-    
-    return result;
-}
-
-// 解码单个2x2块
-IWRAM_CODE void VideoDecoder::decode_block(const YUV_Struct &yuv_data, u16* dst)
-{
-    const s8 &d_r = yuv_data.d_r;
-    const s8 &d_g = yuv_data.d_g;
-    const s8 &d_b = yuv_data.d_b;
-
-    u32* dst_row = (u32*)dst;
-    auto const &y = yuv_data.y;
-    *dst_row = yuv_to_rgb555_2pix(
-        y[0][0],y[0][1], d_r, d_g, d_b);
-    *(dst_row + SCREEN_WIDTH/2) = yuv_to_rgb555_2pix(
-        y[1][0],y[1][1], d_r, d_g, d_b);
-}
-
-// 解码色块（2x2上采样到4x4）
-IWRAM_CODE void VideoDecoder::decode_color_block(const YUV_Struct &yuv_data, u16* dst)
-{
-    const s8 &d_r = yuv_data.d_r;
-    const s8 &d_g = yuv_data.d_g;
-    const s8 &d_b = yuv_data.d_b;
-    auto &y = yuv_data.y;
-    
-    u32* dst_row = (u32*)dst;
-    
-    // 第一行：1122
-    *dst_row = yuv_to_rgb555_2pix(y[0][0],y[0][0], d_r, d_g, d_b);
-    *(dst_row + 1) = yuv_to_rgb555_2pix(y[0][1],y[0][1], d_r, d_g, d_b);
-    
-    // 第二行：1122
-    dst_row += SCREEN_WIDTH/2;
-    *dst_row = yuv_to_rgb555_2pix(y[0][0],y[0][0], d_r, d_g, d_b);
-    *(dst_row + 1) = yuv_to_rgb555_2pix(y[0][1],y[0][1], d_r, d_g, d_b);
-    
-    // 第三行：3344
-    dst_row += SCREEN_WIDTH/2;
-    *dst_row = yuv_to_rgb555_2pix(y[1][0],y[1][0], d_r, d_g, d_b);
-    *(dst_row + 1) = yuv_to_rgb555_2pix(y[1][1],y[1][1], d_r, d_g, d_b);
-    
-    // 第四行：3344
-    dst_row += SCREEN_WIDTH/2;
-    *dst_row = yuv_to_rgb555_2pix(y[1][0],y[1][0], d_r, d_g, d_b);
-    *(dst_row + 1) = yuv_to_rgb555_2pix(y[1][1],y[1][1], d_r, d_g, d_b);
-}
-
 // RGB555码本解码函数 - 直接使用预计算的RGB555值
 IWRAM_CODE void VideoDecoder::decode_block_rgb555(const RGB555_Struct &rgb555_data, u16* dst)
 {
@@ -168,14 +110,6 @@ IWRAM_CODE void VideoDecoder::decode_big_block_rgb555(const RGB555_Struct* codeb
     decode_block_rgb555(codebook[quant_indices[3]], big_block_dst + SCREEN_WIDTH * 2 + 2);
 }
 
-// 通用的4x4大块解码函数（纹理块）- 支持跳过标记
-IWRAM_CODE void VideoDecoder::decode_big_block(const YUV_Struct* codebook, const u8 quant_indices[4], u16* big_block_dst)
-{
-    decode_block(codebook[quant_indices[0]], big_block_dst);
-    decode_block(codebook[quant_indices[1]], big_block_dst + 2);
-    decode_block(codebook[quant_indices[2]], big_block_dst + SCREEN_WIDTH * 2);
-    decode_block(codebook[quant_indices[3]], big_block_dst + SCREEN_WIDTH * 2 + 2);
-}
 
 // DMA拷贝码本的辅助函数
 IWRAM_CODE void VideoDecoder::copy_unified_codebook(u8* dst_raw, const u8* src, YUV_Struct** codebook_ptr, int codebook_size)

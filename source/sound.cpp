@@ -15,7 +15,7 @@ void sound_init(void) {
         SNDA_VOL_100;  // DirectSound A 左右声道、满音量
 }
 
-void sound_play(const u8 *data, u32 size, u32 sample_rate, bool loop) {
+void sound_play(const u8 *data, u32 sample_rate, bool loop) {
     sound_stop();  // 关闭之前的播放
 
     // 设置 Timer0 控制采样频率

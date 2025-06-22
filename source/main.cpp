@@ -37,7 +37,7 @@ IWRAM_CODE void doit(){
     // 初始化音频播放
     if (audio_data_len > 0) {
         sound_init();
-        sound_play((const u8*)audio_data, audio_data_len, SAMPLE_RATE, true);  // 循环播放
+        sound_play((const u8*)audio_data, SAMPLE_RATE, true);  // 循环播放
         audio_playing = true;
     }
     
@@ -62,21 +62,10 @@ IWRAM_CODE void doit(){
                     VBlankIntrWait();
                 continue;
             }
-            for(int i = 0; i < 10; i++) {
-                // 等待VBlank，防止CPU空跑跑满
-                int frame_id = frame + i;
-                if(frame_id >= VIDEO_FRAME_COUNT) {
-                    frame_id -= VIDEO_FRAME_COUNT;  // 循环回到起点
-                }
-                const unsigned char* next_frame_data = video_data + frame_offsets[frame_id];
-                if(VideoDecoder::is_i_frame(next_frame_data)) {
-                    // 预加载码本，以消耗掉空闲时间
-                    VideoDecoder::preload_codebook(next_frame_data);
-                    if(!should_copy)//预载后，再看一眼能不能立刻显示，不能的话，等一帧
-                        VBlankIntrWait();
-                    break;
-                }
-            }
+            VideoDecoder::preload_codebook(video_data + frame_offsets[VideoDecoder::next_i_frame]);
+            if(!should_copy)//预载后，再看一眼能不能立刻显示，不能的话，等一帧
+                VBlankIntrWait();
+            continue;
             // 预加载码本，以消耗掉空闲时间
             // 这个函数里面如果没事做，会等待VBlank，因此不用担心跑满CPU
         }
@@ -93,14 +82,7 @@ IWRAM_CODE void doit(){
             
             // 从I帧对应的音频偏移处重新开始播放
             const u8* audio_offset = (const u8*)audio_data + i_frame_audio_offsets[i_frame_index];
-            u32 remaining_audio_size = audio_data_len - i_frame_audio_offsets[i_frame_index];
-            
-            if (remaining_audio_size > 0) {
-                sound_play(audio_offset, remaining_audio_size, SAMPLE_RATE, true);
-            } else {
-                // 如果剩余音频不足，重新开始播放
-                sound_play((const u8*)audio_data, audio_data_len, SAMPLE_RATE, true);
-            }
+            sound_play(audio_offset, SAMPLE_RATE, true);
         }
         #endif
         
@@ -112,7 +94,7 @@ IWRAM_CODE void doit(){
             // 视频循环时，音频也应该重新开始
             if (audio_playing) {
                 sound_stop();
-                sound_play((const u8*)audio_data, audio_data_len, SAMPLE_RATE, true);
+                sound_play((const u8*)audio_data, SAMPLE_RATE, true);
             }
         }
         
