@@ -92,6 +92,7 @@ public:
     // 主要解码接口
     static void decode_frame(const u8* frame_data, u16* dst);
     static void preload_codebook(const u8* src);
+    static void load_codebook_and_convert(const u8* src);
     
     // 检查是否为I帧
     static bool is_i_frame(const u8* frame_data);

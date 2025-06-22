@@ -230,6 +230,18 @@ IWRAM_CODE void VideoDecoder::convert_yuv_to_rgb555_codebook(const YUV_Struct* y
     }
 }
 
+IWRAM_CODE void VideoDecoder::load_codebook_and_convert(const u8* src)
+{
+    // 预加载码本
+    copy_unified_codebook(unified_codebook_raw, src, &unified_codebook, UNIFIED_CODEBOOK_SIZE);
+    
+    // 转换为RGB555码本
+    convert_yuv_to_rgb555_codebook(unified_codebook, rgb555_codebook, UNIFIED_CODEBOOK_SIZE);
+    
+    code_book_preloaded = true;
+    rgb555_codebook_preloaded = true;
+}
+
 IWRAM_CODE void VideoDecoder::preload_codebook(const u8* src)
 {
     u8 frame_type = src[0];
@@ -237,26 +249,14 @@ IWRAM_CODE void VideoDecoder::preload_codebook(const u8* src)
         VBlankIntrWait(); // 等待VBlank，防止CPU空跑跑满
         return; // 只在I帧中预加载码本
     }
-    
-    // 加载YUV码本
-    copy_unified_codebook(unified_codebook_raw, src + 1, &unified_codebook, UNIFIED_CODEBOOK_SIZE);
-    code_book_preloaded = true;
-    
-    // 转换为RGB555码本
-    convert_yuv_to_rgb555_codebook(unified_codebook, rgb555_codebook, UNIFIED_CODEBOOK_SIZE);
-    rgb555_codebook_preloaded = true;
+    load_codebook_and_convert(src + 1);
 }
 
 IWRAM_CODE void VideoDecoder::decode_i_frame_unified(const u8* src, u16* dst)
 {
     // 拷贝统一码本
     if(!code_book_preloaded){
-        copy_unified_codebook(unified_codebook_raw, src, 
-                         &unified_codebook, UNIFIED_CODEBOOK_SIZE);
-        
-        // 转换为RGB555码本
-        convert_yuv_to_rgb555_codebook(unified_codebook, rgb555_codebook, UNIFIED_CODEBOOK_SIZE);
-        rgb555_codebook_preloaded = true;
+        load_codebook_and_convert(src);
     }
     code_book_preloaded = false;//清空标记，不然下一次的预载可能就不管用了
     rgb555_codebook_preloaded = false;
