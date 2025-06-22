@@ -49,7 +49,7 @@ IWRAM_CODE void doit(){
 
         
         // 渲染帧
-        int i_frame_index = VideoRenderer::render_frame(frame_data);
+        VideoRenderer::render_frame(frame_data);
         
         while(!should_copy) {
             if(VideoDecoder::rgb555_codebook_preloaded){
@@ -86,12 +86,12 @@ IWRAM_CODE void doit(){
         
         // 音画同步：如果是I帧，重新同步音频播放
         #ifdef I_FRAME_AUDIO_OFFSET_COUNT
-        if (i_frame_index >= 0) {
+        if ((frame & 0x3F) == 0) {//每隔64帧检查一次
             // 停止当前音频播放
             sound_stop();
             
             // 从I帧对应的音频偏移处重新开始播放
-            const u8* audio_offset = (const u8*)audio_data + i_frame_audio_offsets[i_frame_index];
+            const u8* audio_offset = (const u8*)audio_data + frame_audio_offsets[frame];
             sound_play(audio_offset, SAMPLE_RATE, true);
         }
         #endif

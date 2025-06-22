@@ -41,7 +41,27 @@ def main():
                    help="音频采样率（默认16000 Hz）")
     pa.add_argument("--no-audio", action="store_true",
                    help="禁用音频提取")
+    pa.add_argument("--audio-only", action="store_true", help="只导出音频文件，不处理视频")
     args = pa.parse_args()
+
+    # audio_only分支提前，直接return
+    if args.audio_only:
+        from audio_encoder import AudioEncoder
+        audio_encoder = AudioEncoder(sample_rate=args.audio_sample_rate)
+        frames, actual_output_fps = extract_frames_from_video(
+            args.input, args.duration, args.fps, args.full_duration, args.dither
+        )
+        frame_count = len(frames)
+        audio_duration = frame_count / actual_output_fps
+        audio_data, i_frame_audio_offsets, frame_audio_offsets = audio_encoder.extract_audio_from_video(
+            args.input, audio_duration, frame_count=frame_count)
+        output_base = pathlib.Path(args.out)
+        audio_header_path = output_base.parent / f"audio_data.h"
+        audio_source_path = output_base.parent / f"audio_data.c"
+        audio_encoder.write_audio_header(audio_header_path, audio_data, audio_duration, i_frame_audio_offsets, frame_audio_offsets)
+        audio_encoder.write_audio_source(audio_source_path, audio_data, i_frame_audio_offsets, frame_audio_offsets)
+        print(f"✓ 已生成音频文件: {audio_header_path.name} / {audio_source_path.name}")
+        return
 
     # 提取帧
     frames, actual_output_fps = extract_frames_from_video(
@@ -59,7 +79,8 @@ def main():
     if not args.no_audio:
         from audio_encoder import AudioEncoder
         audio_encoder = AudioEncoder(sample_rate=args.audio_sample_rate)
-        audio_data = audio_encoder.extract_audio_from_video(args.input, audio_duration)
+        audio_data, i_frame_audio_offsets, frame_audio_offsets = audio_encoder.extract_audio_from_video(
+            args.input, audio_duration, frame_count=len(frames))
         if audio_data is None:
             print("⚠️ 音频提取失败，继续处理视频...")
 
@@ -98,23 +119,9 @@ def main():
         output_base = pathlib.Path(args.out)
         audio_header_path = output_base.parent / f"audio_data.h"
         audio_source_path = output_base.parent / f"audio_data.c"
-        
-        # 传递I帧时间戳给音频编码器
-        if i_frame_timestamps:
-            audio_data, i_frame_audio_offsets = audio_encoder.extract_audio_from_video(
-                args.input, audio_duration, i_frame_timestamps=i_frame_timestamps
-            )
-        else:
-            audio_data, i_frame_audio_offsets = audio_encoder.extract_audio_from_video(
-                args.input, audio_duration
-            )
-        
-        if audio_data is not None:
-            audio_encoder.write_audio_header(audio_header_path, audio_data, audio_duration, i_frame_audio_offsets)
-            audio_encoder.write_audio_source(audio_source_path, audio_data, i_frame_audio_offsets)
-            print(f"✓ 已生成音频文件: {audio_header_path.name} / {audio_source_path.name}")
-        else:
-            print("⚠️ 音频提取失败，跳过音频文件生成")
+        audio_encoder.write_audio_header(audio_header_path, audio_data, audio_duration, i_frame_audio_offsets, frame_audio_offsets)
+        audio_encoder.write_audio_source(audio_source_path, audio_data, i_frame_audio_offsets, frame_audio_offsets)
+        print(f"✓ 已生成音频文件: {audio_header_path.name} / {audio_source_path.name}")
 
 if __name__ == "__main__":
     main()

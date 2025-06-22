@@ -14,7 +14,7 @@ class AudioEncoder:
         self.sample_rate = sample_rate
         self.bytes_per_second = sample_rate * 1 * 1  # 采样率 * 声道数 * 字节宽度
     
-    def extract_audio_from_video(self, video_path: str, duration: float, start_time: float = 0.0, i_frame_timestamps=None):
+    def extract_audio_from_video(self, video_path: str, duration: float, start_time: float = 0.0, i_frame_timestamps=None, frame_count=None):
         """从视频文件中提取音频"""
         print(f"正在从视频中提取音频...")
         print(f"  音频采样率: {self.sample_rate} Hz")
@@ -57,6 +57,18 @@ class AudioEncoder:
             while len(pcm8) % 4 != 0:
                 pcm8.append(0x80)  # GBA静音中心值
             
+            # 计算每帧音频偏移
+            frame_audio_offsets = None
+            if frame_count is not None:
+                frame_audio_offsets = []
+                for i in range(frame_count):
+                    timestamp = i / frame_count * duration
+                    offset = int(timestamp * self.bytes_per_second)
+                    if offset < len(pcm8):
+                        frame_audio_offsets.append(offset)
+                    else:
+                        frame_audio_offsets.append(len(pcm8) - 1)
+            
             # 计算I帧音频偏移
             i_frame_audio_offsets = []
             if i_frame_timestamps:
@@ -71,14 +83,14 @@ class AudioEncoder:
             print(f"✓ 音频提取完成: {len(pcm8)} 字节")
             print(f"✓ I帧音频偏移: {len(i_frame_audio_offsets)} 个偏移点")
             
-            return bytes(pcm8), i_frame_audio_offsets
+            return bytes(pcm8), i_frame_audio_offsets, frame_audio_offsets
             
         finally:
             # 清理临时文件
             if os.path.exists(temp_audio_path):
                 os.unlink(temp_audio_path)
     
-    def write_audio_header(self, path_h: Path, audio_data: bytes, duration: float, i_frame_audio_offsets=None):
+    def write_audio_header(self, path_h: Path, audio_data: bytes, duration: float, i_frame_audio_offsets=None, frame_audio_offsets=None):
         """生成音频头文件"""
         guard = "AUDIO_DATA_H"
         
@@ -104,9 +116,13 @@ extern const unsigned char audio_data[audio_data_len];
             if i_frame_audio_offsets:
                 f.write("extern const unsigned int i_frame_audio_offsets[I_FRAME_AUDIO_OFFSET_COUNT];\n")
             
+            if frame_audio_offsets:
+                f.write(f"#define FRAME_AUDIO_OFFSET_COUNT {len(frame_audio_offsets)}\n")
+                f.write(f"extern const unsigned int frame_audio_offsets[FRAME_AUDIO_OFFSET_COUNT];\n")
+            
             f.write(f"\n#endif // {guard}\n")
     
-    def write_audio_source(self, path_c: Path, audio_data: bytes, i_frame_audio_offsets=None):
+    def write_audio_source(self, path_c: Path, audio_data: bytes, i_frame_audio_offsets=None, frame_audio_offsets=None):
         """生成音频源文件"""
         with path_c.open("w", encoding="utf-8") as f:
             f.write('#include "audio_data.h"\n\n')
@@ -133,5 +149,14 @@ extern const unsigned char audio_data[audio_data_len];
                 per_line = 8
                 for i in range(0, len(i_frame_audio_offsets), per_line):
                     chunk = ', '.join(f"{offset}" for offset in i_frame_audio_offsets[i:i+per_line])
+                    f.write("    " + chunk + ",\n")
+                f.write("};\n")
+            
+            # 写入每帧音频偏移数组
+            if frame_audio_offsets:
+                f.write("\nconst unsigned int frame_audio_offsets[] = {\n")
+                per_line = 8
+                for i in range(0, len(frame_audio_offsets), per_line):
+                    chunk = ', '.join(f"{offset}" for offset in frame_audio_offsets[i:i+per_line])
                     f.write("    " + chunk + ",\n")
                 f.write("};\n") 
