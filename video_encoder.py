@@ -48,23 +48,17 @@ def main():
         args.input, args.duration, args.fps, args.full_duration, args.dither
     )
 
+    # 检查fps是否被修正
+    if args.fps > actual_output_fps:
+        print(f"⚠️ 用户输入的FPS({args.fps})高于实际视频FPS({actual_output_fps:.2f})，将自动使用实际FPS进行编码，避免加速。")
+    used_fps = actual_output_fps
+
     # 音频处理
     audio_data = None
+    audio_duration = len(frames) / used_fps  # 音频时长与实际导出帧严格一致
     if not args.no_audio:
         from audio_encoder import AudioEncoder
         audio_encoder = AudioEncoder(sample_rate=args.audio_sample_rate)
-        
-        # 计算实际音频时长
-        if args.full_duration:
-            import cv2
-            cap = cv2.VideoCapture(args.input)
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            src_fps = cap.get(cv2.CAP_PROP_FPS) or 30
-            audio_duration = total_frames / src_fps
-            cap.release()
-        else:
-            audio_duration = args.duration
-        
         audio_data = audio_encoder.extract_audio_from_video(args.input, audio_duration)
         if audio_data is None:
             print("⚠️ 音频提取失败，继续处理视频...")
@@ -87,7 +81,8 @@ def main():
         max_workers=args.max_workers,
         enabled_segments_bitmap=args.enabled_segments_bitmap,
         enabled_medium_segments_bitmap=args.enabled_medium_segments_bitmap,
-        use_parallel=not args.no_parallel
+        use_parallel=not args.no_parallel,
+        fps=used_fps
     )
     
     # 解包编码结果

@@ -250,7 +250,7 @@ class VideoEncoderCore:
                     force_i_threshold=0.7, variance_threshold=5.0, color_fallback_threshold=50.0, codebook_size=256,
                     kmeans_max_iter=200, i_frame_weight=3, max_workers=None,
                     enabled_segments_bitmap=0xFFFF, enabled_medium_segments_bitmap=0x0F,
-                    use_parallel=True):
+                    use_parallel=True, fps=30.0):
         """编码视频的主要流程"""
         
         print(f"码本配置: 统一码本{codebook_size}项")
@@ -313,8 +313,7 @@ class VideoEncoderCore:
         
         all_data = b''.join(encoded_frames)
         
-        # 计算I帧时间戳（假设30fps）
-        fps = 30.0
+        # 计算I帧时间戳（用实际fps）
         i_frame_timestamps = []
         for frame_idx in range(len(frames)):
             if frame_idx % i_frame_interval == 0 or frame_idx == 0:
