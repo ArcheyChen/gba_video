@@ -32,11 +32,11 @@ private:
     // 统一码本存储（在IWRAM中）
     static u8 unified_codebook_raw[UNIFIED_CODEBOOK_SIZE*sizeof(YUV_Struct)+4]__attribute__((aligned(32)));
     static YUV_Struct *unified_codebook;
-    static bool code_book_preloaded;
     
     // 解码后的RGB555码本存储（在IWRAM中）
-    static RGB555_Struct rgb555_codebook[UNIFIED_CODEBOOK_SIZE];
-    static bool rgb555_codebook_preloaded;
+    static RGB555_Struct rgb555_codebook_buf[2][UNIFIED_CODEBOOK_SIZE];
+    static RGB555_Struct *rgb555_codebook;
+    static int current_rgb555_codebook_index;  // 当前使用的RGB555码本索引
     
     // 查找表
     static u16 big_block_relative_offsets[240/4*160/4];
@@ -83,8 +83,23 @@ private:
     static void decode_p_frame_unified_rgb555(const u8* src, u16* dst);
 
 public:
+    static int next_i_frame;//用于预载
+    static bool code_book_preloaded;
+    static bool rgb555_codebook_preloaded;
     // 查找表（移到public以便外部函数访问）
     static u8 clip_lookup_table[512];
+    static void find_next_i_frame(const u8* video_data,int start_frame){
+        constexpr int max_find_count = 30; // 最多查找30帧
+        static int last_check_offset = 0;
+        for(int i=0;i<max_find_count;i++){
+            last_check_offset++;
+            if(is_i_frame(video_data + frame_offsets[start_frame+last_check_offset])){
+                next_i_frame = start_frame;
+                last_check_offset = 0; // 重置偏移
+                return;
+            }
+        }
+    }
     
     // 初始化函数
     static void init();

@@ -52,7 +52,31 @@ IWRAM_CODE void doit(){
         int i_frame_index = VideoRenderer::render_frame(frame_data);
         
         while(!should_copy) {
-            VideoDecoder::preload_codebook(frame_data);
+            if(VideoDecoder::rgb555_codebook_preloaded){
+                VBlankIntrWait();
+                continue;;
+            }
+            if(VideoDecoder::next_i_frame == -1){
+                VideoDecoder::find_next_i_frame(video_data, frame);
+                if(!should_copy)
+                    VBlankIntrWait();
+                continue;
+            }
+            for(int i = 0; i < 10; i++) {
+                // 等待VBlank，防止CPU空跑跑满
+                int frame_id = frame + i;
+                if(frame_id >= VIDEO_FRAME_COUNT) {
+                    frame_id -= VIDEO_FRAME_COUNT;  // 循环回到起点
+                }
+                const unsigned char* next_frame_data = video_data + frame_offsets[frame_id];
+                if(VideoDecoder::is_i_frame(next_frame_data)) {
+                    // 预加载码本，以消耗掉空闲时间
+                    VideoDecoder::preload_codebook(next_frame_data);
+                    if(!should_copy)//预载后，再看一眼能不能立刻显示，不能的话，等一帧
+                        VBlankIntrWait();
+                    break;
+                }
+            }
             // 预加载码本，以消耗掉空闲时间
             // 这个函数里面如果没事做，会等待VBlank，因此不用担心跑满CPU
         }

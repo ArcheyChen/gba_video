@@ -11,9 +11,12 @@ constexpr int PIXELS_PER_FRAME = SCREEN_WIDTH * SCREEN_HEIGHT;
 u8 VideoDecoder::unified_codebook_raw[UNIFIED_CODEBOOK_SIZE*sizeof(YUV_Struct)+4]__attribute__((aligned(32)));
 YUV_Struct* VideoDecoder::unified_codebook;
 bool VideoDecoder::code_book_preloaded = false;
+int VideoDecoder::next_i_frame = -1; //-1代表没找到下一个iframe
 
 // RGB555码本存储
-RGB555_Struct VideoDecoder::rgb555_codebook[UNIFIED_CODEBOOK_SIZE];
+RGB555_Struct VideoDecoder::rgb555_codebook_buf[2][UNIFIED_CODEBOOK_SIZE];
+int VideoDecoder::current_rgb555_codebook_index = 1;  // 当前使用的RGB555码本索引
+RGB555_Struct* VideoDecoder::rgb555_codebook = VideoDecoder::rgb555_codebook_buf[1];
 bool VideoDecoder::rgb555_codebook_preloaded = false;
 
 // 查找表定义
@@ -236,7 +239,7 @@ IWRAM_CODE void VideoDecoder::load_codebook_and_convert(const u8* src)
     copy_unified_codebook(unified_codebook_raw, src, &unified_codebook, UNIFIED_CODEBOOK_SIZE);
     
     // 转换为RGB555码本
-    convert_yuv_to_rgb555_codebook(unified_codebook, rgb555_codebook, UNIFIED_CODEBOOK_SIZE);
+    convert_yuv_to_rgb555_codebook(unified_codebook, rgb555_codebook_buf[current_rgb555_codebook_index^1], UNIFIED_CODEBOOK_SIZE);
     
     code_book_preloaded = true;
     rgb555_codebook_preloaded = true;
@@ -245,11 +248,21 @@ IWRAM_CODE void VideoDecoder::load_codebook_and_convert(const u8* src)
 IWRAM_CODE void VideoDecoder::preload_codebook(const u8* src)
 {
     u8 frame_type = src[0];
-    if(frame_type != FRAME_TYPE_I || code_book_preloaded) {
+    if(frame_type != FRAME_TYPE_I || rgb555_codebook_preloaded) {
         VBlankIntrWait(); // 等待VBlank，防止CPU空跑跑满
         return; // 只在I帧中预加载码本
     }
-    load_codebook_and_convert(src + 1);
+    if(!code_book_preloaded){
+        // 预加载统一码本
+        copy_unified_codebook(unified_codebook_raw, src + 1, &unified_codebook, UNIFIED_CODEBOOK_SIZE);
+        code_book_preloaded = true;
+        return;
+    }
+    if(!rgb555_codebook_preloaded){
+        // 预加载RGB555码本
+        convert_yuv_to_rgb555_codebook(unified_codebook, rgb555_codebook_buf[current_rgb555_codebook_index^1], UNIFIED_CODEBOOK_SIZE);
+        rgb555_codebook_preloaded = true;
+    }
 }
 
 IWRAM_CODE void VideoDecoder::decode_i_frame_unified(const u8* src, u16* dst)
@@ -260,7 +273,10 @@ IWRAM_CODE void VideoDecoder::decode_i_frame_unified(const u8* src, u16* dst)
     }
     code_book_preloaded = false;//清空标记，不然下一次的预载可能就不管用了
     rgb555_codebook_preloaded = false;
+    next_i_frame = -1; // 重置下一个I帧索引
     src += UNIFIED_CODEBOOK_SIZE * BYTES_PER_BLOCK;
+    current_rgb555_codebook_index ^= 1; // 切换到另一个RGB555码本缓冲区
+    rgb555_codebook = rgb555_codebook_buf[current_rgb555_codebook_index];
     
     u16 tot_big_blocks = (VIDEO_WIDTH / (BLOCK_WIDTH * 2)) * (VIDEO_HEIGHT / (BLOCK_HEIGHT * 2));
     
