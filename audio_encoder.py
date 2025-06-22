@@ -6,6 +6,7 @@ import os
 import struct
 from pathlib import Path
 from pydub import AudioSegment
+import numpy as np
 
 class AudioEncoder:
     """音频编码器，从视频文件中提取音频并转换为GBA格式"""
@@ -14,11 +15,14 @@ class AudioEncoder:
         self.sample_rate = sample_rate
         self.bytes_per_second = sample_rate * 1 * 1  # 采样率 * 声道数 * 字节宽度
     
-    def extract_audio_from_video(self, video_path: str, duration: float, start_time: float = 0.0, i_frame_timestamps=None, frame_count=None):
-        """从视频文件中提取音频"""
+    def extract_audio_from_video(self, video_path: str, duration: float, start_time: float = 0.0, i_frame_timestamps=None, frame_count=None, volume_percent=100):
+        """
+        从视频文件中提取音频，并可调整音量（百分比）
+        """
         print(f"正在从视频中提取音频...")
         print(f"  音频采样率: {self.sample_rate} Hz")
         print(f"  音频时长: {duration:.2f} 秒")
+        print(f"  音量调整: {volume_percent}%")
         
         # 创建临时文件
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_audio:
@@ -48,6 +52,14 @@ class AudioEncoder:
             # 使用pydub加载和处理音频
             sound = AudioSegment.from_file(temp_audio_path)
             sound = sound.set_channels(1).set_frame_rate(self.sample_rate).set_sample_width(1)
+            # 音量调整
+            if volume_percent != 100:
+                sound = sound + (20 * np.log10(volume_percent / 100.0))
+            # 获取实际音频时长
+            actual_audio_duration = sound.duration_seconds
+            if actual_audio_duration < duration:
+                print(f"⚠️ 实际音频时长({actual_audio_duration:.2f}s)小于请求时长({duration:.2f}s)，自动截断到实际时长。")
+                duration = actual_audio_duration
             
             # 获取原始PCM数据
             raw_data = sound.raw_data

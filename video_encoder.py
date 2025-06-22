@@ -37,11 +37,12 @@ def main():
                    help=f"启用中码表段的bitmap，每位表示对应段是否启用中码表模式（默认0x{DEFAULT_ENABLED_MEDIUM_SEGMENTS_BITMAP:02X}）")
     pa.add_argument("--no-parallel", action="store_true",
                    help="禁用并行处理，使用串行模式")
-    pa.add_argument("--audio-sample-rate", type=int, default=16000,
+    pa.add_argument("--audio-sample-rate", type=int, default=16384,
                    help="音频采样率（默认16000 Hz）")
     pa.add_argument("--no-audio", action="store_true",
                    help="禁用音频提取")
     pa.add_argument("--audio-only", action="store_true", help="只导出音频文件，不处理视频")
+    pa.add_argument("--volume", type=float, default=100.0, help="音频音量百分比（100为原始，200为放大一倍，50为减半）")
     args = pa.parse_args()
 
     # audio_only分支提前，直接return
@@ -54,7 +55,7 @@ def main():
         frame_count = len(frames)
         audio_duration = frame_count / actual_output_fps
         audio_data, i_frame_audio_offsets, frame_audio_offsets = audio_encoder.extract_audio_from_video(
-            args.input, audio_duration, frame_count=frame_count)
+            args.input, audio_duration, frame_count=frame_count, volume_percent=args.volume)
         output_base = pathlib.Path(args.out)
         audio_header_path = output_base.parent / f"audio_data.h"
         audio_source_path = output_base.parent / f"audio_data.c"
@@ -80,7 +81,7 @@ def main():
         from audio_encoder import AudioEncoder
         audio_encoder = AudioEncoder(sample_rate=args.audio_sample_rate)
         audio_data, i_frame_audio_offsets, frame_audio_offsets = audio_encoder.extract_audio_from_video(
-            args.input, audio_duration, frame_count=len(frames))
+            args.input, audio_duration, frame_count=len(frames), volume_percent=args.volume)
         if audio_data is None:
             print("⚠️ 音频提取失败，继续处理视频...")
 
