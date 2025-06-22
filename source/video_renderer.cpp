@@ -31,7 +31,11 @@ int VideoRenderer::render_frame(const u8* frame_data) {
     
     // 如果是I帧，增加计数器并返回I帧编号
     if (is_i_frame) {
-        return i_frame_counter++;
+        auto old_i_frame_counter = i_frame_counter++;
+        if(i_frame_counter>=I_FRAME_AUDIO_OFFSET_COUNT){
+            i_frame_counter = 0; // 重置计数器
+        }
+        return old_i_frame_counter;
     } else {
         return -1;  // P帧
     }

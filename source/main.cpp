@@ -56,18 +56,28 @@ IWRAM_CODE void doit(){
                 VBlankIntrWait();
                 continue;;
             }
-            if(VideoDecoder::next_i_frame == -1){
-                VideoDecoder::find_next_i_frame(video_data, frame);
-                if(!should_copy)
-                    VBlankIntrWait();
-                continue;
+            // if(VideoDecoder::next_i_frame == -1){
+            //     VideoDecoder::find_next_i_frame(video_data, frame);
+            //     if(!should_copy)
+            //         VBlankIntrWait();
+            //     continue;
+            // }
+            bool found_i_frame = false;
+            for(int i = 0; i < 10; ++i) {
+                int next_frame = frame + i;
+                if(next_frame >= VIDEO_FRAME_COUNT) {
+                    next_frame -= VIDEO_FRAME_COUNT;  // 循环回到起点
+                }
+                if(VideoDecoder::is_i_frame(frame_data + frame_offsets[frame + i])) {
+                    VideoDecoder::preload_codebook(video_data + frame_offsets[frame + i]);
+                    found_i_frame = true;
+                    break;
+                }
             }
-            VideoDecoder::preload_codebook(video_data + frame_offsets[VideoDecoder::next_i_frame]);
-            if(!should_copy)//预载后，再看一眼能不能立刻显示，不能的话，等一帧
+            if(!found_i_frame) {
+                // 如果没有找到I帧，等待VBlank
                 VBlankIntrWait();
-            continue;
-            // 预加载码本，以消耗掉空闲时间
-            // 这个函数里面如果没事做，会等待VBlank，因此不用担心跑满CPU
+            }
         }
         should_copy = false;
         
@@ -76,7 +86,7 @@ IWRAM_CODE void doit(){
         
         // 音画同步：如果是I帧，重新同步音频播放
         #ifdef I_FRAME_AUDIO_OFFSET_COUNT
-        if (i_frame_index >= 0 && audio_playing && i_frame_index < I_FRAME_AUDIO_OFFSET_COUNT) {
+        if (i_frame_index >= 0) {
             // 停止当前音频播放
             sound_stop();
             

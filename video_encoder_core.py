@@ -15,70 +15,54 @@ from video_encoder_utils import write_header, write_source
 
 # 全局函数，用于多进程
 def sort_single_gop_worker(args):
-    """单个GOP排序的worker函数"""
-    gop_start, gop_data, frames, i_frame_interval, diff_threshold = args
-    
-    codebook = gop_data['unified_codebook'].copy()
-    counts = np.zeros(len(codebook), dtype=int)
-    
-    # GOP 范围：起始帧下一个到下一个 I 帧
-    gop_end = min(gop_start + i_frame_interval, len(frames))
-    
-    # 统计每个码本项的使用频次
-    for fid in range(gop_start + 1, gop_end):
-        cur = frames[fid]
-        prev = frames[fid - 1]
-        # 识别更新的大块
-        updated = identify_updated_big_blocks(cur, prev, diff_threshold)
-        # 取出该帧的 block_types
-        bt_map = None
-        for fno, bt in gop_data['block_types_list']:
-            if fno == fid:
-                bt_map = bt; break
-        # 累加每个纹理子块的索引使用次数
-        for by, bx in updated:
-            is_color = bt_map and bt_map.get((by, bx), ('detail',))[0] == 'color'
-            if not is_color:
-                for sy in (0,1):
-                    for sx in (0,1):
-                        y, x = by*2+sy, bx*2+sx
-                        if y < cur.shape[0] and x < cur.shape[1]:
-                            b = cur[y, x]
-                            idx = quantize_blocks_unified(b.reshape(1, -1), codebook)[0]
-                            counts[idx] += 1
-    
-    # 检查是否有使用频次差异
-    max_count = counts.max()
-    min_count = counts.min()
-    total_usage = counts.sum()
-    
-    if max_count > min_count and total_usage > 0:
-        print(f"  GOP {gop_start}: 最大使用频次 {max_count}, 最小使用频次 {min_count}, 总使用次数 {total_usage}")
-        
-        # 根据 counts 降序排序，stable 保持相同频次项原序
-        order = np.argsort(-counts, kind='stable')
-        gop_data['unified_codebook'] = codebook[order]
-        
-        # 创建索引映射表（旧索引 -> 新索引）
-        index_mapping = np.zeros(len(codebook), dtype=int)
-        for new_idx, old_idx in enumerate(order):
-            index_mapping[old_idx] = new_idx
-        
-        # 更新 block_types 中的索引
-        for fid, bt in gop_data['block_types_list']:
-            if bt is not None:
-                for (big_by, big_bx), (block_type, block_indices) in bt.items():
-                    if block_type == 'detail':
-                        # 更新纹理块的索引
-                        new_indices = []
-                        for old_idx in block_indices:
-                            if old_idx < len(index_mapping):
-                                new_indices.append(index_mapping[old_idx])
-                            else:
-                                new_indices.append(old_idx)
-                        bt[(big_by, big_bx)] = (block_type, new_indices)
-    
-    return gop_start, gop_data
+    """批量GOP排序的worker函数"""
+    gop_batch, frames, i_frame_interval, diff_threshold = args
+    results = []
+    for gop_start, gop_data in gop_batch:
+        codebook = gop_data['unified_codebook'].copy()
+        counts = np.zeros(len(codebook), dtype=int)
+        gop_end = min(gop_start + i_frame_interval, len(frames))
+        for fid in range(gop_start + 1, gop_end):
+            cur = frames[fid]
+            prev = frames[fid - 1]
+            updated = identify_updated_big_blocks(cur, prev, diff_threshold)
+            bt_map = None
+            for fno, bt in gop_data['block_types_list']:
+                if fno == fid:
+                    bt_map = bt; break
+            for by, bx in updated:
+                is_color = bt_map and bt_map.get((by, bx), ('detail',))[0] == 'color'
+                if not is_color:
+                    for sy in (0,1):
+                        for sx in (0,1):
+                            y, x = by*2+sy, bx*2+sx
+                            if y < cur.shape[0] and x < cur.shape[1]:
+                                b = cur[y, x]
+                                idx = quantize_blocks_unified(b.reshape(1, -1), codebook)[0]
+                                counts[idx] += 1
+        max_count = counts.max()
+        min_count = counts.min()
+        total_usage = counts.sum()
+        if max_count > min_count and total_usage > 0:
+            print(f"  GOP {gop_start}: 最大使用频次 {max_count}, 最小使用频次 {min_count}, 总使用次数 {total_usage}")
+            order = np.argsort(-counts, kind='stable')
+            gop_data['unified_codebook'] = codebook[order]
+            index_mapping = np.zeros(len(codebook), dtype=int)
+            for new_idx, old_idx in enumerate(order):
+                index_mapping[old_idx] = new_idx
+            for fid, bt in gop_data['block_types_list']:
+                if bt is not None:
+                    for (big_by, big_bx), (block_type, block_indices) in bt.items():
+                        if block_type == 'detail':
+                            new_indices = []
+                            for old_idx in block_indices:
+                                if old_idx < len(index_mapping):
+                                    new_indices.append(index_mapping[old_idx])
+                                else:
+                                    new_indices.append(old_idx)
+                            bt[(big_by, big_bx)] = (block_type, new_indices)
+        results.append((gop_start, gop_data))
+    return results
 
 # 简化的统计数据结构，用于多进程
 class SimpleStats:
@@ -331,26 +315,24 @@ class VideoEncoderCore:
         return all_data, frame_offsets, i_frame_timestamps
     
     def _parallel_sort_codebooks(self, frames, gop_codebooks, i_frame_interval, diff_threshold, max_workers):
-        """并行码本排序"""
-        # 准备GOP数据
+        """并行码本排序（每个进程处理多个GOP，减少通讯）"""
         gop_items = list(gop_codebooks.items())
-        
-        # 准备worker参数
+        total_gops = len(gop_items)
+        # 计算每个进程分配多少GOP
+        num_workers = min(max_workers, total_gops)
+        gops_per_worker = (total_gops + num_workers - 1) // num_workers
         worker_args = []
-        for gop_start, gop_data in gop_items:
-            args = (gop_start, gop_data, frames, i_frame_interval, diff_threshold)
+        for i in range(0, total_gops, gops_per_worker):
+            batch = gop_items[i:i+gops_per_worker]
+            args = (batch, frames, i_frame_interval, diff_threshold)
             worker_args.append(args)
-        
-        # 使用进程池并行处理所有GOP
         sorted_gop_codebooks = {}
-        with ProcessPoolExecutor(max_workers=min(len(worker_args), max_workers)) as executor:
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
             futures = [executor.submit(sort_single_gop_worker, args) for args in worker_args]
-            
-            # 收集结果
             for future in as_completed(futures):
-                gop_start, gop_data = future.result()
-                sorted_gop_codebooks[gop_start] = gop_data
-        
+                batch_result = future.result()
+                for gop_start, gop_data in batch_result:
+                    sorted_gop_codebooks[gop_start] = gop_data
         return sorted_gop_codebooks
     
     def _parallel_encode_frames(self, frames, gop_codebooks, i_frame_interval, diff_threshold, 
