@@ -18,6 +18,7 @@ static volatile u32 vbl = 0;
 static volatile u32 acc = 0;
 static volatile bool should_copy = false;
 static bool force_sound_sync = true;
+static bool free_play_mode = false;
 #define LCD_FPS 597275
 //这个是乘了10000后的FPS，这样更精确
 IWRAM_CODE void isr_vbl() { 
@@ -36,6 +37,7 @@ IWRAM_CODE void doit(){
     
     // 初始化音频播放
     sound_init();
+    VideoDecoder::reset_codebook();
     force_sound_sync = true;
     
     while (1)//main display loop
@@ -45,33 +47,19 @@ IWRAM_CODE void doit(){
         // 渲染帧
         VideoRenderer::render_frame(frame_data);
         
-        while(!should_copy) {
+        while(!should_copy && !free_play_mode) {
             if(VideoDecoder::rgb555_codebook_preloaded){
                 VBlankIntrWait();
                 continue;;
             }
-            // if(VideoDecoder::next_i_frame == -1){
-            //     VideoDecoder::find_next_i_frame(video_data, frame);
-            //     if(!should_copy)
-            //         VBlankIntrWait();
-            //     continue;
-            // }
-            bool found_i_frame = false;
-            for(int i = 0; i < 10; ++i) {
-                int next_frame = frame + i;
-                if(next_frame >= VIDEO_FRAME_COUNT) {
-                    next_frame -= VIDEO_FRAME_COUNT;  // 循环回到起点
-                }
-                if(VideoDecoder::is_i_frame(frame_data + frame_offsets[frame + i])) {
-                    VideoDecoder::preload_codebook(video_data + frame_offsets[frame + i]);
-                    found_i_frame = true;
-                    break;
-                }
+            if(VideoDecoder::next_i_frame == -1){
+                VideoDecoder::find_next_i_frame(video_data, frame+1);
+                if(!should_copy)
+                    VBlankIntrWait();
+                continue;
             }
-            if(!found_i_frame) {
-                // 如果没有找到I帧，等待VBlank
-                VBlankIntrWait();
-            }
+            VideoDecoder::preload_codebook(video_data + frame_offsets[VideoDecoder::next_i_frame]);
+
         }
         should_copy = false;
         
@@ -106,6 +94,10 @@ IWRAM_CODE void doit(){
                 scanKeys();
                 VBlankIntrWait();
             }
+            free_play_mode = false; // 暂停时退出自由播放模式
+        }
+        if(keys & KEY_SELECT){
+            free_play_mode = !free_play_mode; // 切换自由播放模式
         }
         if (keys & (KEY_RIGHT)){
             sound_stop();//防止爆音

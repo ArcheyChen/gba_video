@@ -82,18 +82,21 @@ public:
     static int next_i_frame;//用于预载
     static bool code_book_preloaded;
     static bool rgb555_codebook_preloaded;
+    static int last_check_frame;
     // 查找表（移到public以便外部函数访问）
     static u8 clip_lookup_table[512];
     static void find_next_i_frame(const u8* video_data,int start_frame){
-        constexpr int max_find_count = 30; // 最多查找30帧
-        static int last_check_offset = 0;
+        constexpr int max_find_count = 30; // 一次最多查找30帧
+        if(last_check_frame == -1){
+            last_check_frame = start_frame;
+        }
         for(int i=0;i<max_find_count;i++){
-            last_check_offset++;
-            if(is_i_frame(video_data + frame_offsets[start_frame+last_check_offset])){
-                next_i_frame = start_frame;
-                last_check_offset = 0; // 重置偏移
+            if(is_i_frame(video_data + frame_offsets[last_check_frame])){
+                next_i_frame = last_check_frame;
+                last_check_frame = -1; // 重置偏移
                 return;
             }
+            last_check_frame++;
         }
     }
     
@@ -116,6 +119,7 @@ public:
     static void reset_codebook() {
         code_book_preloaded = false;
         rgb555_codebook_preloaded = false;
+        last_check_frame = -1;
         next_i_frame = -1; // 重置下一个I帧索引
     }
 };

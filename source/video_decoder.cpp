@@ -11,6 +11,7 @@ constexpr int PIXELS_PER_FRAME = SCREEN_WIDTH * SCREEN_HEIGHT;
 u8 VideoDecoder::unified_codebook_raw[UNIFIED_CODEBOOK_SIZE*sizeof(YUV_Struct)+4]__attribute__((aligned(32)));
 YUV_Struct* VideoDecoder::unified_codebook;
 bool VideoDecoder::code_book_preloaded = false;
+int VideoDecoder::last_check_frame = -1;
 int VideoDecoder::next_i_frame = -1; //-1代表没找到下一个iframe
 
 // RGB555码本存储
@@ -206,7 +207,7 @@ IWRAM_CODE void VideoDecoder::decode_i_frame_unified(const u8* src, u16* dst)
         load_codebook_and_convert(src);
     }
     reset_codebook();
-    
+
     src += UNIFIED_CODEBOOK_SIZE * BYTES_PER_BLOCK;
     current_rgb555_codebook_index ^= 1; // 切换到另一个RGB555码本缓冲区
     rgb555_codebook = rgb555_codebook_buf[current_rgb555_codebook_index];
