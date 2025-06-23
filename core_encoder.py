@@ -96,9 +96,9 @@ def pack_yuv420_frame_numba(bgr_frame):
             d_b = clip_value(cb_mean, -128.0, 127.0)
             
             # 将有符号值转换为无符号字节存储
-            block_array[by, bx, 4] = np.uint8(np.int8(d_r).view(np.uint8))
-            block_array[by, bx, 5] = np.uint8(np.int8(d_g).view(np.uint8))
-            block_array[by, bx, 6] = np.uint8(np.int8(d_b).view(np.uint8))
+            block_array[by, bx, 4] = np.uint8(np.int8(d_r))
+            block_array[by, bx, 5] = np.uint8(np.int8(d_g))
+            block_array[by, bx, 6] = np.uint8(np.int8(d_b))
     
     return block_array
 
@@ -138,18 +138,15 @@ def calculate_color_block_distance(color_block: np.ndarray, codebook_entry: np.n
     
     return distance
 
-def classify_4x4_blocks_unified(blocks: np.ndarray, variance_threshold: float = 5.0) -> tuple:
-    """将4x4块分类为大色块和纹理块，用于统一码本"""
+@njit(cache=True, fastmath=True)
+def classify_4x4_blocks_unified_numba(blocks, variance_threshold=5.0):
     blocks_h, blocks_w = blocks.shape[:2]
     big_blocks_h = blocks_h // 2
     big_blocks_w = blocks_w // 2
-    
-    all_blocks = []  # 所有2x2块
-    block_types = {}   # 记录每个4x4块的类型和对应的2x2块索引
-    
+    all_blocks = []
+    block_types_list = []  # list of (big_by, big_bx, type, indices)
     for big_by in range(big_blocks_h):
         for big_bx in range(big_blocks_w):
-            # 收集4x4大块内的4个2x2小块
             blocks_4x4 = []
             for sub_by in range(2):
                 for sub_bx in range(2):
@@ -159,49 +156,56 @@ def classify_4x4_blocks_unified(blocks: np.ndarray, variance_threshold: float = 
                         blocks_4x4.append(blocks[by, bx])
                     else:
                         blocks_4x4.append(np.zeros(BYTES_PER_BLOCK, dtype=np.uint8))
-            
-            # 检查每个2x2子块是否内部一致（而非整个4x4块）
             all_2x2_blocks_are_uniform = True
             for block in blocks_4x4:
-                if calculate_2x2_block_variance(block) > variance_threshold:
+                y = block[:4].astype(np.float32)
+                v = ((y[0] - y[1]) ** 2 + (y[0] - y[2]) ** 2 + (y[0] - y[3]) ** 2 + (y[1] - y[2]) ** 2 + (y[1] - y[3]) ** 2 + (y[2] - y[3]) ** 2) / 6.0
+                if v > variance_threshold:
                     all_2x2_blocks_are_uniform = False
                     break
-            
             if all_2x2_blocks_are_uniform:
-                # 大色块：每个2x2子块内部都一致，用下采样的2x2块表示
                 downsampled_block = np.zeros(BYTES_PER_BLOCK, dtype=np.uint8)
-                
-                y_values = []
-                d_r_values = []
-                d_g_values = []
-                d_b_values = []
-                
-                for block in blocks_4x4:
-                    # 每个2x2块内部一致，取其内部平均值
-                    avg_y = np.mean(block[:4])
-                    y_values.append(int(avg_y))
-                    d_r_values.append(block[4].view(np.int8))
-                    d_g_values.append(block[5].view(np.int8))
-                    d_b_values.append(block[6].view(np.int8))
-                
-                # 用4个2x2子块的平均值构成下采样块
-                downsampled_block[:4] = np.array(y_values, dtype=np.uint8)
-                downsampled_block[4] = np.clip(np.mean(d_r_values), -128, 127).astype(np.int8).view(np.uint8)
-                downsampled_block[5] = np.clip(np.mean(d_g_values), -128, 127).astype(np.int8).view(np.uint8)
-                downsampled_block[6] = np.clip(np.mean(d_b_values), -128, 127).astype(np.int8).view(np.uint8)
-                
+                y_values = np.zeros(4, dtype=np.uint8)
+                d_r_values = np.zeros(4, dtype=np.int8)
+                d_g_values = np.zeros(4, dtype=np.int8)
+                d_b_values = np.zeros(4, dtype=np.int8)
+                for i in range(4):
+                    block = blocks_4x4[i]
+                    y_values[i] = int(np.mean(block[:4]))
+                    d_r_values[i] = np.int8(block[4])
+                    d_g_values[i] = np.int8(block[5])
+                    d_b_values[i] = np.int8(block[6])
+                downsampled_block[:4] = y_values
+                val_r = np.mean(d_r_values)
+                val_r = min(max(val_r, -128), 127)
+                downsampled_block[4] = np.int8(val_r)
+                val_g = np.mean(d_g_values)
+                val_g = min(max(val_g, -128), 127)
+                downsampled_block[5] = np.int8(val_g)
+                val_b = np.mean(d_b_values)
+                val_b = min(max(val_b, -128), 127)
+                downsampled_block[6] = np.int8(val_b)
                 block_idx = len(all_blocks)
                 all_blocks.append(downsampled_block)
-                block_types[(big_by, big_bx)] = ('color', [block_idx])
+                block_types_list.append((big_by, big_bx, 0, [block_idx]))  # 0=color
             else:
-                # 纹理块：至少有一个2x2子块内部不一致，保留所有4个2x2块
                 block_indices = []
                 for block in blocks_4x4:
                     block_idx = len(all_blocks)
                     all_blocks.append(block)
                     block_indices.append(block_idx)
-                block_types[(big_by, big_bx)] = ('detail', block_indices)
-    
+                block_types_list.append((big_by, big_bx, 1, block_indices))  # 1=detail
+    return all_blocks, block_types_list
+
+def classify_4x4_blocks_unified(blocks: np.ndarray, variance_threshold: float = 5.0) -> tuple:
+    """4x4块分类为大色块和纹理块，用于统一码本，外部接口不变"""
+    all_blocks, block_types_list = classify_4x4_blocks_unified_numba(blocks, variance_threshold)
+    block_types = {}
+    for big_by, big_bx, typ, indices in block_types_list:
+        if typ == 0:
+            block_types[(big_by, big_bx)] = ('color', indices)
+        else:
+            block_types[(big_by, big_bx)] = ('detail', indices)
     return all_blocks, block_types
 
 def generate_codebook(blocks_data: np.ndarray, codebook_size: int, max_iter: int = 100) -> tuple:
