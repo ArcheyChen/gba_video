@@ -15,6 +15,7 @@
 基本性能：可实现30FPS流畅播放，一分钟的纯视频在2.3MB-5.5MB不等，添加上音频后，由于采用的是PCM编码，因此体积增加直接等同于你的采样率。如16Khz的采样率，一秒的体积会增加16KB。
 
 采用的基本技术：YUV420采样，VQ量化，I/P帧编码，频率编码，平坦区域上采样。
+- 采用分频器算法以实现真正的24FPS播放，解决了屏幕60HZ刷新率与视频帧数不匹配的问题。
 
 
 -----
@@ -94,6 +95,7 @@ This project is still quite rough at the moment. I hope talented individuals can
 - I/P frame encoding
 - Frequency encoding
 - Upsampling for flat regions
+- Uses a frequency divider algorithm to achieve true 24FPS playback, solving the mismatch between the 60Hz screen refresh rate and video frame rates.
 
 -----
 

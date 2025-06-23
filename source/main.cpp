@@ -17,7 +17,6 @@
 static volatile u32 vbl = 0;
 static volatile u32 acc = 0;
 static volatile bool should_copy = false;
-static volatile bool audio_playing = false;  // 音频播放状态
 #define LCD_FPS 597275
 //这个是乘了10000后的FPS，这样更精确
 IWRAM_CODE void isr_vbl() { 
@@ -38,7 +37,6 @@ IWRAM_CODE void doit(){
     if (audio_data_len > 0) {
         sound_init();
         sound_play((const u8*)audio_data, SAMPLE_RATE, true);  // 循环播放
-        audio_playing = true;
     }
     
     while (1)
@@ -88,8 +86,6 @@ IWRAM_CODE void doit(){
         #ifdef I_FRAME_AUDIO_OFFSET_COUNT
         if ((frame & 0x3F) == 0) {//每隔64帧检查一次
             // 停止当前音频播放
-            sound_stop();
-            
             // 从I帧对应的音频偏移处重新开始播放
             const u8* audio_offset = (const u8*)audio_data + frame_audio_offsets[frame];
             sound_play(audio_offset, SAMPLE_RATE, true);
@@ -102,12 +98,21 @@ IWRAM_CODE void doit(){
             // 重置I帧计数器
             VideoRenderer::reset_i_frame_counter();
             // 视频循环时，音频也应该重新开始
-            if (audio_playing) {
-                sound_stop();
-                sound_play((const u8*)audio_data, SAMPLE_RATE, true);
-            }
+            sound_play((const u8*)audio_data, SAMPLE_RATE, true);
         }
-        
+        scanKeys();
+        u16 keys = keysDown();
+        if (keys & KEY_START) {
+
+            sound_stop();
+            // 暂停功能
+            while (!(keysDown() & KEY_START)) {
+                scanKeys();
+                VBlankIntrWait();
+            }
+            const u8* audio_offset = (const u8*)audio_data + frame_audio_offsets[frame];
+            sound_play(audio_offset, SAMPLE_RATE, true);
+        }
     }
 }
 
