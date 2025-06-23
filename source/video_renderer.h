@@ -5,9 +5,6 @@
 
 // 视频渲染器类
 class VideoRenderer {
-private:
-    static int i_frame_counter;  // I帧计数器
-    
 public:
     // EWRAM 单缓冲
     static u16 ewramBuffer[SCREEN_WIDTH * SCREEN_HEIGHT];
@@ -22,9 +19,6 @@ public:
     
     // 清除缓冲区
     static void clear_buffer();
-    
-    // 重置I帧计数器
-    static void reset_i_frame_counter() { i_frame_counter = 0; }
 };
 
 #endif // VIDEO_RENDERER_H 

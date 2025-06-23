@@ -113,6 +113,11 @@ public:
     static bool is_rgb555_codebook_preloaded() { return rgb555_codebook_preloaded; }
 
     static void decode_block(const YUV_Struct &yuv_data, u16* dst);
+    static void reset_codebook() {
+        code_book_preloaded = false;
+        rgb555_codebook_preloaded = false;
+        next_i_frame = -1; // 重置下一个I帧索引
+    }
 };
 
 #endif // VIDEO_DECODER_H 

@@ -17,6 +17,7 @@
 static volatile u32 vbl = 0;
 static volatile u32 acc = 0;
 static volatile bool should_copy = false;
+static bool force_sound_sync = true;
 #define LCD_FPS 597275
 //这个是乘了10000后的FPS，这样更精确
 IWRAM_CODE void isr_vbl() { 
@@ -34,18 +35,13 @@ IWRAM_CODE void doit(){
     int frame = 0;
     
     // 初始化音频播放
-    if (audio_data_len > 0) {
-        sound_init();
-        sound_play((const u8*)audio_data, SAMPLE_RATE, true);  // 循环播放
-    }
+    sound_init();
+    force_sound_sync = true;
     
-    while (1)
+    while (1)//main display loop
     {
         const unsigned char* frame_data = video_data + frame_offsets[frame];
-        
-        // VBlankIntrWait(); // 注释掉以提高性能，让DMA自动等待
 
-        
         // 渲染帧
         VideoRenderer::render_frame(frame_data);
         
@@ -84,8 +80,7 @@ IWRAM_CODE void doit(){
         
         // 音画同步：如果是I帧，重新同步音频播放
         #ifdef I_FRAME_AUDIO_OFFSET_COUNT
-        if ((frame & 0x3F) == 0) {//每隔64帧检查一次
-            // 停止当前音频播放
+        if ((frame & 0x3F) == 0 || force_sound_sync) {//每隔64帧检查一次
             // 从I帧对应的音频偏移处重新开始播放
             const u8* audio_offset = (const u8*)audio_data + frame_audio_offsets[frame];
             sound_play(audio_offset, SAMPLE_RATE, true);
@@ -95,23 +90,54 @@ IWRAM_CODE void doit(){
         frame++;
         if(frame >= VIDEO_FRAME_COUNT) {
             frame = 0;
-            // 重置I帧计数器
-            VideoRenderer::reset_i_frame_counter();
+            VideoDecoder::reset_codebook();
             // 视频循环时，音频也应该重新开始
             sound_play((const u8*)audio_data, SAMPLE_RATE, true);
+            force_sound_sync = true; // 强制音频同步
         }
         scanKeys();
         u16 keys = keysDown();
-        if (keys & KEY_START) {
+        if (keys & (KEY_START | KEY_A)) {
 
             sound_stop();
+            force_sound_sync = true;
             // 暂停功能
-            while (!(keysDown() & KEY_START)) {
+            while (!(keysDown() & (KEY_START | KEY_A))) {
                 scanKeys();
                 VBlankIntrWait();
             }
-            const u8* audio_offset = (const u8*)audio_data + frame_audio_offsets[frame];
-            sound_play(audio_offset, SAMPLE_RATE, true);
+        }
+        if (keys & (KEY_RIGHT)){
+            sound_stop();//防止爆音
+            frame += 3 * VIDEO_FPS/10000;//快进3秒，这个VIDEO_FPS是乘了10000的
+            if (frame >= VIDEO_FRAME_COUNT) {
+                frame = 0;
+            }
+            while(!VideoDecoder::is_i_frame(video_data + frame_offsets[frame])) {
+                frame++;
+                if (frame >= VIDEO_FRAME_COUNT) {
+                    frame = 0;
+                }
+            }
+            VideoDecoder::reset_codebook();
+            force_sound_sync = true; // 强制音频同步
+            continue;
+        }
+
+        if (keys & KEY_LEFT){
+            sound_stop();//防止爆音
+            frame -= 3 * VIDEO_FPS/10000;//快进3秒，这个VIDEO_FPS是乘了10000的
+            if (frame <= 0) {
+                frame = 0;
+            }
+            while(!VideoDecoder::is_i_frame(video_data + frame_offsets[frame])) {
+                frame--;
+                if (frame <= 0) {
+                    frame = 0;
+                }
+            }
+            VideoDecoder::reset_codebook();
+            force_sound_sync = true; // 强制音频同步
         }
     }
 }

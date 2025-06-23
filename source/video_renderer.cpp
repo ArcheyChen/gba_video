@@ -6,7 +6,6 @@
 
 // 静态成员变量定义
 EWRAM_BSS u16 VideoRenderer::ewramBuffer[SCREEN_WIDTH * SCREEN_HEIGHT];
-EWRAM_DATA int VideoRenderer::i_frame_counter = 0;
 
 void VideoRenderer::init() {
     // 初始化视频解码器
@@ -15,8 +14,6 @@ void VideoRenderer::init() {
     // 清除缓冲区
     clear_buffer();
     
-    // 重置I帧计数器
-    reset_i_frame_counter();
     
     // 初始显示
     DMA3COPY(ewramBuffer, VRAM, (SCREEN_WIDTH * SCREEN_HEIGHT >> 1) | DMA32);
