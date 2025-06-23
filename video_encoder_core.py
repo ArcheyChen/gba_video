@@ -7,6 +7,7 @@ import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import time
 import pickle
+from numba import njit
 
 from core_encoder import *
 from gop_processor import generate_gop_unified_codebooks
@@ -453,61 +454,90 @@ class VideoEncoderCore:
         
         return all_encoded_frames, all_frame_offsets
     
+    @njit(cache=True, fastmath=True)
+    def count_codebook_usage_numba(cur_frames, prev_frames, block_types_arr, codebook, diff_threshold):
+        n_frames = cur_frames.shape[0]
+        counts = np.zeros(codebook.shape[0], dtype=np.int64)
+        for i in range(n_frames):
+            cur = cur_frames[i]
+            prev = prev_frames[i]
+            bt_map = block_types_arr[i]
+            blocks_h, blocks_w = cur.shape[:2]
+            big_blocks_h = blocks_h // 2
+            big_blocks_w = blocks_w // 2
+            for big_by in range(big_blocks_h):
+                for big_bx in range(big_blocks_w):
+                    # 只处理 detail 块
+                    if bt_map[big_by, big_bx, 0] == 1:
+                        for sy in (0,1):
+                            for sx in (0,1):
+                                y, x = big_by*2+sy, big_bx*2+sx
+                                if y < blocks_h and x < blocks_w:
+                                    b = cur[y, x]
+                                    # 量化
+                                    min_dist = 1e10
+                                    best_idx = 0
+                                    for j in range(codebook.shape[0]):
+                                        dist = 0.0
+                                        for k in range(b.shape[0]):
+                                            diff = float(b[k]) - float(codebook[j, k])
+                                            dist += diff * diff
+                                        if dist < min_dist:
+                                            min_dist = dist
+                                            best_idx = j
+                                    counts[best_idx] += 1
+        return counts
+
     def _sort_codebooks_by_usage(self, frames, gop_codebooks, i_frame_interval, diff_threshold):
-        """根据使用频次对码本进行排序（原始串行版本）"""
+        """根据使用频次对码本进行排序（JIT加速统计）"""
         for gop_start, gop_data in gop_codebooks.items():
             codebook = gop_data['unified_codebook']
-            counts = np.zeros(len(codebook), dtype=int)
-            
-            # GOP 范围：起始帧下一个到下一个 I 帧
             gop_end = min(gop_start + i_frame_interval, len(frames))
-            
-            # 统计每个码本项的使用频次
+            # 收集所有需要统计的帧和 block_types
+            cur_frames = []
+            prev_frames = []
+            block_types_arr = []
             for fid in range(gop_start + 1, gop_end):
                 cur = frames[fid]
                 prev = frames[fid - 1]
-                # 识别更新的大块
-                updated = identify_updated_big_blocks(cur, prev, diff_threshold)
-                # 取出该帧的 block_types
                 bt_map = None
                 for fno, bt in gop_data['block_types_list']:
                     if fno == fid:
                         bt_map = bt; break
-                # 累加每个纹理子块的索引使用次数
-                for by, bx in updated:
-                    is_color = bt_map and bt_map.get((by, bx), ('detail',))[0] == 'color'
-                    if not is_color:
-                        for sy in (0,1):
-                            for sx in (0,1):
-                                y, x = by*2+sy, bx*2+sx
-                                if y < cur.shape[0] and x < cur.shape[1]:
-                                    b = cur[y, x]
-                                    idx = quantize_blocks_unified(b.reshape(1, -1), codebook)[0]
-                                    counts[idx] += 1
-            
-            # 检查是否有使用频次差异
+                # 将 block_types dict 转为 numpy 数组，0=color, 1=detail
+                blocks_h, blocks_w = cur.shape[:2]
+                big_blocks_h = blocks_h // 2
+                big_blocks_w = blocks_w // 2
+                bt_arr = np.zeros((big_blocks_h, big_blocks_w, 2), dtype=np.int32)
+                for (by, bx), (typ, indices) in bt_map.items():
+                    if typ == 'color':
+                        bt_arr[by, bx, 0] = 0
+                    else:
+                        bt_arr[by, bx, 0] = 1
+                cur_frames.append(cur)
+                prev_frames.append(prev)
+                block_types_arr.append(bt_arr)
+            if len(cur_frames) == 0:
+                counts = np.zeros(len(codebook), dtype=int)
+            else:
+                cur_frames_np = np.stack(cur_frames)
+                prev_frames_np = np.stack(prev_frames)
+                block_types_np = np.stack(block_types_arr)
+                counts = self.count_codebook_usage_numba(cur_frames_np, prev_frames_np, block_types_np, codebook, diff_threshold)
             max_count = counts.max()
             min_count = counts.min()
             total_usage = counts.sum()
-            
             if max_count > min_count and total_usage > 0:
                 print(f"  GOP {gop_start}: 最大使用频次 {max_count}, 最小使用频次 {min_count}, 总使用次数 {total_usage}")
-                
-                # 根据 counts 降序排序，stable 保持相同频次项原序
                 order = np.argsort(-counts, kind='stable')
                 gop_data['unified_codebook'] = codebook[order]
-                
-                # 创建索引映射表（旧索引 -> 新索引）
                 index_mapping = np.zeros(len(codebook), dtype=int)
                 for new_idx, old_idx in enumerate(order):
                     index_mapping[old_idx] = new_idx
-                
-                # 更新 block_types 中的索引
                 for fid, bt in gop_data['block_types_list']:
                     if bt is not None:
                         for (big_by, big_bx), (block_type, block_indices) in bt.items():
                             if block_type == 'detail':
-                                # 更新纹理块的索引
                                 new_indices = []
                                 for old_idx in block_indices:
                                     if old_idx < len(index_mapping):
