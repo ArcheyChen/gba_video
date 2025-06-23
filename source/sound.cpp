@@ -1,9 +1,10 @@
 #include <gba.h>
 #include "sound.h"
+#include "audio_data.h"
 
 #define TIMER_FREQ 16777216  // GBA 主频 = 16.777216 MHz
 
-static inline u16 timer_reload(u32 sample_rate) {
+constexpr static inline u16 timer_reload(u32 sample_rate) {
     return (u16)(0x10000 - (TIMER_FREQ / sample_rate));
 }
 
@@ -15,11 +16,12 @@ void sound_init(void) {
         SNDA_VOL_100;  // DirectSound A 左右声道、满音量
 }
 
-void sound_play(const u8 *data, u32 sample_rate, bool loop) {
+void sound_play(const u8 *data) {
     sound_stop();  // 关闭之前的播放
 
     // 设置 Timer0 控制采样频率
-    REG_TM0CNT_L = timer_reload(sample_rate);
+    constexpr u16 timer_reload_val = timer_reload(SAMPLE_RATE);
+    REG_TM0CNT_L = timer_reload_val;
     REG_TM0CNT_H = TIMER_START;
 
     DMA1COPY(data, &REG_FIFO_A, 
@@ -29,9 +31,6 @@ void sound_play(const u8 *data, u32 sample_rate, bool loop) {
         DMA32 |
         DMA_SPECIAL |
         DMA_ENABLE);
-
-    if (!loop)
-        REG_DMA1CNT &= ~DMA_REPEAT;  // 只播一次
 }
 
 void sound_stop(void) {

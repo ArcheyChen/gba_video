@@ -71,7 +71,7 @@ IWRAM_CODE void doit(){
         if ((frame & 0x3F) == 0 || force_sound_sync) {//每隔64帧检查一次
             // 从I帧对应的音频偏移处重新开始播放
             const u8* audio_offset = (const u8*)audio_data + frame_audio_offsets[frame];
-            sound_play(audio_offset, SAMPLE_RATE, true);
+            sound_play(audio_offset);
         }
         #endif
         
@@ -80,7 +80,7 @@ IWRAM_CODE void doit(){
             frame = 0;
             VideoDecoder::reset_codebook();
             // 视频循环时，音频也应该重新开始
-            sound_play((const u8*)audio_data, SAMPLE_RATE, true);
+            sound_play((const u8*)audio_data);
             force_sound_sync = true; // 强制音频同步
         }
         scanKeys();
