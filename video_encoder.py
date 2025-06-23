@@ -15,11 +15,11 @@ def main():
     pa.add_argument("--fps", type=int, default=30)
     pa.add_argument("--out", default="video_data")
     pa.add_argument("--i-frame-interval", type=int, default=60)
-    pa.add_argument("--diff-threshold", type=float, default=1.0)
+    pa.add_argument("--diff-threshold", type=float, default=2.5)
     pa.add_argument("--force-i-threshold", type=float, default=0.7)
-    pa.add_argument("--variance-threshold", type=float, default=4.0,
+    pa.add_argument("--variance-threshold", type=float, default=6.0,
                    help="方差阈值，用于区分纯色块和纹理块（默认5.0）")
-    pa.add_argument("--color-fallback-threshold", type=float, default=2.5,
+    pa.add_argument("--color-fallback-threshold", type=float, default=50,
                    help="色块回退距离阈值，当色块与码本项距离超过此值时回退到纹理块模式（默认10.0）")
     pa.add_argument("--codebook-size", type=int, default=DEFAULT_UNIFIED_CODEBOOK_SIZE,
                    help=f"统一码本大小（默认{DEFAULT_UNIFIED_CODEBOOK_SIZE}）")
