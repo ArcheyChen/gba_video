@@ -72,6 +72,7 @@ IWRAM_CODE void doit(){
             // 从I帧对应的音频偏移处重新开始播放
             const u8* audio_offset = (const u8*)audio_data + frame_audio_offsets[frame];
             sound_play(audio_offset);
+            force_sound_sync = false;
         }
         #endif
         

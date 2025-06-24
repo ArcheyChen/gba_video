@@ -38,8 +38,6 @@ class AudioEncoder:
             cmd.extend([
                 "-vn",                   # 不包含视频
                 "-acodec", "pcm_s16le",  # 16位PCM编码
-                "-ar", "44100",          # 先用44.1kHz提取
-                "-ac", "1",              # 单声道
                 "-y",                    # 覆盖输出文件
                 temp_audio_path
             ])
