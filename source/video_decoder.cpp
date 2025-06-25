@@ -104,7 +104,8 @@ IWRAM_CODE void VideoDecoder::decode_color_block_rgb555(const RGB555_Struct &rgb
 IWRAM_CODE void VideoDecoder::decode_segment_rgb555(u8 CODE_BOOK_SIZE,u8 INDEX_BIT_LEN,u8 INDEX_BIT_MASK ,u16 seg_idx, const u8** src, u16* zone_dst, 
                                             const RGB555_Struct* unified_codebook)
 {
-    const RGB555_Struct* codebook = unified_codebook + (seg_idx * CODE_BOOK_SIZE);
+    const RGB555_Struct* codebook = unified_codebook;
+    codebook += seg_idx<<INDEX_BIT_LEN;
     
     u8 num_blocks = *(*src)++;
     
@@ -193,6 +194,7 @@ IWRAM_CODE void VideoDecoder::convert_yuv_to_rgb555_codebook(const YUV_Struct* y
         const YUV_Struct& yuv = yuv_codebook[i];
         RGB555_Struct& rgb555 = rgb555_codebook[i];
         
+        auto lookup_table = clip_lookup_table + 128;
         // 转换2x2块的每个像素
         for(int y = 0; y < 2; y++) {
             for(int x = 0; x < 2; x++) {
@@ -201,7 +203,6 @@ IWRAM_CODE void VideoDecoder::convert_yuv_to_rgb555_codebook(const YUV_Struct* y
                 s8 d_g = yuv.d_g;
                 s8 d_b = yuv.d_b;
                 
-                auto lookup_table = clip_lookup_table + 128;
                 u16 r = lookup_table[y_val + d_r];
                 u16 g = lookup_table[y_val + d_g];
                 u16 b = lookup_table[y_val + d_b];
