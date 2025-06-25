@@ -51,11 +51,10 @@ private:
     static void copy_unified_codebook(u8* dst_raw, const u8* src, YUV_Struct** codebook_ptr, int codebook_size);
     static void convert_yuv_to_rgb555_codebook(const YUV_Struct* yuv_codebook, RGB555_Struct* rgb555_codebook, int codebook_size);
     
-    template<u8 INDEX_BIT_LEN>
-    IWRAM_CODE static void decode_codebook_4x4_block_templated(u8 &valid_bitmap, BitReader &reader, u16* big_block_dst, const RGB555_Struct * codebook){
+    IWRAM_CODE static void decode_normal_4x4_block(u8 INDEX_BIT_LEN,u8 INDEX_BIT_MASK,u8 &valid_bitmap, BitReader &reader, u16* big_block_dst, const RGB555_Struct * codebook){
         for (u8 sub_idx = 0; sub_idx < 4; sub_idx++) {
             if (valid_bitmap & 1) {
-                u8 codebook_idx = reader.read<INDEX_BIT_LEN>();
+                u8 codebook_idx = reader.read(INDEX_BIT_LEN,INDEX_BIT_MASK);
                 u16* subblock_dst = big_block_dst;
                 switch (sub_idx) {
                     case 0: /* 左上 */ break;

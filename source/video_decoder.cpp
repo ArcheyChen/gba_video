@@ -466,13 +466,13 @@ IWRAM_CODE bool VideoDecoder::is_i_frame(const u8* frame_data)
 
 // RGB555版本的4x4块解码函数
 IWRAM_CODE void VideoDecoder::decode_small_codebook_4x4_block_rgb555(u8 &valid_bitmap, BitReader &reader, u16* big_block_dst, const RGB555_Struct * mini_codebook){
-    decode_codebook_4x4_block_templated<4>(valid_bitmap, reader, big_block_dst, mini_codebook);
+    decode_normal_4x4_block(4,0xF,valid_bitmap, reader, big_block_dst, mini_codebook);
 }
 
 IWRAM_CODE void VideoDecoder::decode_medium_codebook_4x4_block_rgb555(u8 &valid_bitmap, BitReader &reader, u16* big_block_dst, const RGB555_Struct* medium_codebook) {
-    decode_codebook_4x4_block_templated<6>(valid_bitmap, reader, big_block_dst, medium_codebook);
+    decode_normal_4x4_block(6,0x3F,valid_bitmap, reader, big_block_dst, medium_codebook);
 }
 
 IWRAM_CODE void VideoDecoder::decode_full_index_4x4_block_rgb555(u8 &valid_bitmap, BitReader &reader, u16* big_block_dst, const RGB555_Struct* unified_codebook) {
-    decode_codebook_4x4_block_templated<8>(valid_bitmap, reader, big_block_dst, unified_codebook);
+    decode_normal_4x4_block(8,0xFF,valid_bitmap, reader, big_block_dst, unified_codebook);
 } 
