@@ -19,6 +19,8 @@ static volatile u32 acc = 0;
 static volatile bool should_copy = false;
 static bool force_sound_sync = true;
 static bool free_play_mode = false;
+
+static int frame = 0;
 #define LCD_FPS 597275
 //这个是乘了10000后的FPS，这样更精确
 IWRAM_CODE void isr_vbl() { 
@@ -29,11 +31,11 @@ IWRAM_CODE void isr_vbl() {
         should_copy = true;
         acc -= LCD_FPS;
     }
+
     REG_IF = IRQ_VBLANK; 
 }
 
 IWRAM_CODE void doit(){
-    int frame = 0;
     
     // 初始化音频播放
     sound_init();
@@ -65,8 +67,6 @@ IWRAM_CODE void doit(){
         
         // 拷贝到VRAM
         DMA3COPY(VideoRenderer::ewramBuffer, VRAM, (SCREEN_WIDTH * SCREEN_HEIGHT >> 1) | DMA32);
-        
-        // 音画同步：如果是I帧，重新同步音频播放
         #ifdef I_FRAME_AUDIO_OFFSET_COUNT
         if ((frame & 0x3F) == 0 || force_sound_sync) {//每隔64帧检查一次
             // 从I帧对应的音频偏移处重新开始播放
@@ -75,6 +75,8 @@ IWRAM_CODE void doit(){
             force_sound_sync = false;
         }
         #endif
+        // 音画同步：如果是I帧，重新同步音频播放
+
         
         frame++;
         if(frame >= VIDEO_FRAME_COUNT) {

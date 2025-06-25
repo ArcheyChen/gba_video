@@ -1063,3 +1063,54 @@ def encode_p_frame_unified(current_blocks: np.ndarray, prev_blocks: np.ndarray,
                 data.append(unified_idx)
     
     return bytes(data), False, used_zones, total_color_updates, total_detail_updates, small_updates, medium_updates, full_updates, small_bytes, medium_bytes, full_bytes, small_segments, medium_segments, small_blocks_per_update, medium_blocks_per_update, full_blocks_per_update
+
+@njit(cache=True, fastmath=True)
+def accumulate_unchanged_blocks_numba(current_blocks_flat: np.ndarray, prev_blocks_flat: np.ndarray, 
+                                    block_diffs: np.ndarray, diff_threshold: float) -> None:
+    """将未更新的块从前一帧累积到当前帧 - Numba加速版本
+    
+    Args:
+        current_blocks_flat: 当前帧的扁平化块数据 (会被原地修改)
+        prev_blocks_flat: 前一帧的扁平化块数据
+        block_diffs: 块差异数组
+        diff_threshold: 差异阈值
+    """
+    total_blocks = block_diffs.size
+    
+    for i in range(total_blocks):
+        if block_diffs.flat[i] <= diff_threshold:
+            # 如果差异小于阈值，将前一帧的块复制到当前帧
+            for j in range(BYTES_PER_BLOCK):
+                current_blocks_flat[i, j] = prev_blocks_flat[i, j]
+
+def accumulate_unchanged_blocks(current_blocks: np.ndarray, prev_blocks: np.ndarray, 
+                              diff_threshold: float) -> np.ndarray:
+    """将未更新的块从前一帧累积到当前帧，以避免渐变残影
+    
+    Args:
+        current_blocks: 当前帧的块数据
+        prev_blocks: 前一帧的块数据
+        diff_threshold: 差异阈值
+    
+    Returns:
+        修改后的当前帧块数据（累积了未更新的块）
+    """
+    if prev_blocks is None or current_blocks.shape != prev_blocks.shape:
+        return current_blocks.copy()
+    
+    blocks_h, blocks_w = current_blocks.shape[:2]
+    
+    # 创建当前帧的副本以避免修改原始数据
+    accumulated_blocks = current_blocks.copy()
+    
+    # 计算块差异
+    current_flat = current_blocks.reshape(-1, BYTES_PER_BLOCK)
+    prev_flat = prev_blocks.reshape(-1, BYTES_PER_BLOCK)
+    accumulated_flat = accumulated_blocks.reshape(-1, BYTES_PER_BLOCK)
+    
+    block_diffs = compute_2x2_block_differences_numba(current_flat, prev_flat, blocks_h, blocks_w)
+    
+    # 使用Numba加速的累积更新
+    accumulate_unchanged_blocks_numba(accumulated_flat, prev_flat, block_diffs, diff_threshold)
+    
+    return accumulated_blocks

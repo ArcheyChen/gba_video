@@ -162,8 +162,11 @@ def encode_frame_chunk_worker(args):
             local_stats.codebook_bytes += codebook_size_bytes
             local_stats.index_bytes += max(0, index_size)
         else:
+            # P帧编码前，先将未更新的块从前一帧累积到当前帧，避免渐变残影
+            accumulated_frame = accumulate_unchanged_blocks(current_frame, prev_frame, diff_threshold)
+            
             frame_data, is_i_frame, used_zones, color_updates, detail_updates, small_updates, medium_updates, full_updates, small_bytes, medium_bytes, full_bytes, small_segments, medium_segments, small_blocks_per_update, medium_blocks_per_update, full_blocks_per_update = encode_p_frame_unified(
-                current_frame, prev_frame,
+                accumulated_frame, prev_frame,
                 unified_codebook, block_types,
                 diff_threshold, force_i_threshold, enabled_segments_bitmap,
                 enabled_medium_segments_bitmap, color_fallback_threshold
@@ -217,7 +220,12 @@ def encode_frame_chunk_worker(args):
         encoded_frames.append(frame_data)
         current_offset += len(frame_data)
         
-        prev_frame = current_frame.copy() if current_frame.size > 0 else None
+        # 更新前一帧引用：I帧直接使用当前帧，P帧使用累积后的帧
+        if force_i_frame or prev_frame is None:
+            prev_frame = current_frame.copy() if current_frame.size > 0 else None
+        else:
+            # P帧使用累积后的帧作为下一帧的参考，以便累积渐变差异
+            prev_frame = accumulated_frame.copy() if accumulated_frame.size > 0 else None
         
         if frame_idx % 30 == 0 or frame_idx == end_idx - 1:
             print(f"  已编码 {frame_idx + 1} 帧")
@@ -595,8 +603,11 @@ class VideoEncoderCore:
                     index_size=max(0, index_size)
                 )
             else:
+                # P帧编码前，先将未更新的块从前一帧累积到当前帧，避免渐变残影
+                accumulated_frame = accumulate_unchanged_blocks(current_frame, prev_frame, diff_threshold)
+                
                 frame_data, is_i_frame, used_zones, color_updates, detail_updates, small_updates, medium_updates, full_updates, small_bytes, medium_bytes, full_bytes, small_segments, medium_segments, small_blocks_per_update, medium_blocks_per_update, full_blocks_per_update = encode_p_frame_unified(
-                    current_frame, prev_frame,
+                    accumulated_frame, prev_frame,
                     unified_codebook, block_types,
                     diff_threshold, force_i_threshold, enabled_segments_bitmap,
                     enabled_medium_segments_bitmap, color_fallback_threshold
@@ -627,7 +638,12 @@ class VideoEncoderCore:
             encoded_frames.append(frame_data)
             current_offset += len(frame_data)
             
-            prev_frame = current_frame.copy() if current_frame.size > 0 else None
+            # 更新前一帧引用：I帧直接使用当前帧，P帧使用累积后的帧
+            if force_i_frame or prev_frame is None:
+                prev_frame = current_frame.copy() if current_frame.size > 0 else None
+            else:
+                # P帧使用累积后的帧作为下一帧的参考，以便累积渐变差异
+                prev_frame = accumulated_frame.copy() if accumulated_frame.size > 0 else None
             
             if frame_idx % 30 == 0 or frame_idx == len(frames) - 1:
                 print(f"  已编码 {frame_idx + 1}/{len(frames)} 帧")
