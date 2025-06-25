@@ -30,10 +30,11 @@ MUSIC		:=
 #---------------------------------------------------------------------------------
 # options for code generation
 #---------------------------------------------------------------------------------
+# ARCH	:=	-mthumb -mthumb-interwork
 ARCH	:=	
 
-CFLAGS	:=	-g -Wall -gdwarf-4 -O3\
-		-mcpu=arm7tdmi -mtune=arm7tdmi\
+CFLAGS	:=	-g -Wall -O2\
+		-mcpu=arm7tdmi -mtune=arm7tdmi -flto\
 		$(ARCH)
 
 CFLAGS	+=	$(INCLUDE)

@@ -101,7 +101,51 @@ IWRAM_CODE void VideoDecoder::decode_color_block_rgb555(const RGB555_Struct &rgb
     dst_row[2] = rgb555_data.rgb[1][1];
     dst_row[3] = rgb555_data.rgb[1][1];
 }
-
+IWRAM_CODE void VideoDecoder::decode_segment_rgb555(u8 CODE_BOOK_SIZE,u8 INDEX_BIT_LEN,u8 INDEX_BIT_MASK ,u16 seg_idx, const u8** src, u16* zone_dst, 
+                                            const RGB555_Struct* unified_codebook)
+{
+    const RGB555_Struct* codebook = unified_codebook + (seg_idx * CODE_BOOK_SIZE);
+    
+    u8 num_blocks = *(*src)++;
+    
+    // 记录bitmap和位置数据的起始位置
+    const u8* bitmap_and_indices_ptr = *src;
+    
+    // 跳过bitmap和位置数据
+    *src += (num_blocks >> 1) * 3;  // 每2个块用3字节
+    if (num_blocks & 1) {
+        *src += 2;  // 最后一个奇数块用2字节
+    }
+    
+    // 现在src指向bitstream开始位置
+    BitReader reader(src,INDEX_BIT_LEN);
+    
+    // 解码每2个块为一组
+    const u8* bitmap_ptr = bitmap_and_indices_ptr;
+    for (u8 i = 0; i < (num_blocks >> 1); i++) {
+        u8 valid_bitmap = *bitmap_ptr++;
+        u8 zone_relative_idx1 = *bitmap_ptr++;
+        u8 zone_relative_idx2 = *bitmap_ptr++;
+        
+        // 解码第一个4x4块
+        u16* big_block_dst = zone_dst + zone_block_relative_offsets[zone_relative_idx1];
+        decode_normal_4x4_block(valid_bitmap, reader, big_block_dst, codebook);
+        
+        // 解码第二个4x4块
+        big_block_dst = zone_dst + zone_block_relative_offsets[zone_relative_idx2];
+        decode_normal_4x4_block(valid_bitmap, reader, big_block_dst, codebook);
+    }
+    
+    // 处理最后一个奇数块（如果存在）
+    if (num_blocks & 1) {
+        u8 valid_bitmap = *bitmap_ptr++;
+        u8 zone_relative_idx1 = *bitmap_ptr++;
+        
+        u16* big_block_dst = zone_dst + zone_block_relative_offsets[zone_relative_idx1];
+        decode_normal_4x4_block(valid_bitmap, reader, big_block_dst, codebook);
+    }
+    // BitReader析构时会自动更新src指针
+}
 // RGB555码本通用的4x4大块解码函数（纹理块）
 IWRAM_CODE void VideoDecoder::decode_big_block_rgb555(const RGB555_Struct* codebook, const u8 quant_indices[4], u16* big_block_dst)
 {
@@ -168,6 +212,22 @@ IWRAM_CODE void VideoDecoder::convert_yuv_to_rgb555_codebook(const YUV_Struct* y
     }
 }
 
+IWRAM_CODE void VideoDecoder::decode_normal_4x4_block(u8 &valid_bitmap, BitReader &reader, u16* big_block_dst, const RGB555_Struct * codebook){
+        for (u8 sub_idx = 0; sub_idx < 4; sub_idx++) {
+            if (valid_bitmap & 1) {
+                u8 codebook_idx = reader.read();
+                u16* subblock_dst = big_block_dst;
+                switch (sub_idx) {
+                    case 0: /* 左上 */ break;
+                    case 1: subblock_dst += 2; break; /* 右上 */
+                    case 2: subblock_dst += SCREEN_WIDTH * 2; break; /* 左下 */
+                    case 3: subblock_dst += SCREEN_WIDTH * 2 + 2; break; /* 右下 */
+                }
+                decode_block_rgb555(codebook[codebook_idx], subblock_dst);
+            }
+            valid_bitmap >>= 1;
+        }
+    }
 IWRAM_CODE void VideoDecoder::load_codebook_and_convert(const u8* src)
 {
     // 预加载码本
@@ -241,138 +301,20 @@ IWRAM_CODE void VideoDecoder::decode_i_frame_unified(const u8* src, u16* dst)
 IWRAM_CODE void VideoDecoder::decode_small_codebook_segment_rgb555(u16 seg_idx, const u8** src, u16* zone_dst, 
                                             const RGB555_Struct* unified_codebook)
 {
-    const RGB555_Struct* mini_codebook = unified_codebook + (seg_idx * MINI_CODEBOOK_SIZE);
-    
-    u8 num_blocks = *(*src)++;
-    
-    // 记录bitmap和位置数据的起始位置
-    const u8* bitmap_and_indices_ptr = *src;
-    
-    // 跳过bitmap和位置数据
-    *src += (num_blocks >> 1) * 3;  // 每2个块用3字节
-    if (num_blocks & 1) {
-        *src += 2;  // 最后一个奇数块用2字节
-    }
-    
-    // 现在src指向bitstream开始位置
-    BitReader reader(src);
-    
-    // 解码每2个块为一组
-    const u8* bitmap_ptr = bitmap_and_indices_ptr;
-    for (u8 i = 0; i < (num_blocks >> 1); i++) {
-        u8 valid_bitmap = *bitmap_ptr++;
-        u8 zone_relative_idx1 = *bitmap_ptr++;
-        u8 zone_relative_idx2 = *bitmap_ptr++;
-        
-        // 解码第一个4x4块
-        u16* big_block_dst = zone_dst + zone_block_relative_offsets[zone_relative_idx1];
-        decode_small_codebook_4x4_block_rgb555(valid_bitmap, reader, big_block_dst, mini_codebook);
-        
-        // 解码第二个4x4块
-        big_block_dst = zone_dst + zone_block_relative_offsets[zone_relative_idx2];
-        decode_small_codebook_4x4_block_rgb555(valid_bitmap, reader, big_block_dst, mini_codebook);
-    }
-    
-    // 处理最后一个奇数块（如果存在）
-    if (num_blocks & 1) {
-        u8 valid_bitmap = *bitmap_ptr++;
-        u8 zone_relative_idx1 = *bitmap_ptr++;
-        
-        u16* big_block_dst = zone_dst + zone_block_relative_offsets[zone_relative_idx1];
-        decode_small_codebook_4x4_block_rgb555(valid_bitmap, reader, big_block_dst, mini_codebook);
-    }
-    // BitReader析构时会自动更新src指针
+    decode_segment_rgb555(MINI_CODEBOOK_SIZE,4,0xF,seg_idx,src,zone_dst,unified_codebook);
 }
 
 IWRAM_CODE void VideoDecoder::decode_medium_codebook_segment_rgb555(u8 seg_idx, const u8** src, u16* zone_dst, 
                                              const RGB555_Struct* unified_codebook)
 {
-    const RGB555_Struct* medium_codebook = unified_codebook + (seg_idx * MEDIUM_CODEBOOK_SIZE);
-    
-    u8 num_blocks = *(*src)++;
-    
-    // 记录bitmap和位置数据的起始位置
-    const u8* bitmap_and_indices_ptr = *src;
-    
-    // 跳过bitmap和位置数据
-    *src += (num_blocks >> 1) * 3;  // 每2个块用3字节
-    if (num_blocks & 1) {
-        *src += 2;  // 最后一个奇数块用2字节
-    }
-    
-    // 现在src指向bitstream开始位置
-    BitReader reader(src);
-    
-    // 解码每2个块为一组
-    const u8* bitmap_ptr = bitmap_and_indices_ptr;
-    for (u8 i = 0; i < (num_blocks >> 1); i++) {
-        u8 valid_bitmap = *bitmap_ptr++;
-        u8 zone_relative_idx1 = *bitmap_ptr++;
-        u8 zone_relative_idx2 = *bitmap_ptr++;
-        
-        // 解码第一个4x4块
-        u16* big_block_dst = zone_dst + zone_block_relative_offsets[zone_relative_idx1];
-        decode_medium_codebook_4x4_block_rgb555(valid_bitmap, reader, big_block_dst, medium_codebook);
-        
-        // 解码第二个4x4块
-        big_block_dst = zone_dst + zone_block_relative_offsets[zone_relative_idx2];
-        decode_medium_codebook_4x4_block_rgb555(valid_bitmap, reader, big_block_dst, medium_codebook);
-    }
-    
-    // 处理最后一个奇数块（如果存在）
-    if (num_blocks & 1) {
-        u8 valid_bitmap = *bitmap_ptr++;
-        u8 zone_relative_idx1 = *bitmap_ptr++;
-        
-        u16* big_block_dst = zone_dst + zone_block_relative_offsets[zone_relative_idx1];
-        decode_medium_codebook_4x4_block_rgb555(valid_bitmap, reader, big_block_dst, medium_codebook);
-    }
-    // BitReader析构时会自动更新src指针
+    decode_segment_rgb555(MEDIUM_CODEBOOK_SIZE,6,0x3F,seg_idx,src,zone_dst,unified_codebook);
 }
 
 IWRAM_CODE void VideoDecoder::decode_full_index_segment_rgb555(const u8** src, u16* zone_dst, 
                                         const RGB555_Struct* unified_codebook)
 {
-    u8 num_full_blocks = *(*src)++;
-    if (num_full_blocks == 0) return;
-    
-    // 记录bitmap和位置数据的起始位置
-    const u8* bitmap_and_indices_ptr = *src;
-    
-    // 跳过bitmap和位置数据
-    *src += (num_full_blocks >> 1) * 3;  // 每2个块用3字节
-    if (num_full_blocks & 1) {
-        *src += 2;  // 最后一个奇数块用2字节
-    }
-    
-    // 现在src指向bitstream开始位置
-    BitReader reader(src);
-    
-    // 解码每2个块为一组
-    const u8* bitmap_ptr = bitmap_and_indices_ptr;
-    for (u8 i = 0; i < (num_full_blocks >> 1); i++) {
-        u8 valid_bitmap = *bitmap_ptr++;
-        u8 zone_relative_idx1 = *bitmap_ptr++;
-        u8 zone_relative_idx2 = *bitmap_ptr++;
-        
-        // 解码第一个4x4块
-        u16* big_block_dst = zone_dst + zone_block_relative_offsets[zone_relative_idx1];
-        decode_full_index_4x4_block_rgb555(valid_bitmap, reader, big_block_dst, unified_codebook);
-        
-        // 解码第二个4x4块
-        big_block_dst = zone_dst + zone_block_relative_offsets[zone_relative_idx2];
-        decode_full_index_4x4_block_rgb555(valid_bitmap, reader, big_block_dst, unified_codebook);
-    }
-    
-    // 处理最后一个奇数块（如果存在）
-    if (num_full_blocks & 1) {
-        u8 valid_bitmap = *bitmap_ptr++;
-        u8 zone_relative_idx1 = *bitmap_ptr++;
-        
-        u16* big_block_dst = zone_dst + zone_block_relative_offsets[zone_relative_idx1];
-        decode_full_index_4x4_block_rgb555(valid_bitmap, reader, big_block_dst, unified_codebook);
-    }
-    // BitReader析构时会自动更新src指针
+    //只有一大段，因此CODEBOOKSIZE什么的，都填0即可
+    decode_segment_rgb555(0,8,0xFF,0,src,zone_dst,unified_codebook);
 }
 
 // RGB555版本的P帧解码函数
@@ -399,7 +341,7 @@ IWRAM_CODE void VideoDecoder::decode_p_frame_unified_rgb555(const u8* src, u16* 
             // 处理启用的小码表段
             for (u16 seg_idx = 0; seg_idx < 16; seg_idx++) {
                 if (enabled_segments_bitmap & (1 << seg_idx)) {
-                    decode_small_codebook_segment_rgb555(seg_idx, &src, zone_dst, rgb555_codebook);
+                    decode_segment_rgb555(MINI_CODEBOOK_SIZE,4,0xF,seg_idx,&src,zone_dst,rgb555_codebook);
                 }
             }
             
@@ -409,7 +351,7 @@ IWRAM_CODE void VideoDecoder::decode_p_frame_unified_rgb555(const u8* src, u16* 
             // 处理启用的中码表段
             for (u8 seg_idx = 0; seg_idx < 4; seg_idx++) {
                 if (enabled_medium_segments_bitmap & (1 << seg_idx)) {
-                    decode_medium_codebook_segment_rgb555(seg_idx, &src, zone_dst, rgb555_codebook);
+                    decode_segment_rgb555(MEDIUM_CODEBOOK_SIZE,6,0x3F,seg_idx,&src,zone_dst,rgb555_codebook);
                 }
             }
             
@@ -463,16 +405,3 @@ IWRAM_CODE bool VideoDecoder::is_i_frame(const u8* frame_data)
     u8 frame_type = *frame_data;
     return frame_type == FRAME_TYPE_I;
 }
-
-// RGB555版本的4x4块解码函数
-IWRAM_CODE void VideoDecoder::decode_small_codebook_4x4_block_rgb555(u8 &valid_bitmap, BitReader &reader, u16* big_block_dst, const RGB555_Struct * mini_codebook){
-    decode_normal_4x4_block(4,0xF,valid_bitmap, reader, big_block_dst, mini_codebook);
-}
-
-IWRAM_CODE void VideoDecoder::decode_medium_codebook_4x4_block_rgb555(u8 &valid_bitmap, BitReader &reader, u16* big_block_dst, const RGB555_Struct* medium_codebook) {
-    decode_normal_4x4_block(6,0x3F,valid_bitmap, reader, big_block_dst, medium_codebook);
-}
-
-IWRAM_CODE void VideoDecoder::decode_full_index_4x4_block_rgb555(u8 &valid_bitmap, BitReader &reader, u16* big_block_dst, const RGB555_Struct* unified_codebook) {
-    decode_normal_4x4_block(8,0xFF,valid_bitmap, reader, big_block_dst, unified_codebook);
-} 
