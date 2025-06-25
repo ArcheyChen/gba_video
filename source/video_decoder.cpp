@@ -466,52 +466,13 @@ IWRAM_CODE bool VideoDecoder::is_i_frame(const u8* frame_data)
 
 // RGB555版本的4x4块解码函数
 IWRAM_CODE void VideoDecoder::decode_small_codebook_4x4_block_rgb555(u8 &valid_bitmap, BitReader &reader, u16* big_block_dst, const RGB555_Struct * mini_codebook){
-    for (u8 sub_idx = 0; sub_idx < 4; sub_idx++) {
-        if (valid_bitmap & 1) {
-            u8 codebook_idx = reader.read4();
-            u16* subblock_dst = big_block_dst;
-            switch (sub_idx) {
-                case 0: /* 左上 */ break;
-                case 1: subblock_dst += 2; break; /* 右上 */
-                case 2: subblock_dst += SCREEN_WIDTH * 2; break; /* 左下 */
-                case 3: subblock_dst += SCREEN_WIDTH * 2 + 2; break; /* 右下 */
-            }
-            decode_block_rgb555(mini_codebook[codebook_idx], subblock_dst);
-        }
-        valid_bitmap >>= 1;
-    }
+    decode_codebook_4x4_block_templated<4>(valid_bitmap, reader, big_block_dst, mini_codebook);
 }
 
 IWRAM_CODE void VideoDecoder::decode_medium_codebook_4x4_block_rgb555(u8 &valid_bitmap, BitReader &reader, u16* big_block_dst, const RGB555_Struct* medium_codebook) {
-    for (u8 sub_idx = 0; sub_idx < 4; sub_idx++) {
-        if (valid_bitmap & 1) {
-            u8 codebook_idx = reader.read6();
-            u16* subblock_dst = big_block_dst;
-            switch (sub_idx) {
-                case 0: /* 左上 */ break;
-                case 1: subblock_dst += 2; break; /* 右上 */
-                case 2: subblock_dst += SCREEN_WIDTH * 2; break; /* 左下 */
-                case 3: subblock_dst += SCREEN_WIDTH * 2 + 2; break; /* 右下 */
-            }
-            decode_block_rgb555(medium_codebook[codebook_idx], subblock_dst);
-        }
-        valid_bitmap >>= 1;
-    }
+    decode_codebook_4x4_block_templated<6>(valid_bitmap, reader, big_block_dst, medium_codebook);
 }
 
 IWRAM_CODE void VideoDecoder::decode_full_index_4x4_block_rgb555(u8 &valid_bitmap, BitReader &reader, u16* big_block_dst, const RGB555_Struct* unified_codebook) {
-    for (u8 sub_idx = 0; sub_idx < 4; sub_idx++) {
-        if (valid_bitmap & 1) {
-            u8 codebook_idx = reader.read8();
-            u16* subblock_dst = big_block_dst;
-            switch (sub_idx) {
-                case 0: /* 左上 */ break;
-                case 1: subblock_dst += 2; break; /* 右上 */
-                case 2: subblock_dst += SCREEN_WIDTH * 2; break; /* 左下 */
-                case 3: subblock_dst += SCREEN_WIDTH * 2 + 2; break; /* 右下 */
-            }
-            decode_block_rgb555(unified_codebook[codebook_idx], subblock_dst);
-        }
-        valid_bitmap >>= 1;
-    }
+    decode_codebook_4x4_block_templated<8>(valid_bitmap, reader, big_block_dst, unified_codebook);
 } 

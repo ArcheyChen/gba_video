@@ -27,26 +27,27 @@ public:
     }
     
     // 读取指定位数的数据
-    IWRAM_CODE inline u8 read(u8 num_bits) {
+    template <u8 NUM_BITS>
+    IWRAM_CODE inline u8 read() {
         // 确保缓冲区有足够的位
-        if (bits_in_buffer < num_bits) {
+        if (bits_in_buffer < NUM_BITS) {
             fill_buffer();
         }
         
         // 提取所需的位
-        u8 result = bit_buffer & ((1u << num_bits) - 1);
+        u8 result = bit_buffer & ((1u << NUM_BITS) - 1);
         
         // 更新缓冲区
-        bit_buffer >>= num_bits;
-        bits_in_buffer -= num_bits;
+        bit_buffer >>= NUM_BITS;
+        bits_in_buffer -= NUM_BITS;
         
         return result;
     }
     
     // 专门的读取函数，提供更好的性能
-    IWRAM_CODE inline u8 read4() { return read(4); }
-    IWRAM_CODE inline u8 read6() { return read(6); }
-    IWRAM_CODE inline u8 read8() { return read(8); }
+    IWRAM_CODE inline u8 read4() { return read<4>(); }
+    IWRAM_CODE inline u8 read6() { return read<6>(); }
+    IWRAM_CODE inline u8 read8() { return read<8>(); }
     
     // 析构函数：确保src指针正确对齐到字节边界 - 移除IWRAM_CODE避免section冲突
     inline ~BitReader() {

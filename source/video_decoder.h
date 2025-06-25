@@ -51,11 +51,23 @@ private:
     static void copy_unified_codebook(u8* dst_raw, const u8* src, YUV_Struct** codebook_ptr, int codebook_size);
     static void convert_yuv_to_rgb555_codebook(const YUV_Struct* yuv_codebook, RGB555_Struct* rgb555_codebook, int codebook_size);
     
-    // 分段解码函数
-    static void decode_small_codebook_4x4_block(u8 &valid_bitmap, BitReader &reader, u16* big_block_dst, const YUV_Struct * mini_codebook);
-    static void decode_medium_codebook_4x4_block(u8 &valid_bitmap, BitReader &reader, u16* big_block_dst, const YUV_Struct* medium_codebook);
-    static void decode_full_index_4x4_block(u8 &valid_bitmap, BitReader &reader, u16* big_block_dst, const YUV_Struct* unified_codebook);
-    
+    template<u8 INDEX_BIT_LEN>
+    IWRAM_CODE static void decode_codebook_4x4_block_templated(u8 &valid_bitmap, BitReader &reader, u16* big_block_dst, const RGB555_Struct * codebook){
+        for (u8 sub_idx = 0; sub_idx < 4; sub_idx++) {
+            if (valid_bitmap & 1) {
+                u8 codebook_idx = reader.read<INDEX_BIT_LEN>();
+                u16* subblock_dst = big_block_dst;
+                switch (sub_idx) {
+                    case 0: /* 左上 */ break;
+                    case 1: subblock_dst += 2; break; /* 右上 */
+                    case 2: subblock_dst += SCREEN_WIDTH * 2; break; /* 左下 */
+                    case 3: subblock_dst += SCREEN_WIDTH * 2 + 2; break; /* 右下 */
+                }
+                decode_block_rgb555(codebook[codebook_idx], subblock_dst);
+            }
+            valid_bitmap >>= 1;
+        }
+    }
     // 新增：RGB555分段解码函数
     static void decode_small_codebook_4x4_block_rgb555(u8 &valid_bitmap, BitReader &reader, u16* big_block_dst, const RGB555_Struct * mini_codebook);
     static void decode_medium_codebook_4x4_block_rgb555(u8 &valid_bitmap, BitReader &reader, u16* big_block_dst, const RGB555_Struct* medium_codebook);
