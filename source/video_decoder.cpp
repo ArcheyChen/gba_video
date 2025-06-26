@@ -232,13 +232,12 @@ IWRAM_CODE void VideoDecoder::decode_normal_4x4_block(u8 &valid_bitmap, BitReade
 IWRAM_CODE void VideoDecoder::load_codebook_and_convert(const u8* src)
 {
     // 预加载码本
-    copy_unified_codebook(unified_codebook_raw, src, &unified_codebook, UNIFIED_CODEBOOK_SIZE);
+    if(!code_book_preloaded)
+        copy_unified_codebook(unified_codebook_raw, src, &unified_codebook, UNIFIED_CODEBOOK_SIZE);
     
     // 转换为RGB555码本
-    convert_yuv_to_rgb555_codebook(unified_codebook, rgb555_codebook_buf[current_rgb555_codebook_index^1], UNIFIED_CODEBOOK_SIZE);
-    
-    code_book_preloaded = true;
-    rgb555_codebook_preloaded = true;
+    if(!rgb555_codebook_preloaded)
+        convert_yuv_to_rgb555_codebook(unified_codebook, rgb555_codebook_buf[current_rgb555_codebook_index^1], UNIFIED_CODEBOOK_SIZE);
 }
 
 IWRAM_CODE void VideoDecoder::preload_codebook(const u8* src)
@@ -264,7 +263,7 @@ IWRAM_CODE void VideoDecoder::preload_codebook(const u8* src)
 IWRAM_CODE void VideoDecoder::decode_i_frame_unified(const u8* src, u16* dst)
 {
     // 拷贝统一码本
-    if(!code_book_preloaded){
+    if(!rgb555_codebook_preloaded){
         load_codebook_and_convert(src);
     }
     reset_codebook();
