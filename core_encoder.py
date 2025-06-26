@@ -21,7 +21,7 @@ Y_COEFF  = np.array([0.28571429,  0.57142857,  0.14285714])
 CB_COEFF = np.array([-0.14285714, -0.28571429,  0.42857143])
 CR_COEFF = np.array([ 0.35714286, -0.28571429, -0.07142857])
 BLOCK_W, BLOCK_H = 2, 2
-BYTES_PER_BLOCK  = 7  # 4Y + d_r + d_g + d_b
+BYTES_PER_BLOCK  = 6  # 4Y + Cb + Cr
 
 # 新增常量
 ZONE_HEIGHT_PIXELS = 16  # 每个区域的像素高度
@@ -79,7 +79,8 @@ def pack_yuv420_frame_numba(bgr_frame):
                         cb = r * (-0.14285714) + g * (-0.28571429) + b * 0.42857143
                         cr = r * 0.35714286 + g * (-0.28571429) + b * (-0.07142857)
                         
-                        y_values[idx] = np.uint8(clip_value(y / 2.0, 0.0, 255.0))
+                        # 不再预处理Y值，直接存储完整Y
+                        y_values[idx] = np.uint8(clip_value(y, 0.0, 255.0))
                         cb_sum += cb
                         cr_sum += cr
                         idx += 1
@@ -87,18 +88,13 @@ def pack_yuv420_frame_numba(bgr_frame):
             # Store Y values
             block_array[by, bx, 0:4] = y_values
             
-            # Compute and store chroma
+            # Compute and store chroma - 直接存储Cb和Cr，不再预处理
             cb_mean = cb_sum / 4.0
             cr_mean = cr_sum / 4.0
             
-            d_r = clip_value(cr_mean, -128.0, 127.0)
-            d_g = clip_value((-(cb_mean/2.0) - cr_mean) / 2.0, -128.0, 127.0)  
-            d_b = clip_value(cb_mean, -128.0, 127.0)
-            
-            # 将有符号值转换为无符号字节存储
-            block_array[by, bx, 4] = np.uint8(np.int8(d_r))
-            block_array[by, bx, 5] = np.uint8(np.int8(d_g))
-            block_array[by, bx, 6] = np.uint8(np.int8(d_b))
+            # 直接存储Cb和Cr（有符号值转换为无符号字节存储）
+            block_array[by, bx, 4] = np.uint8(np.int8(clip_value(cb_mean, -128.0, 127.0)))
+            block_array[by, bx, 5] = np.uint8(np.int8(clip_value(cr_mean, -128.0, 127.0)))
     
     return block_array
 
@@ -166,25 +162,20 @@ def classify_4x4_blocks_unified_numba(blocks, variance_threshold=5.0):
             if all_2x2_blocks_are_uniform:
                 downsampled_block = np.zeros(BYTES_PER_BLOCK, dtype=np.uint8)
                 y_values = np.zeros(4, dtype=np.uint8)
-                d_r_values = np.zeros(4, dtype=np.int8)
-                d_g_values = np.zeros(4, dtype=np.int8)
-                d_b_values = np.zeros(4, dtype=np.int8)
+                cb_values = np.zeros(4, dtype=np.int8)
+                cr_values = np.zeros(4, dtype=np.int8)
                 for i in range(4):
                     block = blocks_4x4[i]
                     y_values[i] = int(np.mean(block[:4]))
-                    d_r_values[i] = np.int8(block[4])
-                    d_g_values[i] = np.int8(block[5])
-                    d_b_values[i] = np.int8(block[6])
+                    cb_values[i] = np.int8(block[4])
+                    cr_values[i] = np.int8(block[5])
                 downsampled_block[:4] = y_values
-                val_r = np.mean(d_r_values)
-                val_r = min(max(val_r, -128), 127)
-                downsampled_block[4] = np.int8(val_r)
-                val_g = np.mean(d_g_values)
-                val_g = min(max(val_g, -128), 127)
-                downsampled_block[5] = np.int8(val_g)
-                val_b = np.mean(d_b_values)
-                val_b = min(max(val_b, -128), 127)
-                downsampled_block[6] = np.int8(val_b)
+                val_cb = np.mean(cb_values)
+                val_cb = min(max(val_cb, -128), 127)
+                downsampled_block[4] = np.int8(val_cb)
+                val_cr = np.mean(cr_values)
+                val_cr = min(max(val_cr, -128), 127)
+                downsampled_block[5] = np.int8(val_cr)
                 block_idx = len(all_blocks)
                 all_blocks.append(downsampled_block)
                 block_types_list.append((big_by, big_bx, 0, [block_idx]))  # 0=color
@@ -497,7 +488,7 @@ def encode_i_frame_unified(blocks: np.ndarray, unified_codebook: np.ndarray,
                                     blocks_4x4.append(blocks[by, bx])
                         
                         avg_block = np.mean(blocks_4x4, axis=0).round().astype(np.uint8)
-                        for i in range(4, 7):
+                        for i in range(4, 6):  # 现在只有6个元素：4Y + Cb + Cr
                             avg_val = np.mean([b[i].view(np.int8) for b in blocks_4x4])
                             avg_block[i] = np.clip(avg_val, -128, 127).astype(np.int8).view(np.uint8)
                         
@@ -632,7 +623,7 @@ def encode_p_frame_unified(current_blocks: np.ndarray, prev_blocks: np.ndarray,
                             blocks_4x4.append(current_blocks[by, bx])
                     
                     avg_block = np.mean(blocks_4x4, axis=0).round().astype(np.uint8)
-                    for i in range(4, 7):
+                    for i in range(4, 6):  # 现在只有6个元素：4Y + Cb + Cr
                         avg_val = np.mean([b[i].view(np.int8) for b in blocks_4x4])
                         avg_block[i] = np.clip(avg_val, -128, 127).astype(np.int8).view(np.uint8)
                     

@@ -21,13 +21,17 @@ RGB555_Struct* VideoDecoder::rgb555_codebook = VideoDecoder::rgb555_codebook_buf
 bool VideoDecoder::rgb555_codebook_preloaded = false;
 
 // 查找表定义
-u8 VideoDecoder::clip_lookup_table[512];
+u8 VideoDecoder::clip_lookup_table_raw[2048];
+u8* VideoDecoder::clip_lookup_table = nullptr;
 u16 VideoDecoder::big_block_relative_offsets[240/4*160/4];
 u16 VideoDecoder::zone_block_relative_offsets[240];
 
 void VideoDecoder::init() {
     // 初始化查找表
-    for(int i=-128;i<512-128;i++){
+    int table_size = sizeof(clip_lookup_table_raw) / sizeof(clip_lookup_table_raw[0]);
+    int offset = 1024;
+    clip_lookup_table = clip_lookup_table_raw + offset;
+    for(int i=-offset;i<table_size-offset;i++){
         u8 raw_val;
         if(i<=0)
             raw_val = 0;
@@ -35,7 +39,7 @@ void VideoDecoder::init() {
             raw_val = 255;
         else
             raw_val = static_cast<u8>(i);
-        clip_lookup_table[i+128] = raw_val>>2;
+        clip_lookup_table[i] = raw_val>>3;
     }
     
     // 初始化块偏移查找表
@@ -194,18 +198,21 @@ IWRAM_CODE void VideoDecoder::convert_yuv_to_rgb555_codebook(const YUV_Struct* y
         const YUV_Struct& yuv = yuv_codebook[i];
         RGB555_Struct& rgb555 = rgb555_codebook[i];
         
-        auto lookup_table = clip_lookup_table + 128;
+        auto lookup_table = clip_lookup_table_raw + 1024;
         // 转换2x2块的每个像素
         for(int y = 0; y < 2; y++) {
             for(int x = 0; x < 2; x++) {
                 u8 y_val = yuv.y[y][x];
-                s8 d_r = yuv.d_r;
-                s8 d_g = yuv.d_g;
-                s8 d_b = yuv.d_b;
+                s8 cb = yuv.cb;
+                s8 cr = yuv.cr;
                 
-                u16 r = lookup_table[y_val + d_r];
-                u16 g = lookup_table[y_val + d_g];
-                u16 b = lookup_table[y_val + d_b];
+                // 使用您的快速YUV到RGB转换矩阵：
+                // R = Y + (Cr << 1)
+                // G = Y - (Cb >> 1) - Cr  
+                // B = Y + (Cb << 1)
+                u16 r = lookup_table[y_val + (cr << 1)];
+                u16 g = lookup_table[y_val - (cb >> 1) - cr];
+                u16 b = lookup_table[y_val + (cb << 1)];
                 
                 rgb555.rgb[y][x] = r | (g << 5) | (b << 10);
             }

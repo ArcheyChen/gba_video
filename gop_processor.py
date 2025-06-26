@@ -38,23 +38,20 @@ def extract_effective_blocks_from_big_blocks(blocks: np.ndarray, big_block_posit
             downsampled_block = np.zeros(BYTES_PER_BLOCK, dtype=np.uint8)
             
             y_values = []
-            d_r_values = []
-            d_g_values = []
-            d_b_values = []
+            cb_values = []
+            cr_values = []
             
             for block in blocks_4x4:
                 # 每个2x2块内部一致，取其内部平均值
                 avg_y = np.mean(block[:4])
                 y_values.append(int(avg_y))
-                d_r_values.append(block[4].view(np.int8))
-                d_g_values.append(block[5].view(np.int8))
-                d_b_values.append(block[6].view(np.int8))
+                cb_values.append(block[4].view(np.int8))
+                cr_values.append(block[5].view(np.int8))
             
             # 用4个2x2子块的平均值构成下采样块
             downsampled_block[:4] = np.array(y_values, dtype=np.uint8)
-            downsampled_block[4] = np.clip(np.mean(d_r_values), -128, 127).astype(np.int8).view(np.uint8)
-            downsampled_block[5] = np.clip(np.mean(d_g_values), -128, 127).astype(np.int8).view(np.uint8)
-            downsampled_block[6] = np.clip(np.mean(d_b_values), -128, 127).astype(np.int8).view(np.uint8)
+            downsampled_block[4] = np.clip(np.mean(cb_values), -128, 127).astype(np.int8).view(np.uint8)
+            downsampled_block[5] = np.clip(np.mean(cr_values), -128, 127).astype(np.int8).view(np.uint8)
             
             # 色块重复4次以增加在聚类中的权重（因为一个色块代表4个2x2块）
             effective_blocks.extend([downsampled_block] * 4)

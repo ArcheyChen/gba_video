@@ -16,9 +16,8 @@
 // YUV数据结构
 struct YUV_Struct{
     u8 y[2][2];
-    s8 d_r;    // 预计算的 Cr
-    s8 d_g;    // 预计算的 (-(Cb>>1)-Cr)>>1
-    s8 d_b;    // 预计算的 Cb
+    s8 cb;     // Cb 色度分量
+    s8 cr;     // Cr 色度分量
 } __attribute__((packed));
 
 // 解码后的RGB555数据结构（直接存储RGB555值，避免实时转换）
@@ -79,7 +78,8 @@ public:
     static bool rgb555_codebook_preloaded;
     static int last_check_frame;
     // 查找表（移到public以便外部函数访问）
-    static u8 clip_lookup_table[512];
+    static u8 clip_lookup_table_raw[2048];
+    static u8 *clip_lookup_table;
     static void find_next_i_frame(const u8* video_data,int start_frame){
         constexpr int max_find_count = 30; // 一次最多查找30帧
         if(last_check_frame == -1){

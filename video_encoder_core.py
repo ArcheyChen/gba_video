@@ -148,7 +148,7 @@ def encode_frame_chunk_worker(args):
             is_i_frame = True
             
             # 计算码本和索引大小
-            codebook_size_bytes = codebook_size * 7  # BYTES_PER_BLOCK
+            codebook_size_bytes = codebook_size * 6  # BYTES_PER_BLOCK
             index_size = len(frame_data) - 1 - codebook_size_bytes
             
             # 更新统计
@@ -173,7 +173,7 @@ def encode_frame_chunk_worker(args):
             )
             
             if is_i_frame:
-                codebook_size_bytes = codebook_size * 7  # BYTES_PER_BLOCK
+                codebook_size_bytes = codebook_size * 6  # BYTES_PER_BLOCK
                 index_size = len(frame_data) - 1 - codebook_size_bytes
                 
                 # 更新统计
@@ -517,11 +517,15 @@ class VideoEncoderCore:
                 big_blocks_h = blocks_h // 2
                 big_blocks_w = blocks_w // 2
                 bt_arr = np.zeros((big_blocks_h, big_blocks_w, 2), dtype=np.int32)
-                for (by, bx), (typ, indices) in bt_map.items():
-                    if typ == 'color':
-                        bt_arr[by, bx, 0] = 0
-                    else:
-                        bt_arr[by, bx, 0] = 1
+                if bt_map is not None:
+                    for (by, bx), (typ, indices) in bt_map.items():
+                        if typ == 'color':
+                            bt_arr[by, bx, 0] = 0
+                        else:
+                            bt_arr[by, bx, 0] = 1
+                else:
+                    # 如果 bt_map 为 None，默认所有块为纹理块
+                    bt_arr[:, :, 0] = 1
                 cur_frames.append(cur)
                 prev_frames.append(prev)
                 block_types_arr.append(bt_arr)
@@ -531,7 +535,7 @@ class VideoEncoderCore:
                 cur_frames_np = np.stack(cur_frames)
                 prev_frames_np = np.stack(prev_frames)
                 block_types_np = np.stack(block_types_arr)
-                counts = self.count_codebook_usage_numba(cur_frames_np, prev_frames_np, block_types_np, codebook, diff_threshold)
+                counts = VideoEncoderCore.count_codebook_usage_numba(cur_frames_np, prev_frames_np, block_types_np, codebook, diff_threshold)
             max_count = counts.max()
             min_count = counts.min()
             total_usage = counts.sum()
