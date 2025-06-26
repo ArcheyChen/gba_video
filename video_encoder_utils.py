@@ -2,6 +2,7 @@
 
 import pathlib
 import textwrap
+from core_encoder import BYTES_PER_BLOCK
 
 def write_header(path_h: pathlib.Path, frame_cnt: int, total_bytes: int, codebook_size: int, output_fps: float):
     """生成C语言头文件"""
@@ -30,7 +31,7 @@ def write_header(path_h: pathlib.Path, frame_cnt: int, total_bytes: int, codeboo
             // 块参数
             #define BLOCK_WIDTH         2
             #define BLOCK_HEIGHT        2
-            #define BYTES_PER_BLOCK     7
+            #define BYTES_PER_BLOCK     {BYTES_PER_BLOCK}
             
             extern const unsigned char video_data[VIDEO_TOTAL_BYTES];
             extern const unsigned int frame_offsets[VIDEO_FRAME_COUNT];

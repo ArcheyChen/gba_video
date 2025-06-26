@@ -488,7 +488,7 @@ def encode_i_frame_unified(blocks: np.ndarray, unified_codebook: np.ndarray,
                                     blocks_4x4.append(blocks[by, bx])
                         
                         avg_block = np.mean(blocks_4x4, axis=0).round().astype(np.uint8)
-                        for i in range(4, 6):  # 现在只有6个元素：4Y + Cb + Cr
+                        for i in range(4, BYTES_PER_BLOCK):  # 现在是6个元素：4Y + Cb + Cr，所以range(4,6)=[4,5]
                             avg_val = np.mean([b[i].view(np.int8) for b in blocks_4x4])
                             avg_block[i] = np.clip(avg_val, -128, 127).astype(np.int8).view(np.uint8)
                         
@@ -623,7 +623,7 @@ def encode_p_frame_unified(current_blocks: np.ndarray, prev_blocks: np.ndarray,
                             blocks_4x4.append(current_blocks[by, bx])
                     
                     avg_block = np.mean(blocks_4x4, axis=0).round().astype(np.uint8)
-                    for i in range(4, 6):  # 现在只有6个元素：4Y + Cb + Cr
+                    for i in range(4, BYTES_PER_BLOCK):  # 现在是6个元素：4Y + Cb + Cr，所以range(4,6)=[4,5]
                         avg_val = np.mean([b[i].view(np.int8) for b in blocks_4x4])
                         avg_block[i] = np.clip(avg_val, -128, 127).astype(np.int8).view(np.uint8)
                     
