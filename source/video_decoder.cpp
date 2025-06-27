@@ -408,8 +408,6 @@ IWRAM_CODE void VideoDecoder::decode_full_index_segment_rgb555(const u8** src, u
 // RGB555版本的P帧解码函数
 IWRAM_CODE void VideoDecoder::decode_p_frame_unified_rgb555(const u8* src, u16* dst)
 {
-    // 首先将VRAM中的前一帧复制到buffer
-    memcpy(dst, (u16*)VRAM, SCREEN_WIDTH * SCREEN_HEIGHT * sizeof(u16));
     
     // 然后解码运动补偿数据，从VRAM的其他位置复制到buffer的目标位置
     decode_motion_compensation_data(&src, dst, (u16*)VRAM);
