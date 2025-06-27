@@ -47,6 +47,7 @@ private:
     // 查找表
     static u16 big_block_relative_offsets[240/4*160/4];
     static u16 zone_block_relative_offsets[240];
+    static u16 zone_motion_block_relative_offsets[240];
 
     // 新增：RGB555码本解码函数
     static void decode_color_block_rgb555(const RGB555_Struct &rgb555_data, u16* dst);
