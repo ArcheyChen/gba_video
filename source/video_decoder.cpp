@@ -267,12 +267,9 @@ IWRAM_CODE void VideoDecoder::apply_motion_compensation_8x8_block(u16* dst, u16*
             int src_y = src_start_y + y;
             int src_x = src_start_x + x;
             
-            // 边界检查
-            if (dst_y >= 0 && dst_y < SCREEN_HEIGHT && dst_x >= 0 && dst_x < SCREEN_WIDTH &&
-                src_y >= 0 && src_y < SCREEN_HEIGHT && src_x >= 0 && src_x < SCREEN_WIDTH) {
+            
                 // 从VRAM的源位置复制像素到buffer的目标位置
-                dst[dst_y * SCREEN_WIDTH + dst_x] = vram_src[src_y * SCREEN_WIDTH + src_x];
-            }
+            dst[dst_y * SCREEN_WIDTH + dst_x] = vram_src[src_y * SCREEN_WIDTH + src_x];
         }
     }
 }

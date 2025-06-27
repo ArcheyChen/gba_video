@@ -218,9 +218,9 @@ def detect_motion_compensation_candidates(current_blocks: np.ndarray, prev_block
             current_blocks, prev_blocks, block_8x8_y, block_8x8_x, diff_threshold
         )
         
-        # 如果更新块数少于阈值，标记为候选（暂时允许零向量用于调试）
+        # 如果更新块数少于阈值且有真实运动（非零向量），标记为候选
         dx, dy = best_mv
-        if updates_needed <= update_threshold:
+        if updates_needed <= update_threshold and (dx != 0 or dy != 0):
             zone_idx, zone_relative_idx = get_8x8_block_zone_info(block_8x8_idx)
             
             if zone_idx not in motion_candidates:
@@ -236,12 +236,12 @@ def detect_motion_compensation_candidates(current_blocks: np.ndarray, prev_block
     
     # 更新统计信息
     motion_stats.update_frame_stats(motion_candidates, total_8x8_blocks)
+        # 调试信息
+    # total_compensated_blocks = sum(len(candidates) for candidates in motion_candidates.values())
+    # if total_compensated_blocks > 0:
+    #     print(f"  运动补偿: {total_compensated_blocks}/{total_8x8_blocks} 个8x8块")
     
-    # 调试信息
-    total_compensated_blocks = sum(len(candidates) for candidates in motion_candidates.values())
-    if total_compensated_blocks > 0:
-        print(f"  运动补偿: {total_compensated_blocks}/{total_8x8_blocks} 个8x8块")
-    
+
     return motion_candidates
 
 def apply_motion_compensation_to_blocks(current_blocks: np.ndarray, prev_blocks: np.ndarray,
