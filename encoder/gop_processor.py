@@ -45,13 +45,23 @@ def extract_effective_blocks_from_big_blocks(blocks: np.ndarray, big_block_posit
                 # 每个2x2块内部一致，取其内部平均值
                 avg_y = np.mean(block[:4])
                 y_values.append(int(avg_y))
-                cb_values.append(block[4].view(np.int8))
-                cr_values.append(block[5].view(np.int8))
+                
+                # YUV444格式：UV值直接平均，不需要减128
+                avg_cb = np.mean(block[4:8])  # Cb值索引4-7
+                avg_cr = np.mean(block[8:12])  # Cr值索引8-11
+                cb_values.append(avg_cb)
+                cr_values.append(avg_cr)
             
             # 用4个2x2子块的平均值构成下采样块
             downsampled_block[:4] = np.array(y_values, dtype=np.uint8)
-            downsampled_block[4] = np.clip(np.mean(cb_values), -128, 127).astype(np.int8).view(np.uint8)
-            downsampled_block[5] = np.clip(np.mean(cr_values), -128, 127).astype(np.int8).view(np.uint8)
+            
+            # 设置所有4个像素的UV值为平均值
+            avg_cb_final = np.clip(np.mean(cb_values), 0, 255).astype(np.uint8)
+            avg_cr_final = np.clip(np.mean(cr_values), 0, 255).astype(np.uint8)
+            
+            for i in range(4):
+                downsampled_block[4 + i] = avg_cb_final  # Cb
+                downsampled_block[8 + i] = avg_cr_final  # Cr
             
             # 色块重复4次以增加在聚类中的权重（因为一个色块代表4个2x2块）
             effective_blocks.extend([downsampled_block] * 4)

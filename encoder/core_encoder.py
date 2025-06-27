@@ -113,11 +113,9 @@ def calculate_color_block_distance(color_block: np.ndarray, codebook_entry: np.n
     color_block_float = color_block.astype(np.float32)
     codebook_float = codebook_entry.astype(np.float32)
     
-    # 前4个是Y值，保持uint8
-    # 后8个是UV值，需要减128转换回有符号值进行比较
-    for i in range(4, BYTES_PER_BLOCK):
-        color_block_float[i] = color_block[i].astype(np.float32) - 128.0
-        codebook_float[i] = codebook_entry[i].astype(np.float32) - 128.0
+    # 前4个是Y值，保持uint8直接比较
+    # 后8个是UV值，由于两边都减128，差值相同，所以直接用uint8比较即可
+    # (U-128) - (U'-128) = U - U'，所以可以省略-128操作
     
     # 计算欧几里得距离
     diff = color_block_float - codebook_float
@@ -166,10 +164,12 @@ def classify_4x4_blocks_unified_numba(blocks, variance_threshold=5.0):
                     y_values[i] = int(np.mean(block[:4]))
                     # UV值需要减128转回有符号值进行平均
                     for j in range(4):
-                        cb_values[i] += (float(block[4 + j]) - 128.0)
-                        cr_values[i] += (float(block[8 + j]) - 128.0)
+                        cb_values[i] += (float(block[4 + j]))
+                        cr_values[i] += (float(block[8 + j]))
                     cb_values[i] /= 4.0  # 平均
                     cr_values[i] /= 4.0  # 平均
+                    cb_values[i] -= 128.0  # 转回有符号值
+                    cr_values[i] -= 128.0  # 转回有符号值
                 
                 downsampled_block[:4] = y_values
                 
@@ -430,12 +430,9 @@ def convert_blocks_for_clustering(blocks_data: np.ndarray) -> np.ndarray:
     if blocks_data.ndim > 2:
         blocks_data = blocks_data.reshape(-1, BYTES_PER_BLOCK)
     
+    # 直接转换为float32，不需要对UV减128
+    # 因为聚类算法计算的是距离，UV-128的操作会在计算距离时相消
     blocks_float = blocks_data.astype(np.float32)
-    
-    # 前4个是Y值，保持原样
-    # 后8个UV值，需要减128转换为有符号值
-    for i in range(4, BYTES_PER_BLOCK):
-        blocks_float[:, i] = blocks_data[:, i].astype(np.float32) - 128.0
     
     return blocks_float
 
@@ -443,13 +440,10 @@ def convert_codebook_from_clustering(codebook_float: np.ndarray) -> np.ndarray:
     """将聚类结果转换回正确的块格式（YUV444）"""
     codebook = np.zeros_like(codebook_float, dtype=np.uint8)
     
-    # 前4个是Y值，直接截断到0-255
-    codebook[:, 0:4] = np.clip(codebook_float[:, 0:4].round(), 0, 255).astype(np.uint8)
+    # 由于聚类时没有对UV减128，所以这里直接截断到0-255即可
+    codebook = np.clip(codebook_float.round(), 0, 255).astype(np.uint8)
     
-    # 后8个是UV值，需要加128转换为无符号值
-    for i in range(4, BYTES_PER_BLOCK):
-        clipped_values = np.clip(codebook_float[:, i].round() + 128.0, 0, 255).astype(np.uint8)
-        codebook[:, i] = clipped_values
+    return codebook
     
     return codebook
 
@@ -504,7 +498,7 @@ def encode_i_frame_unified(blocks: np.ndarray, unified_codebook: np.ndarray,
                         # 对于UV分量（索引4-11），需要特殊处理
                         for i in range(4, BYTES_PER_BLOCK):
                             # 将uint8转为有符号值进行平均，然后转回uint8
-                            avg_val = np.mean([(b[i].astype(np.float32) - 128.0) for b in blocks_4x4])
+                            avg_val = np.mean([(b[i].astype(np.float32)) for b in blocks_4x4]) - 128.0
                             avg_block[i] = np.clip(avg_val + 128.0, 0, 255).astype(np.uint8)
                         
                         # 计算色块与最佳码本项的距离
@@ -643,7 +637,7 @@ def encode_p_frame_unified(current_blocks: np.ndarray, prev_blocks: np.ndarray,
                     # 对于UV分量（索引4-11），需要特殊处理
                     for i in range(4, BYTES_PER_BLOCK):
                         # 将uint8转为有符号值进行平均，然后转回uint8
-                        avg_val = np.mean([(b[i].astype(np.float32) - 128.0) for b in blocks_4x4])
+                        avg_val = np.mean([(b[i].astype(np.float32)) for b in blocks_4x4])  - 128.0
                         avg_block[i] = np.clip(avg_val + 128.0, 0, 255).astype(np.uint8)
                     
                     # 计算色块与最佳码本项的距离
@@ -1094,14 +1088,14 @@ def convert_yuv444_codebook_to_yuv420(yuv444_codebook: np.ndarray) -> np.ndarray
         
         # UV值：计算平均值并转换回有符号格式
         # Cb: 索引4-7是Cb值
-        cb_values = yuv444_entry[4:8].astype(np.float32) - 128.0  # 转回有符号值
-        cb_mean = np.mean(cb_values)
+        cb_values = yuv444_entry[4:8].astype(np.float32)
+        cb_mean = np.mean(cb_values) - 128.0  # 转回有符号值
         cb_sint8 = np.clip(cb_mean, -128.0, 127.0).astype(np.int8)
         yuv420_codebook[i, 4] = cb_sint8.view(np.uint8)
         
         # Cr: 索引8-11是Cr值  
-        cr_values = yuv444_entry[8:12].astype(np.float32) - 128.0  # 转回有符号值
-        cr_mean = np.mean(cr_values)
+        cr_values = yuv444_entry[8:12].astype(np.float32)
+        cr_mean = np.mean(cr_values) - 128.0  # 转回有符号值
         cr_sint8 = np.clip(cr_mean, -128.0, 127.0).astype(np.int8)
         yuv420_codebook[i, 5] = cr_sint8.view(np.uint8)
     
