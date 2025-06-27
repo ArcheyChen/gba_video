@@ -270,6 +270,18 @@ IWRAM_CODE void VideoDecoder::apply_motion_compensation_8x8_block(u16* dst, u16*
     }
 }
 
+int inline cal_dst_offset(int motion_block_idx){
+    int relative_8x8_row = motion_block_idx / MOTION_BLOCKS_8X8_PER_ZONE_ROW;
+    int relative_8x8_col = motion_block_idx % MOTION_BLOCKS_8X8_PER_ZONE_ROW;
+    
+    int block_8x8_y = relative_8x8_row;
+    int block_8x8_x = relative_8x8_col;
+
+    int dst_start_y = block_8x8_y * MOTION_BLOCK_8X8_SIZE;
+    int dst_start_x = block_8x8_x * MOTION_BLOCK_8X8_SIZE;
+    int dst_offset = dst_start_y * SCREEN_WIDTH + dst_start_x;
+    return dst_offset;
+}
 // 解码运动补偿数据
 IWRAM_CODE void VideoDecoder::decode_motion_compensation_data(const u8* &src, u16* dst, u16* vram_src)
 {
@@ -277,6 +289,8 @@ IWRAM_CODE void VideoDecoder::decode_motion_compensation_data(const u8* &src, u1
     u8 zone_bitmap = *src++;
     int zone_idx = 0;
     // 遍历每个zone
+    u16* zone_src = vram_src;
+    u16* zone_dst = dst;
     while(zone_bitmap){
         if(zone_bitmap & 1){
             // 读取该zone的运动补偿块数量
@@ -285,7 +299,7 @@ IWRAM_CODE void VideoDecoder::decode_motion_compensation_data(const u8* &src, u1
             // 解码每个运动补偿块
             for (u8 i = 0; i < motion_blocks_count; i++) {
                 // 读取zone内相对索引
-                u8 zone_relative_idx = src[0];
+                u8 motion_block_idx = src[0];
                 u8 encoded_mv = src[1];
                 src +=2;
                 // 解码运动向量
@@ -294,33 +308,23 @@ IWRAM_CODE void VideoDecoder::decode_motion_compensation_data(const u8* &src, u1
                 motion_dy = (encoded_mv >> 4) - MOTION_RANGE;
                 
                 // 计算8x8块的全局坐标
-                int zone_start_8x8_row = zone_idx * MOTION_BLOCKS_8X8_PER_ZONE_HEIGHT;
-                int relative_8x8_row = zone_relative_idx / MOTION_BLOCKS_8X8_PER_ZONE_ROW;
-                int relative_8x8_col = zone_relative_idx % MOTION_BLOCKS_8X8_PER_ZONE_ROW;
+                int dst_offset = cal_dst_offset(motion_block_idx);
                 
-                int block_8x8_y = zone_start_8x8_row + relative_8x8_row;
-                int block_8x8_x = relative_8x8_col;
-            
-                int dst_start_y = block_8x8_y * MOTION_BLOCK_8X8_SIZE;
-                int dst_start_x = block_8x8_x * MOTION_BLOCK_8X8_SIZE;
-                
-                // 计算运动补偿后的源位置
-                int src_start_y = dst_start_y + motion_dy;
-                int src_start_x = dst_start_x + motion_dx;
-                
+                int src_offset = dst_offset + motion_dy * SCREEN_WIDTH + motion_dx;
+
                 // 复制8x8像素块（从VRAM复制到buffer）
-                int dst_y = dst_start_y * SCREEN_WIDTH + dst_start_x;
-                int src_y = src_start_y * SCREEN_WIDTH + src_start_x;
                 for (int y = 0; y < MOTION_BLOCK_8X8_SIZE; y++) {
                     // memcpy(&dst[dst_y],&vram_src[src_y],MOTION_BLOCK_8X8_SIZE*sizeof(u16));
-                    DMA3COPY(&vram_src[src_y],&dst[dst_y],(MOTION_BLOCK_8X8_SIZE>>1)|DMA32);
-                    dst_y += SCREEN_WIDTH;
-                    src_y += SCREEN_WIDTH;
+                    DMA3COPY(&zone_src[src_offset],&zone_dst[dst_offset],(MOTION_BLOCK_8X8_SIZE>>1)|DMA32);
+                    dst_offset += SCREEN_WIDTH;
+                    src_offset += SCREEN_WIDTH;
                 }
             }
         }
         zone_idx++;
         zone_bitmap >>=1;
+        zone_src += MOTION_BLOCK_8X8_SIZE * MOTION_BLOCK_8X8_SIZE * 240;
+        zone_dst += MOTION_BLOCK_8X8_SIZE * MOTION_BLOCK_8X8_SIZE * 240;
     }
 }
 
