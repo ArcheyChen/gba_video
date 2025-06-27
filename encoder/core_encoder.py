@@ -31,8 +31,7 @@ MINI_CODEBOOK_SIZE = 16  # 每个分段码本的大小
 MEDIUM_CODEBOOK_SIZE = 64  # 每个中等码本的大小
 DEFAULT_ENABLED_SEGMENTS_BITMAP = 0xFFFF  # 默认启用前16段的bitmap (1111111111111111)
 DEFAULT_ENABLED_MEDIUM_SEGMENTS_BITMAP = 0x0F  # 默认启用前4个中码表段的bitmap (00001111)
-SKIP_MARKER_4BIT = 0xF   # 4bit跳过标记（已废弃）
-SKIP_MARKER_6BIT = 0x3F  # 6bit跳过标记（已废弃）
+
 
 # 帧类型标识
 FRAME_TYPE_I = 0x00  # I帧（关键帧）

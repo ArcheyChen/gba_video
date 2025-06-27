@@ -10,8 +10,6 @@
 #define ZONE_HEIGHT_BIG_BLOCKS (ZONE_HEIGHT_PIXELS / (BLOCK_HEIGHT * 2))  // 每个区域的4x4大块行数
 #define MINI_CODEBOOK_SIZE 16  // 每个分段码本的大小
 #define MEDIUM_CODEBOOK_SIZE 64  // 每个中等码本的大小
-#define SKIP_MARKER_4BIT 0xF   // 4bit跳过标记
-#define SKIP_MARKER_6BIT 0x3F  // 6bit跳过标记
 
 // YUV数据结构
 struct YUV_Struct{
