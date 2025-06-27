@@ -21,7 +21,7 @@ Y_COEFF  = np.array([0.28571429,  0.57142857,  0.14285714])
 CB_COEFF = np.array([-0.14285714, -0.28571429,  0.42857143])
 CR_COEFF = np.array([ 0.35714286, -0.28571429, -0.07142857])
 BLOCK_W, BLOCK_H = 2, 2
-BYTES_PER_BLOCK  = 6  # 4Y + Cb + Cr
+BYTES_PER_BLOCK  = 12  # 4Y + 4Cb + 4Cr (YUV444)
 
 # 新增常量
 ZONE_HEIGHT_PIXELS = 16  # 每个区域的像素高度
@@ -48,8 +48,8 @@ def clip_value(value, min_val, max_val):
         return value
 
 @njit
-def pack_yuv420_frame_numba(bgr_frame):
-    """Numba加速的整帧YUV420转换"""
+def pack_yuv444_frame_numba(bgr_frame):
+    """Numba加速的整帧YUV444转换"""
     blocks_h = HEIGHT // BLOCK_H
     blocks_w = WIDTH // BLOCK_W
     
@@ -61,11 +61,7 @@ def pack_yuv420_frame_numba(bgr_frame):
             y_start = by * BLOCK_H
             x_start = bx * BLOCK_W
             
-            # BGR to YUV conversion for 2x2 block
-            cb_sum = 0.0
-            cr_sum = 0.0
-            y_values = np.zeros(4, dtype=np.uint8)
-            
+            # BGR to YUV conversion for 2x2 block (YUV444)
             idx = 0
             for dy in range(BLOCK_H):
                 for dx in range(BLOCK_W):
@@ -78,28 +74,23 @@ def pack_yuv420_frame_numba(bgr_frame):
                         cb = r * (-0.14285714) + g * (-0.28571429) + b * 0.42857143
                         cr = r * 0.35714286 + g * (-0.28571429) + b * (-0.07142857)
                         
-                        # 不再预处理Y值，直接存储完整Y
-                        y_values[idx] = np.uint8(clip_value(y, 0.0, 255.0))
-                        cb_sum += cb
-                        cr_sum += cr
+                        # 存储Y值
+                        block_array[by, bx, idx] = np.uint8(clip_value(y, 0.0, 255.0))
+                        
+                        # 存储Cb和Cr值（加128转为uint8，与Y统一处理）
+                        cb_uint8 = np.uint8(clip_value(cb + 128.0, 0.0, 255.0))
+                        cr_uint8 = np.uint8(clip_value(cr + 128.0, 0.0, 255.0))
+                        
+                        block_array[by, bx, idx + 4] = cb_uint8
+                        block_array[by, bx, idx + 8] = cr_uint8
+                        
                         idx += 1
-            
-            # Store Y values
-            block_array[by, bx, 0:4] = y_values
-            
-            # Compute and store chroma - 直接存储Cb和Cr，不再预处理
-            cb_mean = cb_sum / 4.0
-            cr_mean = cr_sum / 4.0
-            
-            # 直接存储Cb和Cr（有符号值转换为无符号字节存储）
-            block_array[by, bx, 4] = np.uint8(np.int8(clip_value(cb_mean, -128.0, 127.0)))
-            block_array[by, bx, 5] = np.uint8(np.int8(clip_value(cr_mean, -128.0, 127.0)))
     
     return block_array
 
-def pack_yuv420_frame(frame_bgr: np.ndarray) -> np.ndarray:
-    """使用Numba加速的整帧YUV转换包装函数"""
-    return pack_yuv420_frame_numba(frame_bgr)
+def pack_yuv444_frame(frame_bgr: np.ndarray) -> np.ndarray:
+    """使用Numba加速的整帧YUV444转换包装函数"""
+    return pack_yuv444_frame_numba(frame_bgr)
 
 @njit
 def calculate_block_variance_numba(y_values):
@@ -112,24 +103,25 @@ def calculate_block_variance_numba(y_values):
     return variance / len(y_values)
 
 def calculate_2x2_block_variance(block: np.ndarray) -> float:
-    """计算单个2x2块的方差，用于判断是否为纯色"""
-    y_values = block[:4].astype(np.float64)
+    """计算单个2x2块的方差，用于判断是否为纯色（YUV444格式）"""
+    y_values = block[:4].astype(np.float64)  # 前4个字节是Y值
     return calculate_block_variance_numba(y_values)
 
 def calculate_color_block_distance(color_block: np.ndarray, codebook_entry: np.ndarray) -> float:
-    """计算色块与码本项的距离"""
-    # 将色度分量转换为有符号值进行比较
+    """计算色块与码本项的距离（YUV444格式）"""
+    # 将数据转换为float32进行比较
     color_block_float = color_block.astype(np.float32)
     codebook_float = codebook_entry.astype(np.float32)
     
-    # 色度分量需要转换为有符号值
+    # 前4个是Y值，保持uint8
+    # 后8个是UV值，需要减128转换回有符号值进行比较
     for i in range(4, BYTES_PER_BLOCK):
-        color_block_float[i] = color_block[i].view(np.int8).astype(np.float32)
-        codebook_float[i] = codebook_entry[i].view(np.int8).astype(np.float32)
+        color_block_float[i] = color_block[i].astype(np.float32) - 128.0
+        codebook_float[i] = codebook_entry[i].astype(np.float32) - 128.0
     
     # 计算欧几里得距离
     diff = color_block_float - codebook_float
-    distance = (np.sum(diff * diff))/4
+    distance = np.sum(diff * diff) / 4
     
     return distance
 
@@ -153,28 +145,43 @@ def classify_4x4_blocks_unified_numba(blocks, variance_threshold=5.0):
                         blocks_4x4.append(np.zeros(BYTES_PER_BLOCK, dtype=np.uint8))
             all_2x2_blocks_are_uniform = True
             for block in blocks_4x4:
-                y = block[:4].astype(np.float32)
-                v = ((y[0] - y[1]) ** 2 + (y[0] - y[2]) ** 2 + (y[0] - y[3]) ** 2 + (y[1] - y[2]) ** 2 + (y[1] - y[3]) ** 2 + (y[2] - y[3]) ** 2) / 6.0
+                # YUV444格式，前4个是Y值，手动转换为float避免numba的.astype()问题
+                y0 = float(block[0])
+                y1 = float(block[1])
+                y2 = float(block[2])
+                y3 = float(block[3])
+                v = ((y0 - y1) ** 2 + (y0 - y2) ** 2 + (y0 - y3) ** 2 + (y1 - y2) ** 2 + (y1 - y3) ** 2 + (y2 - y3) ** 2) / 6.0
                 if v > variance_threshold:
                     all_2x2_blocks_are_uniform = False
                     break
             if all_2x2_blocks_are_uniform:
                 downsampled_block = np.zeros(BYTES_PER_BLOCK, dtype=np.uint8)
+                # 计算Y的平均值（前4个）
                 y_values = np.zeros(4, dtype=np.uint8)
-                cb_values = np.zeros(4, dtype=np.int8)
-                cr_values = np.zeros(4, dtype=np.int8)
+                # 计算UV的平均值（YUV444格式）
+                cb_values = np.zeros(4, dtype=np.float32)
+                cr_values = np.zeros(4, dtype=np.float32)
                 for i in range(4):
                     block = blocks_4x4[i]
                     y_values[i] = int(np.mean(block[:4]))
-                    cb_values[i] = np.int8(block[4])
-                    cr_values[i] = np.int8(block[5])
+                    # UV值需要减128转回有符号值进行平均
+                    for j in range(4):
+                        cb_values[i] += (float(block[4 + j]) - 128.0)
+                        cr_values[i] += (float(block[8 + j]) - 128.0)
+                    cb_values[i] /= 4.0  # 平均
+                    cr_values[i] /= 4.0  # 平均
+                
                 downsampled_block[:4] = y_values
-                val_cb = np.mean(cb_values)
-                val_cb = min(max(val_cb, -128), 127)
-                downsampled_block[4] = np.int8(val_cb)
-                val_cr = np.mean(cr_values)
-                val_cr = min(max(val_cr, -128), 127)
-                downsampled_block[5] = np.int8(val_cr)
+                
+                # 计算平均UV值并转回uint8格式
+                avg_cb = np.mean(cb_values)
+                avg_cr = np.mean(cr_values)
+                
+                # 为每个像素设置相同的UV值
+                for j in range(4):
+                    downsampled_block[4 + j] = np.uint8(clip_value(avg_cb + 128.0, 0.0, 255.0))
+                    downsampled_block[8 + j] = np.uint8(clip_value(avg_cr + 128.0, 0.0, 255.0))
+                
                 block_idx = len(all_blocks)
                 all_blocks.append(downsampled_block)
                 block_types_list.append((big_by, big_bx, 0, [block_idx]))  # 0=color
@@ -259,7 +266,7 @@ def generate_unified_codebook(all_blocks: list, codebook_size: int = DEFAULT_UNI
 
 @njit
 def quantize_blocks_distance_numba(blocks_for_clustering, codebook_for_clustering):
-    """Numba加速的块量化距离计算"""
+    """Numba加速的块量化距离计算（YUV444格式）"""
     n_blocks = blocks_for_clustering.shape[0]
     n_codebook = codebook_for_clustering.shape[0]
     indices = np.zeros(n_blocks, dtype=np.uint8)
@@ -347,12 +354,12 @@ def quantize_blocks_unified_medium(blocks_data: np.ndarray, codebook: np.ndarray
 
 @njit
 def compute_2x2_block_differences_numba(current_flat, prev_flat, blocks_h, blocks_w):
-    """Numba加速的2x2块差异计算"""
+    """Numba加速的2x2块差异计算（YUV444格式，只比较Y分量）"""
     block_diffs = np.zeros((blocks_h, blocks_w), dtype=np.float64)
     
     for i in range(blocks_h * blocks_w):
         y_diff_sum = 0.0
-        for j in range(4):  # 只计算Y分量差异
+        for j in range(4):  # 只计算Y分量差异（前4个字节）
             current_val = int(current_flat[i, j])
             prev_val = int(prev_flat[i, j])
             if current_val >= prev_val:
@@ -416,7 +423,7 @@ def identify_updated_big_blocks(current_blocks: np.ndarray, prev_blocks: np.ndar
     return set(updated_list)
 
 def convert_blocks_for_clustering(blocks_data: np.ndarray) -> np.ndarray:
-    """将块数据转换为正确的聚类格式"""
+    """将块数据转换为正确的聚类格式（YUV444）"""
     if len(blocks_data) == 0:
         return blocks_data.astype(np.float32)
     
@@ -425,20 +432,24 @@ def convert_blocks_for_clustering(blocks_data: np.ndarray) -> np.ndarray:
     
     blocks_float = blocks_data.astype(np.float32)
     
+    # 前4个是Y值，保持原样
+    # 后8个UV值，需要减128转换为有符号值
     for i in range(4, BYTES_PER_BLOCK):
-        blocks_float[:, i] = blocks_data[:, i].view(np.int8).astype(np.float32)
+        blocks_float[:, i] = blocks_data[:, i].astype(np.float32) - 128.0
     
     return blocks_float
 
 def convert_codebook_from_clustering(codebook_float: np.ndarray) -> np.ndarray:
-    """将聚类结果转换回正确的块格式"""
+    """将聚类结果转换回正确的块格式（YUV444）"""
     codebook = np.zeros_like(codebook_float, dtype=np.uint8)
     
+    # 前4个是Y值，直接截断到0-255
     codebook[:, 0:4] = np.clip(codebook_float[:, 0:4].round(), 0, 255).astype(np.uint8)
     
+    # 后8个是UV值，需要加128转换为无符号值
     for i in range(4, BYTES_PER_BLOCK):
-        clipped_values = np.clip(codebook_float[:, i].round(), -128, 127).astype(np.int8)
-        codebook[:, i] = clipped_values.view(np.uint8)
+        clipped_values = np.clip(codebook_float[:, i].round() + 128.0, 0, 255).astype(np.uint8)
+        codebook[:, i] = clipped_values
     
     return codebook
 
@@ -453,8 +464,9 @@ def encode_i_frame_unified(blocks: np.ndarray, unified_codebook: np.ndarray,
         big_blocks_h = blocks_h // 2
         big_blocks_w = blocks_w // 2
         
-        # 存储统一码本
-        data.extend(unified_codebook.flatten().tobytes())
+        # 将YUV444码本转换为YUV420格式并存储
+        yuv420_codebook = convert_yuv444_codebook_to_yuv420(unified_codebook)
+        data.extend(yuv420_codebook.flatten().tobytes())
         
         # 按4x4大块的顺序编码
         for big_by in range(big_blocks_h):
@@ -477,7 +489,7 @@ def encode_i_frame_unified(blocks: np.ndarray, unified_codebook: np.ndarray,
                     
                     if block_type == 'color':
                         # 色块：先尝试色块编码，如果距离过大则回退到纹理块
-                        # 从原始blocks重建平均块
+                        # 从原始blocks重建平均块（YUV444格式）
                         blocks_4x4 = []
                         for sub_by in range(2):
                             for sub_bx in range(2):
@@ -486,10 +498,14 @@ def encode_i_frame_unified(blocks: np.ndarray, unified_codebook: np.ndarray,
                                 if by < blocks_h and bx < blocks_w:
                                     blocks_4x4.append(blocks[by, bx])
                         
+                        # 计算平均值（YUV444格式）
                         avg_block = np.mean(blocks_4x4, axis=0).round().astype(np.uint8)
-                        for i in range(4, BYTES_PER_BLOCK):  # 现在是6个元素：4Y + Cb + Cr，所以range(4,6)=[4,5]
-                            avg_val = np.mean([b[i].view(np.int8) for b in blocks_4x4])
-                            avg_block[i] = np.clip(avg_val, -128, 127).astype(np.int8).view(np.uint8)
+                        
+                        # 对于UV分量（索引4-11），需要特殊处理
+                        for i in range(4, BYTES_PER_BLOCK):
+                            # 将uint8转为有符号值进行平均，然后转回uint8
+                            avg_val = np.mean([(b[i].astype(np.float32) - 128.0) for b in blocks_4x4])
+                            avg_block[i] = np.clip(avg_val + 128.0, 0, 255).astype(np.uint8)
                         
                         # 计算色块与最佳码本项的距离
                         unified_idx = quantize_blocks_unified(avg_block.reshape(1, -1), unified_codebook)[0]
@@ -615,16 +631,20 @@ def encode_p_frame_unified(current_blocks: np.ndarray, prev_blocks: np.ndarray,
                                 block_types[(big_by, big_bx)][0] == 'color')
                 
                 if is_color_block:
-                    # 色块更新：如果任何子块需要更新，就更新整个色块
+                    # 色块更新：如果任何子块需要更新，就更新整个色块（YUV444格式）
                     blocks_4x4 = []
                     for by, bx in positions:
                         if by < blocks_h and bx < blocks_w:
                             blocks_4x4.append(current_blocks[by, bx])
                     
+                    # 计算平均值（YUV444格式）
                     avg_block = np.mean(blocks_4x4, axis=0).round().astype(np.uint8)
-                    for i in range(4, BYTES_PER_BLOCK):  # 现在是6个元素：4Y + Cb + Cr，所以range(4,6)=[4,5]
-                        avg_val = np.mean([b[i].view(np.int8) for b in blocks_4x4])
-                        avg_block[i] = np.clip(avg_val, -128, 127).astype(np.int8).view(np.uint8)
+                    
+                    # 对于UV分量（索引4-11），需要特殊处理
+                    for i in range(4, BYTES_PER_BLOCK):
+                        # 将uint8转为有符号值进行平均，然后转回uint8
+                        avg_val = np.mean([(b[i].astype(np.float32) - 128.0) for b in blocks_4x4])
+                        avg_block[i] = np.clip(avg_val + 128.0, 0, 255).astype(np.uint8)
                     
                     # 计算色块与最佳码本项的距离
                     color_idx = quantize_blocks_unified(avg_block.reshape(1, -1), unified_codebook)[0]
@@ -1053,6 +1073,39 @@ def encode_p_frame_unified(current_blocks: np.ndarray, prev_blocks: np.ndarray,
                 data.append(unified_idx)
     
     return bytes(data), False, used_zones, total_color_updates, total_detail_updates, small_updates, medium_updates, full_updates, small_bytes, medium_bytes, full_bytes, small_segments, medium_segments, small_blocks_per_update, medium_blocks_per_update, full_blocks_per_update
+
+def convert_yuv444_codebook_to_yuv420(yuv444_codebook: np.ndarray) -> np.ndarray:
+    """将YUV444格式的码本转换为YUV420格式用于输出
+    
+    Args:
+        yuv444_codebook: YUV444格式码本，每项12字节（4Y + 4Cb + 4Cr）
+    
+    Returns:
+        YUV420格式码本，每项6字节（4Y + 1Cb + 1Cr）
+    """
+    codebook_size = yuv444_codebook.shape[0]
+    yuv420_codebook = np.zeros((codebook_size, 6), dtype=np.uint8)
+    
+    for i in range(codebook_size):
+        yuv444_entry = yuv444_codebook[i]
+        
+        # Y值保持不变（前4个字节）
+        yuv420_codebook[i, 0:4] = yuv444_entry[0:4]
+        
+        # UV值：计算平均值并转换回有符号格式
+        # Cb: 索引4-7是Cb值
+        cb_values = yuv444_entry[4:8].astype(np.float32) - 128.0  # 转回有符号值
+        cb_mean = np.mean(cb_values)
+        cb_sint8 = np.clip(cb_mean, -128.0, 127.0).astype(np.int8)
+        yuv420_codebook[i, 4] = cb_sint8.view(np.uint8)
+        
+        # Cr: 索引8-11是Cr值  
+        cr_values = yuv444_entry[8:12].astype(np.float32) - 128.0  # 转回有符号值
+        cr_mean = np.mean(cr_values)
+        cr_sint8 = np.clip(cr_mean, -128.0, 127.0).astype(np.int8)
+        yuv420_codebook[i, 5] = cr_sint8.view(np.uint8)
+    
+    return yuv420_codebook
 
 @njit(cache=True, fastmath=True)
 def accumulate_unchanged_blocks_numba(current_blocks_flat: np.ndarray, prev_blocks_flat: np.ndarray, 

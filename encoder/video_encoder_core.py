@@ -147,8 +147,9 @@ def encode_frame_chunk_worker(args):
             )
             is_i_frame = True
             
-            # 计算码本和索引大小
-            codebook_size_bytes = codebook_size * BYTES_PER_BLOCK
+            # 计算码本和索引大小（使用输出的YUV420格式）
+            OUTPUT_BYTES_PER_BLOCK = 6  # YUV420格式：4Y + 1Cb + 1Cr
+            codebook_size_bytes = codebook_size * OUTPUT_BYTES_PER_BLOCK
             index_size = len(frame_data) - 1 - codebook_size_bytes
             
             # 更新统计
@@ -173,7 +174,8 @@ def encode_frame_chunk_worker(args):
             )
             
             if is_i_frame:
-                codebook_size_bytes = codebook_size * BYTES_PER_BLOCK
+                OUTPUT_BYTES_PER_BLOCK = 6  # YUV420格式：4Y + 1Cb + 1Cr
+                codebook_size_bytes = codebook_size * OUTPUT_BYTES_PER_BLOCK
                 index_size = len(frame_data) - 1 - codebook_size_bytes
                 
                 # 更新统计
