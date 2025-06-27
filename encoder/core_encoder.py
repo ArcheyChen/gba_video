@@ -130,7 +130,7 @@ def calculate_color_block_distance(color_block: np.ndarray, codebook_entry: np.n
     
     # 计算欧几里得距离
     diff = color_block_float - codebook_float
-    distance = np.sqrt(np.sum(diff * diff))
+    distance = (np.sum(diff * diff))/4
     
     return distance
 
