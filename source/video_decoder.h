@@ -73,7 +73,7 @@ private:
                                             const RGB555_Struct* unified_codebook);
     
     // 运动补偿相关函数
-    static void decode_motion_compensation_data(const u8** src, u16* dst, u16* vram_src);
+    static void decode_motion_compensation_data(const u8* &sr, u16* dst, u16* vram_src);
     static void apply_motion_compensation_8x8_block(u16* dst, u16* vram_src, 
                                                   int block_8x8_y, int block_8x8_x, 
                                                   int motion_dx, int motion_dy);

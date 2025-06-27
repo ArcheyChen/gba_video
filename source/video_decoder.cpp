@@ -260,43 +260,38 @@ IWRAM_CODE void VideoDecoder::apply_motion_compensation_8x8_block(u16* dst, u16*
     int src_start_x = dst_start_x + motion_dx;
     
     // 复制8x8像素块（从VRAM复制到buffer）
+    int dst_y = dst_start_y * SCREEN_WIDTH + dst_start_x;
+    int src_y = src_start_y * SCREEN_WIDTH + src_start_x;
     for (int y = 0; y < MOTION_BLOCK_8X8_SIZE; y++) {
-        for (int x = 0; x < MOTION_BLOCK_8X8_SIZE; x++) {
-            int dst_y = dst_start_y + y;
-            int dst_x = dst_start_x + x;
-            int src_y = src_start_y + y;
-            int src_x = src_start_x + x;
-            
-            
-                // 从VRAM的源位置复制像素到buffer的目标位置
-            dst[dst_y * SCREEN_WIDTH + dst_x] = vram_src[src_y * SCREEN_WIDTH + src_x];
-        }
+        // memcpy(&dst[dst_y],&vram_src[src_y],MOTION_BLOCK_8X8_SIZE*sizeof(u16));
+        DMA3COPY(&vram_src[src_y],&dst[dst_y],(MOTION_BLOCK_8X8_SIZE>>1)|DMA32);
+        dst_y += SCREEN_WIDTH;
+        src_y += SCREEN_WIDTH;
     }
 }
 
 // 解码运动补偿数据
-IWRAM_CODE void VideoDecoder::decode_motion_compensation_data(const u8** src, u16* dst, u16* vram_src)
+IWRAM_CODE void VideoDecoder::decode_motion_compensation_data(const u8* &src, u16* dst, u16* vram_src)
 {
     // 读取zone bitmap
-    u8 zone_bitmap = *(*src)++;
-    
+    u8 zone_bitmap = *src++;
+    int zone_idx = 0;
     // 遍历每个zone
-    for (int zone_idx = 0; zone_idx < MOTION_TOTAL_ZONES; zone_idx++) {
-        if (zone_bitmap & (1 << zone_idx)) {
+    while(zone_bitmap){
+        if(zone_bitmap & 1){
             // 读取该zone的运动补偿块数量
-            u8 motion_blocks_count = *(*src)++;
+            u8 motion_blocks_count = *src++;
             
             // 解码每个运动补偿块
             for (u8 i = 0; i < motion_blocks_count; i++) {
                 // 读取zone内相对索引
-                u8 zone_relative_idx = *(*src)++;
-                
-                // 读取编码的运动向量
-                u8 encoded_mv = *(*src)++;
-                
+                u8 zone_relative_idx = src[0];
+                u8 encoded_mv = src[1];
+                src +=2;
                 // 解码运动向量
                 int motion_dx, motion_dy;
-                decode_motion_vector(encoded_mv, &motion_dx, &motion_dy);
+                motion_dx = (encoded_mv & 0x0F) - MOTION_RANGE;
+                motion_dy = ((encoded_mv >> 4) & 0x0F) - MOTION_RANGE;
                 
                 // 计算8x8块的全局坐标
                 int zone_start_8x8_row = zone_idx * MOTION_BLOCKS_8X8_PER_ZONE_HEIGHT;
@@ -311,6 +306,8 @@ IWRAM_CODE void VideoDecoder::decode_motion_compensation_data(const u8** src, u1
                                                   motion_dx, motion_dy);
             }
         }
+        zone_idx++;
+        zone_bitmap >>=1;
     }
 }
 
@@ -407,7 +404,7 @@ IWRAM_CODE void VideoDecoder::decode_p_frame_unified_rgb555(const u8* src, u16* 
 {
     
     // 然后解码运动补偿数据，从VRAM的其他位置复制到buffer的目标位置
-    decode_motion_compensation_data(&src, dst, (u16*)VRAM);
+    decode_motion_compensation_data(src, dst, (u16*)VRAM);
     
     // 读取两个区域bitmap：纹理块和色块
     u16 detail_zone_bitmap = src[0] | (src[1] << 8);
