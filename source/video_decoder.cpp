@@ -236,6 +236,87 @@ IWRAM_CODE void VideoDecoder::decode_normal_4x4_block(u8 &valid_bitmap, BitReade
             valid_bitmap >>= 1;
         }
     }
+
+// 运动补偿相关函数
+
+// 解码运动向量
+IWRAM_CODE void VideoDecoder::decode_motion_vector(u8 encoded, int* dx, int* dy)
+{
+    *dx = (encoded & 0x0F) - MOTION_RANGE;
+    *dy = ((encoded >> 4) & 0x0F) - MOTION_RANGE;
+}
+
+// 应用8x8块的运动补偿
+IWRAM_CODE void VideoDecoder::apply_motion_compensation_8x8_block(u16* dst, u16* vram_src,
+                                                                 int block_8x8_y, int block_8x8_x,
+                                                                 int motion_dx, int motion_dy)
+{
+    // 计算8x8块在屏幕中的起始位置
+    int dst_start_y = block_8x8_y * MOTION_BLOCK_8X8_SIZE;
+    int dst_start_x = block_8x8_x * MOTION_BLOCK_8X8_SIZE;
+    
+    // 计算运动补偿后的源位置
+    int src_start_y = dst_start_y + motion_dy;
+    int src_start_x = dst_start_x + motion_dx;
+    
+    // 复制8x8像素块（从VRAM复制到buffer）
+    for (int y = 0; y < MOTION_BLOCK_8X8_SIZE; y++) {
+        for (int x = 0; x < MOTION_BLOCK_8X8_SIZE; x++) {
+            int dst_y = dst_start_y + y;
+            int dst_x = dst_start_x + x;
+            int src_y = src_start_y + y;
+            int src_x = src_start_x + x;
+            
+            // 边界检查
+            if (dst_y >= 0 && dst_y < SCREEN_HEIGHT && dst_x >= 0 && dst_x < SCREEN_WIDTH &&
+                src_y >= 0 && src_y < SCREEN_HEIGHT && src_x >= 0 && src_x < SCREEN_WIDTH) {
+                // 从VRAM的源位置复制像素到buffer的目标位置
+                dst[dst_y * SCREEN_WIDTH + dst_x] = vram_src[src_y * SCREEN_WIDTH + src_x];
+            }
+        }
+    }
+}
+
+// 解码运动补偿数据
+IWRAM_CODE void VideoDecoder::decode_motion_compensation_data(const u8** src, u16* dst, u16* vram_src)
+{
+    // 读取zone bitmap
+    u8 zone_bitmap = *(*src)++;
+    
+    // 遍历每个zone
+    for (int zone_idx = 0; zone_idx < MOTION_TOTAL_ZONES; zone_idx++) {
+        if (zone_bitmap & (1 << zone_idx)) {
+            // 读取该zone的运动补偿块数量
+            u8 motion_blocks_count = *(*src)++;
+            
+            // 解码每个运动补偿块
+            for (u8 i = 0; i < motion_blocks_count; i++) {
+                // 读取zone内相对索引
+                u8 zone_relative_idx = *(*src)++;
+                
+                // 读取编码的运动向量
+                u8 encoded_mv = *(*src)++;
+                
+                // 解码运动向量
+                int motion_dx, motion_dy;
+                decode_motion_vector(encoded_mv, &motion_dx, &motion_dy);
+                
+                // 计算8x8块的全局坐标
+                int zone_start_8x8_row = zone_idx * MOTION_BLOCKS_8X8_PER_ZONE_HEIGHT;
+                int relative_8x8_row = zone_relative_idx / MOTION_BLOCKS_8X8_PER_ZONE_ROW;
+                int relative_8x8_col = zone_relative_idx % MOTION_BLOCKS_8X8_PER_ZONE_ROW;
+                
+                int block_8x8_y = zone_start_8x8_row + relative_8x8_row;
+                int block_8x8_x = relative_8x8_col;
+                
+                // 应用运动补偿
+                apply_motion_compensation_8x8_block(dst, vram_src, block_8x8_y, block_8x8_x, 
+                                                  motion_dx, motion_dy);
+            }
+        }
+    }
+}
+
 IWRAM_CODE void VideoDecoder::load_codebook_and_convert(const u8* src)
 {
     // 预加载码本
@@ -327,6 +408,12 @@ IWRAM_CODE void VideoDecoder::decode_full_index_segment_rgb555(const u8** src, u
 // RGB555版本的P帧解码函数
 IWRAM_CODE void VideoDecoder::decode_p_frame_unified_rgb555(const u8* src, u16* dst)
 {
+    // 首先将VRAM中的前一帧复制到buffer
+    memcpy(dst, (u16*)VRAM, SCREEN_WIDTH * SCREEN_HEIGHT * sizeof(u16));
+    
+    // 然后解码运动补偿数据，从VRAM的其他位置复制到buffer的目标位置
+    decode_motion_compensation_data(&src, dst, (u16*)VRAM);
+    
     // 读取两个区域bitmap：纹理块和色块
     u16 detail_zone_bitmap = src[0] | (src[1] << 8);
     u16 color_zone_bitmap = src[2] | (src[3] << 8);

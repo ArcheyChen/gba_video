@@ -11,6 +11,15 @@
 #define MINI_CODEBOOK_SIZE 16  // 每个分段码本的大小
 #define MEDIUM_CODEBOOK_SIZE 64  // 每个中等码本的大小
 
+// 运动补偿相关常量
+#define MOTION_BLOCK_8X8_SIZE 8  // 运动补偿的8x8块大小
+#define MOTION_BLOCKS_8X8_WIDTH (SCREEN_WIDTH / MOTION_BLOCK_8X8_SIZE)  // 30
+#define MOTION_BLOCKS_8X8_HEIGHT (SCREEN_HEIGHT / MOTION_BLOCK_8X8_SIZE)  // 20
+#define MOTION_BLOCKS_8X8_PER_ZONE_ROW MOTION_BLOCKS_8X8_WIDTH  // 30
+#define MOTION_BLOCKS_8X8_PER_ZONE_HEIGHT 8  // 每个zone包含8行8x8块
+#define MOTION_TOTAL_ZONES ((MOTION_BLOCKS_8X8_HEIGHT + MOTION_BLOCKS_8X8_PER_ZONE_HEIGHT - 1) / MOTION_BLOCKS_8X8_PER_ZONE_HEIGHT)  // 3
+#define MOTION_RANGE 7  // 运动向量范围：±7像素
+
 // YUV数据结构
 struct YUV_Struct{
     u8 y[2][2];
@@ -62,6 +71,13 @@ private:
     
     static void decode_segment_rgb555(u8 CODE_BOOK_SIZE,u8 INDEX_BIT_LEN,u8 INDEX_BIT_MASK ,u16 seg_idx, const u8** src, u16* zone_dst, 
                                             const RGB555_Struct* unified_codebook);
+    
+    // 运动补偿相关函数
+    static void decode_motion_compensation_data(const u8** src, u16* dst, u16* vram_src);
+    static void apply_motion_compensation_8x8_block(u16* dst, u16* vram_src, 
+                                                  int block_8x8_y, int block_8x8_x, 
+                                                  int motion_dx, int motion_dy);
+    static void decode_motion_vector(u8 encoded, int* dx, int* dy);
     // 帧解码函数
     static void decode_i_frame_unified(const u8* src, u16* dst);
     static void decode_p_frame_unified(const u8* src, u16* dst);

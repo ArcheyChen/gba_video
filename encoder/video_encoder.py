@@ -6,6 +6,7 @@ import pathlib
 from video_encoder_core import VideoEncoderCore
 from video_encoder_utils import extract_frames_from_video
 from core_encoder import DEFAULT_UNIFIED_CODEBOOK_SIZE, DEFAULT_ENABLED_SEGMENTS_BITMAP, DEFAULT_ENABLED_MEDIUM_SEGMENTS_BITMAP
+from motion_compensation import DEFAULT_UPDATE_THRESHOLD
 
 def main():
     pa = argparse.ArgumentParser(description="Encode to GBA YUV9 with unified codebook")
@@ -35,6 +36,12 @@ def main():
                    help=f"启用段的bitmap，每位表示对应段是否启用小码表模式（默认0x{DEFAULT_ENABLED_SEGMENTS_BITMAP:04X}）")
     pa.add_argument("--enabled-medium-segments-bitmap", type=int, default=DEFAULT_ENABLED_MEDIUM_SEGMENTS_BITMAP,
                    help=f"启用中码表段的bitmap，每位表示对应段是否启用中码表模式（默认0x{DEFAULT_ENABLED_MEDIUM_SEGMENTS_BITMAP:02X}）")
+    pa.add_argument("--motion-compensation", action="store_true", default=True,
+                   help="启用运动补偿（默认启用）")
+    pa.add_argument("--no-motion-compensation", action="store_true",
+                   help="禁用运动补偿")
+    pa.add_argument("--motion-update-threshold", type=int, default=DEFAULT_UPDATE_THRESHOLD,
+                   help="运动补偿更新阈值：8×8块内允许的最大更新2×2块数（默认8，即50%）")
     pa.add_argument("--audio-sample-rate", type=int, default=16384,
                    help="音频采样率（默认16000 Hz）")
     pa.add_argument("--no-audio", action="store_true",
@@ -83,6 +90,9 @@ def main():
         if audio_data is None:
             print("⚠️ 音频提取失败，继续处理视频...")
 
+    # 处理运动补偿选项
+    motion_compensation_enabled = args.motion_compensation and not args.no_motion_compensation
+    
     # 创建编码器核心
     encoder = VideoEncoderCore()
     
@@ -101,7 +111,9 @@ def main():
         max_workers=args.max_workers,
         enabled_segments_bitmap=args.enabled_segments_bitmap,
         enabled_medium_segments_bitmap=args.enabled_medium_segments_bitmap,
-        fps=used_fps
+        fps=used_fps,
+        motion_compensation_enabled=motion_compensation_enabled,
+        motion_update_threshold=args.motion_update_threshold
     )
     
     # 解包编码结果

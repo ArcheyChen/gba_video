@@ -8,6 +8,10 @@ from numba.typed import List
 from collections import defaultdict
 
 from dither_opt import apply_dither_optimized
+from motion_compensation import (
+    detect_motion_compensation_candidates, apply_motion_compensation_to_blocks,
+    encode_motion_compensation_data, DEFAULT_UPDATE_THRESHOLD
+)
 
 # 常量定义
 WIDTH, HEIGHT = 240, 160
@@ -543,8 +547,10 @@ def encode_p_frame_unified(current_blocks: np.ndarray, prev_blocks: np.ndarray,
                           diff_threshold: float, force_i_threshold: float = 0.7,
                           enabled_segments_bitmap: int = DEFAULT_ENABLED_SEGMENTS_BITMAP,
                           enabled_medium_segments_bitmap: int = DEFAULT_ENABLED_MEDIUM_SEGMENTS_BITMAP,
-                          color_fallback_threshold: float = 50.0) -> tuple:
-    """差分编码P帧（统一码本，三级分段编码）- 新的bitmap+bitstream格式"""
+                          color_fallback_threshold: float = 50.0,
+                          motion_compensation_enabled: bool = True,
+                          motion_update_threshold: int = DEFAULT_UPDATE_THRESHOLD) -> tuple:
+    """差分编码P帧（统一码本，三级分段编码，支持运动补偿）- 新的bitmap+bitstream格式"""
     # 将bitmap参数转换为np.uint16类型
     enabled_segments_bitmap = np.uint16(enabled_segments_bitmap)
     enabled_medium_segments_bitmap = np.uint8(enabled_medium_segments_bitmap)
@@ -559,10 +565,27 @@ def encode_p_frame_unified(current_blocks: np.ndarray, prev_blocks: np.ndarray,
     if total_blocks == 0:
         return b'', True, 0, 0, 0, 0, 0, 0, 0, 0, 0, set(), set(), [], [], []
     
-    # 使用Numba加速的2x2块差异计算
+    # 第一阶段：运动补偿检测和应用
+    motion_candidates = {}
+    motion_compensated_blocks = prev_blocks
+    
+    if motion_compensation_enabled:
+        # 检测运动补偿候选
+        motion_candidates = detect_motion_compensation_candidates(
+            current_blocks, prev_blocks, diff_threshold, motion_update_threshold
+        )
+        
+        # 应用运动补偿生成新的参考帧
+        if motion_candidates:
+            motion_compensated_blocks = apply_motion_compensation_to_blocks(
+                current_blocks, prev_blocks, motion_candidates
+            )
+    
+    # 第二阶段：使用运动补偿后的参考帧进行差分编码
+    # 使用Numba加速的2x2块差异计算（基于运动补偿后的参考帧）
     current_flat = current_blocks.reshape(-1, BYTES_PER_BLOCK)
-    prev_flat = prev_blocks.reshape(-1, BYTES_PER_BLOCK)
-    block_diffs = compute_2x2_block_differences_numba(current_flat, prev_flat, blocks_h, blocks_w)
+    compensated_flat = motion_compensated_blocks.reshape(-1, BYTES_PER_BLOCK)
+    block_diffs = compute_2x2_block_differences_numba(current_flat, compensated_flat, blocks_h, blocks_w)
     
     big_blocks_h = blocks_h // 2
     big_blocks_w = blocks_w // 2
@@ -751,6 +774,10 @@ def encode_p_frame_unified(current_blocks: np.ndarray, prev_blocks: np.ndarray,
     # 编码P帧
     data = bytearray()
     data.append(FRAME_TYPE_P)
+    
+    # 写入运动补偿数据（在P帧数据开头）
+    motion_data = encode_motion_compensation_data(motion_candidates)
+    data.extend(motion_data)
     
     # 统计使用的区域数量
     used_zones = 0

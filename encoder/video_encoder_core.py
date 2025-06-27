@@ -13,6 +13,7 @@ from core_encoder import *
 from gop_processor import generate_gop_unified_codebooks
 from video_encoder_stats import EncodingStats
 from video_encoder_utils import write_header, write_source
+from motion_compensation import motion_stats
 
 # 全局函数，用于多进程
 def sort_single_gop_worker(args):
@@ -94,10 +95,15 @@ class SimpleStats:
         self.small_blocks_distribution = {1: 0, 2: 0, 3: 0, 4: 0}
         self.medium_blocks_distribution = {1: 0, 2: 0, 3: 0, 4: 0}
         self.full_blocks_distribution = {1: 0, 2: 0, 3: 0, 4: 0}
+        # 运动补偿统计信息
+        self.motion_stats_dict = None
 
 def encode_frame_chunk_worker(args):
     """帧编码chunk的worker函数"""
-    start_idx, end_idx, frames_chunk, gop_codebooks_chunk, i_frame_interval, diff_threshold, force_i_threshold, enabled_segments_bitmap, enabled_medium_segments_bitmap, codebook_size, color_fallback_threshold = args
+    start_idx, end_idx, frames_chunk, gop_codebooks_chunk, i_frame_interval, diff_threshold, force_i_threshold, enabled_segments_bitmap, enabled_medium_segments_bitmap, codebook_size, color_fallback_threshold, motion_compensation_enabled, motion_update_threshold = args
+    
+    # 重置当前进程的运动补偿统计
+    motion_stats.reset()
     
     encoded_frames = []
     frame_offsets = []
@@ -170,7 +176,8 @@ def encode_frame_chunk_worker(args):
                 accumulated_frame, prev_frame,
                 unified_codebook, block_types,
                 diff_threshold, force_i_threshold, enabled_segments_bitmap,
-                enabled_medium_segments_bitmap, color_fallback_threshold
+                enabled_medium_segments_bitmap, color_fallback_threshold,
+                motion_compensation_enabled, motion_update_threshold
             )
             
             if is_i_frame:
@@ -232,6 +239,9 @@ def encode_frame_chunk_worker(args):
         if frame_idx % 30 == 0 or frame_idx == end_idx - 1:
             print(f"  已编码 {frame_idx + 1}/{end_idx} 帧")
     
+    # 收集运动补偿统计信息
+    local_stats.motion_stats_dict = motion_stats.get_stats_dict()
+    
     # 返回编码结果和统计信息
     return encoded_frames, frame_offsets, start_idx, local_stats
 
@@ -245,7 +255,7 @@ class VideoEncoderCore:
                     force_i_threshold=0.7, variance_threshold=5.0, color_fallback_threshold=50.0, codebook_size=256,
                     kmeans_max_iter=200, i_frame_weight=3, max_workers=None,
                     enabled_segments_bitmap=0xFFFF, enabled_medium_segments_bitmap=0x0F,
-                    fps=30.0):
+                    fps=30.0, motion_compensation_enabled=True, motion_update_threshold=8):
         """编码视频的主要流程"""
         
         print(f"码本配置: 统一码本{codebook_size}项")
@@ -275,7 +285,8 @@ class VideoEncoderCore:
         print("正在编码帧...")
         encoded_frames, frame_offsets = self._parallel_encode_frames(
             frames, sorted_gop_codebooks, i_frame_interval, diff_threshold, force_i_threshold,
-            enabled_segments_bitmap, enabled_medium_segments_bitmap, codebook_size, color_fallback_threshold, max_workers
+            enabled_segments_bitmap, enabled_medium_segments_bitmap, codebook_size, color_fallback_threshold, 
+            motion_compensation_enabled, motion_update_threshold, max_workers
         )
         
         end_time = time.time()
@@ -322,7 +333,9 @@ class VideoEncoderCore:
         return sorted_gop_codebooks
     
     def _parallel_encode_frames(self, frames, gop_codebooks, i_frame_interval, diff_threshold, 
-                               force_i_threshold, enabled_segments_bitmap, enabled_medium_segments_bitmap, codebook_size, color_fallback_threshold, max_workers):
+                               force_i_threshold, enabled_segments_bitmap, enabled_medium_segments_bitmap, 
+                               codebook_size, color_fallback_threshold, motion_compensation_enabled, 
+                               motion_update_threshold, max_workers):
         """并行帧编码"""
         # 优化分块策略：按GOP分组，减少通信开销
         num_frames = len(frames)
@@ -348,7 +361,8 @@ class VideoEncoderCore:
                 
                 chunk_data = (start_frame, end_frame, frames_chunk, gop_codebooks_chunk, i_frame_interval, 
                             diff_threshold, force_i_threshold, enabled_segments_bitmap, 
-                            enabled_medium_segments_bitmap, codebook_size, color_fallback_threshold)
+                            enabled_medium_segments_bitmap, codebook_size, color_fallback_threshold,
+                            motion_compensation_enabled, motion_update_threshold)
                 chunk_data_list.append(chunk_data)
         else:
             # 如果GOP数量很多，按帧数分组，但确保每个分块包含完整的GOP
@@ -373,7 +387,8 @@ class VideoEncoderCore:
                 
                 chunk_data = (i, end_frame, frames_chunk, gop_codebooks_chunk, i_frame_interval, 
                             diff_threshold, force_i_threshold, enabled_segments_bitmap, 
-                            enabled_medium_segments_bitmap, codebook_size, color_fallback_threshold)
+                            enabled_medium_segments_bitmap, codebook_size, color_fallback_threshold,
+                            motion_compensation_enabled, motion_update_threshold)
                 chunk_data_list.append(chunk_data)
         
         print(f"  并行编码：{len(chunk_data_list)}个分块，每个分块约{len(frames) // len(chunk_data_list)}帧")
@@ -436,5 +451,9 @@ class VideoEncoderCore:
                     self.encoding_stats.small_blocks_distribution[block_count] += local_stats.small_blocks_distribution.get(block_count, 0)
                     self.encoding_stats.medium_blocks_distribution[block_count] += local_stats.medium_blocks_distribution.get(block_count, 0)
                     self.encoding_stats.full_blocks_distribution[block_count] += local_stats.full_blocks_distribution.get(block_count, 0)
+                
+                # 合并运动补偿统计
+                if local_stats.motion_stats_dict is not None:
+                    self.encoding_stats.merge_motion_compensation_stats(local_stats.motion_stats_dict)
         
         return all_encoded_frames, all_frame_offsets 
