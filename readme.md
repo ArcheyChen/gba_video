@@ -14,9 +14,15 @@
 
 基本性能：可实现30FPS流畅播放，一分钟的纯视频在2.3MB-5.5MB不等，添加上音频后，由于采用的是PCM编码，因此体积增加直接等同于你的采样率。如16Khz的采样率，一秒的体积会增加16KB。
 
-采用的基本技术：YUV420采样，VQ量化，I/P帧编码，频率编码，平坦区域上采样。
+采用的基本技术：YUV420采样，VQ量化，I/P帧编码，频率编码，平坦区域上采样
 - 采用分频器算法以实现真正的24FPS播放，解决了屏幕60HZ刷新率与视频帧数不匹配的问题。
 
+25-06-28更新：
+- 支持运动补偿技术，从上一帧平移数据而不是重绘整个变动的块
+- 更好的音频同步，当音频与视频迟滞超过1帧，那么就会重新同步音频
+- 更好的视频编码，全部误差使用MSE而不是SAD误差，内部处理全部采用YUV444采样，输出时才降为YUV420采样.这一来也修复了边缘的奇怪颜色问题
+- 优化了解码性能
+- 将编码器移动到了`encoder`目录下
 
 -----
 
@@ -63,11 +69,11 @@ TODO（希望有人能帮我改善的地方）：
 
 - 音频：目前有低噪，我对音频基本一无所知，这方面有待优化。
 - 目前编码器里面，没有加上对I帧索引的记录，造成需要在解码器里面手动搜索I帧位置，对性能有影响。
-- 基本的播放控制功能，如暂停，前进，后退等。
+- 基本的播放控制功能，如暂停，前进，后退等。\[已完成\]
 - 解码器运行时抖动算法：由于GBA颜色太少，因此颜色显示有断层，需要增加抖动算法来缓解。但是，目前的预解码方式好像不好增加bayer抖动算法的样子，希望有人能优化。
-- 奇怪的颜色问题：在白色边缘处，容易出现青色或者其他颜色的奇怪颜色，需要修正。
+- 奇怪的颜色问题：在白色边缘处，容易出现青色或者其他颜色的奇怪颜色，需要修正。\[已修复\]
 - 压缩率：现在的压缩率还有待提升，一个32MB的卡带，只能塞下一个7分钟左右的视频。
-- 基本的播放控制功能，如暂停，前进，后退等。
+- 基本的播放控制功能，如暂停，前进，后退等。\[已完成\]
 
 ---
 
@@ -141,6 +147,18 @@ Decoder details:
 - Audio: Currently there is some noise; I have little knowledge of audio, so this needs optimization.
 - The encoder does not record I-frame indices, so the decoder must search for I-frames manually, affecting performance.
 - Decoder runtime dithering: due to GBA's limited colors, color banding occurs. Dithering should be added, but the current pre-decoding method makes Bayer dithering hard to implement.
-- Strange color issues: cyan or other odd colors may appear at white edges; needs fixing.
+- Strange color issues: cyan or other odd colors may appear at white edges; needs fixing.\[done\]
 - Compression ratio: still needs improvement. A 32MB cartridge can only hold about 7 minutes of video.
-- Basic playback control functions, such as pause, forward, rewind, etc.
+- Basic playback control functions, such as pause, forward, rewind, etc.\[done\]
+
+Update on 2025-06-28:
+
+- Added support for motion compensation: instead of redrawing entire changed blocks, data is shifted from the previous frame.
+
+- Improved audio synchronization: when audio lags behind or leads video by more than one frame, it will be resynchronized.
+
+- Enhanced video encoding: all error metrics now use MSE instead of SAD; internal processing is done in YUV444 and only downsampled to YUV420 at output. This also fixes the strange color artifacts at the edges.
+
+- Optimized decoding performance.
+
+- Moved the encoder to the encoder directory.
