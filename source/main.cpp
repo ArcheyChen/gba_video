@@ -21,6 +21,7 @@ static bool force_sound_sync = true;
 static bool free_play_mode = false;
 
 static int frame = 0;
+static u16 delayed_frame = 0; // 用于延迟帧处理
 #define LCD_FPS 597275
 //这个是乘了10000后的FPS，这样更精确
 IWRAM_CODE void isr_vbl() { 
@@ -28,6 +29,7 @@ IWRAM_CODE void isr_vbl() {
     acc += VIDEO_FPS;  // 使用头文件中定义的FPS
 
     if(acc >= LCD_FPS) {
+        delayed_frame += should_copy & 1;//如果之前的拷贝操作没有完成，延迟帧计数器加1
         should_copy = true;
         acc -= LCD_FPS;
     }
@@ -75,11 +77,12 @@ IWRAM_CODE void doit(){
         // 拷贝到VRAM
         DMA3COPY(VideoRenderer::ewramBuffer, VRAM, (SCREEN_WIDTH * SCREEN_HEIGHT >> 1) | DMA32);
         #ifdef I_FRAME_AUDIO_OFFSET_COUNT
-        if ((frame & 0x3F) == 0 || force_sound_sync) {//每隔64帧检查一次
+        if (delayed_frame || force_sound_sync) {
             // 从I帧对应的音频偏移处重新开始播放
             const u8* audio_offset = (const u8*)audio_data + frame_audio_offsets[frame];
             sound_play(audio_offset);
             force_sound_sync = false;
+            delayed_frame = 0;
         }
         #endif
         // 音画同步：如果是I帧，重新同步音频播放

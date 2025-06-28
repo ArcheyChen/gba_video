@@ -59,6 +59,7 @@ private:
     static void convert_yuv_to_rgb555_codebook(const YUV_Struct* yuv_codebook, RGB555_Struct* rgb555_codebook, int codebook_size);
     
     static void decode_normal_4x4_block(u8 &valid_bitmap, BitReader &reader, u16* big_block_dst, const RGB555_Struct * codebook);
+    static void decode_normal_4x4_block_full_codebook(u8 &valid_bitmap, BitReader &reader, u16* big_block_dst, const RGB555_Struct * codebook);
 
     
     static void decode_small_codebook_segment(u16 seg_idx, const u8** src, u16* zone_dst, const YUV_Struct* unified_codebook);

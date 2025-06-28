@@ -82,12 +82,11 @@ void VideoDecoder::init() {
 // RGB555码本解码函数 - 直接使用预计算的RGB555值
 IWRAM_CODE void VideoDecoder::decode_block_rgb555(const RGB555_Struct &rgb555_data, u16* dst)
 {
-    u16* dst_row = dst;
     // 直接拷贝预计算的RGB555值
-    dst_row[0] = rgb555_data.rgb[0][0];
-    dst_row[1] = rgb555_data.rgb[0][1];
-    dst_row[SCREEN_WIDTH] = rgb555_data.rgb[1][0];
-    dst_row[SCREEN_WIDTH + 1] = rgb555_data.rgb[1][1];
+    dst[0] = rgb555_data.rgb[0][0];
+    dst[1] = rgb555_data.rgb[0][1];
+    dst[SCREEN_WIDTH] = rgb555_data.rgb[1][0];
+    dst[SCREEN_WIDTH + 1] = rgb555_data.rgb[1][1];
 }
 
 // RGB555码本解码色块（2x2上采样到4x4）
@@ -243,6 +242,22 @@ IWRAM_CODE void VideoDecoder::convert_yuv_to_rgb555_codebook(const YUV_Struct* y
 }
 
 IWRAM_CODE void VideoDecoder::decode_normal_4x4_block(u8 &valid_bitmap, BitReader &reader, u16* big_block_dst, const RGB555_Struct * codebook){
+        for (u8 sub_idx = 0; sub_idx < 4; sub_idx++) {
+            if (valid_bitmap & 1) {
+                u8 codebook_idx = reader.read();
+                u16* subblock_dst = big_block_dst;
+                switch (sub_idx) {
+                    case 0: /* 左上 */ break;
+                    case 1: subblock_dst += 2; break; /* 右上 */
+                    case 2: subblock_dst += SCREEN_WIDTH * 2; break; /* 左下 */
+                    case 3: subblock_dst += SCREEN_WIDTH * 2 + 2; break; /* 右下 */
+                }
+                decode_block_rgb555(codebook[codebook_idx], subblock_dst);
+            }
+            valid_bitmap >>= 1;
+        }
+    }
+IWRAM_CODE void VideoDecoder::decode_normal_4x4_block_full_codebook(u8 &valid_bitmap, BitReader &reader, u16* big_block_dst, const RGB555_Struct * codebook){
         for (u8 sub_idx = 0; sub_idx < 4; sub_idx++) {
             if (valid_bitmap & 1) {
                 u8 codebook_idx = reader.read();
