@@ -83,43 +83,44 @@ void VideoDecoder::init() {
 IWRAM_CODE void VideoDecoder::decode_block_rgb555(const RGB555_Struct &rgb555_data, u16* dst)
 {
     // 直接拷贝预计算的RGB555值
-    dst[0] = rgb555_data.rgb[0][0];
-    dst[1] = rgb555_data.rgb[0][1];
-    dst[SCREEN_WIDTH] = rgb555_data.rgb[1][0];
-    dst[SCREEN_WIDTH + 1] = rgb555_data.rgb[1][1];
+    *(u32*)(&dst[0]) = *(u32*)(&rgb555_data.rgb[0][0]);
+    *(u32*)(&dst[SCREEN_WIDTH]) = *(u32*)(&rgb555_data.rgb[1][0]);
 }
 
 // RGB555码本解码色块（2x2上采样到4x4）
 IWRAM_CODE void VideoDecoder::decode_color_block_rgb555(const RGB555_Struct &rgb555_data, u16* __restrict__ dst)
 {
     u16* dst_row = dst;
-    
+    u16 rgb_raw[8];
+    rgb_raw[0] = rgb555_data.rgb[0][0];  // 颜色1
+    rgb_raw[1] = rgb555_data.rgb[0][0];  
+    rgb_raw[2] = rgb555_data.rgb[0][1];  // 颜色2
+    rgb_raw[3] = rgb555_data.rgb[0][1];
+    rgb_raw[4] = rgb555_data.rgb[1][0];  // 颜色3
+    rgb_raw[5] = rgb555_data.rgb[1][0];
+    rgb_raw[6] = rgb555_data.rgb[1][1];  // 颜色4
+    rgb_raw[7] = rgb555_data.rgb[1][1];
+
     // 第一行：1122
-    dst_row[0] = rgb555_data.rgb[0][0];
-    dst_row[1] = rgb555_data.rgb[0][0];
-    dst_row[2] = rgb555_data.rgb[0][1];
-    dst_row[3] = rgb555_data.rgb[0][1];
-    
+    *(u32*)dst_row = *(u32*)&rgb_raw[0];
+    *(u32*)(dst_row + 2) = *(u32*)&rgb_raw[2];
     // 第二行：1122
     dst_row += SCREEN_WIDTH;
-    dst_row[0] = rgb555_data.rgb[0][0];
-    dst_row[1] = rgb555_data.rgb[0][0];
-    dst_row[2] = rgb555_data.rgb[0][1];
-    dst_row[3] = rgb555_data.rgb[0][1];
+    *(u32*)dst_row = *(u32*)&rgb_raw[0];
+    *(u32*)(dst_row + 2) = *(u32*)&rgb_raw[2];
     
     // 第三行：3344
     dst_row += SCREEN_WIDTH;
-    dst_row[0] = rgb555_data.rgb[1][0];
-    dst_row[1] = rgb555_data.rgb[1][0];
-    dst_row[2] = rgb555_data.rgb[1][1];
-    dst_row[3] = rgb555_data.rgb[1][1];
+    // dst_row[3] = rgb555_data.rgb[1][1];
+    *(dst_row) = *(u32*)&rgb_raw[4];
+    *(dst_row + 1) = *(u32*)&rgb_raw[4];
+    *(dst_row + 2) = *(u32*)&rgb_raw[6];
+    *(dst_row + 3) = *(u32*)&rgb_raw[6];
     
     // 第四行：3344
     dst_row += SCREEN_WIDTH;
-    dst_row[0] = rgb555_data.rgb[1][0];
-    dst_row[1] = rgb555_data.rgb[1][0];
-    dst_row[2] = rgb555_data.rgb[1][1];
-    dst_row[3] = rgb555_data.rgb[1][1];
+    *(u32*)dst_row = *(u32*)&rgb_raw[4];
+    *(u32*)(dst_row + 2) = *(u32*)&rgb_raw[6];
 }
 IWRAM_CODE void VideoDecoder::decode_segment_rgb555(u8 CODE_BOOK_SIZE,u8 INDEX_BIT_LEN,u8 INDEX_BIT_MASK ,u16 seg_idx, const u8** src, u16* zone_dst, 
                                             const RGB555_Struct* unified_codebook)
