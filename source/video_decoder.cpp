@@ -91,7 +91,7 @@ IWRAM_CODE void VideoDecoder::decode_block_rgb555(const RGB555_Struct &rgb555_da
 }
 
 // RGB555码本解码色块（2x2上采样到4x4）
-IWRAM_CODE void VideoDecoder::decode_color_block_rgb555(const RGB555_Struct &rgb555_data, u16* dst)
+IWRAM_CODE void VideoDecoder::decode_color_block_rgb555(const RGB555_Struct &rgb555_data, u16* __restrict__ dst)
 {
     u16* dst_row = dst;
     
@@ -144,22 +144,24 @@ IWRAM_CODE void VideoDecoder::decode_segment_rgb555(u8 CODE_BOOK_SIZE,u8 INDEX_B
     
     // 解码每2个块为一组
     const u8* bitmap_ptr = bitmap_and_indices_ptr;
-    for (u8 i = 0; i < (num_blocks >> 1); i++) {
+    bool is_odd = num_blocks & 1;
+    num_blocks >>= 1;  // 每次处理2个块
+    while(num_blocks--) {
         u8 valid_bitmap = *bitmap_ptr++;
-        u8 zone_relative_idx1 = *bitmap_ptr++;
-        u8 zone_relative_idx2 = *bitmap_ptr++;
         
         // 解码第一个4x4块
-        u16* big_block_dst = zone_dst + zone_block_relative_offsets[zone_relative_idx1];
+        u8 zone_relative_idx = *bitmap_ptr++;
+        u16* big_block_dst = zone_dst + zone_block_relative_offsets[zone_relative_idx];
         decode_normal_4x4_block(valid_bitmap, reader, big_block_dst, codebook);
         
         // 解码第二个4x4块
-        big_block_dst = zone_dst + zone_block_relative_offsets[zone_relative_idx2];
+        zone_relative_idx = *bitmap_ptr++;
+        big_block_dst = zone_dst + zone_block_relative_offsets[zone_relative_idx];
         decode_normal_4x4_block(valid_bitmap, reader, big_block_dst, codebook);
     }
     
     // 处理最后一个奇数块（如果存在）
-    if (num_blocks & 1) {
+    if (is_odd) {
         u8 valid_bitmap = *bitmap_ptr++;
         u8 zone_relative_idx1 = *bitmap_ptr++;
         
@@ -388,7 +390,7 @@ IWRAM_CODE void VideoDecoder::decode_i_frame_unified(const u8* src, u16* dst)
     current_rgb555_codebook_index ^= 1; // 切换到另一个RGB555码本缓冲区
     rgb555_codebook = rgb555_codebook_buf[current_rgb555_codebook_index];
     
-    u16 tot_big_blocks = (VIDEO_WIDTH / (BLOCK_WIDTH * 2)) * (VIDEO_HEIGHT / (BLOCK_HEIGHT * 2));
+    constexpr u16 tot_big_blocks = (VIDEO_WIDTH / (BLOCK_WIDTH * 2)) * (VIDEO_HEIGHT / (BLOCK_HEIGHT * 2));
     
     // 解码所有4x4大块
     for (int big_block_idx = 0; big_block_idx < tot_big_blocks; big_block_idx++) {
@@ -518,10 +520,4 @@ IWRAM_CODE void VideoDecoder::decode_frame(const u8* frame_data, u16* dst)
     } else if (frame_type == FRAME_TYPE_P) {
         decode_p_frame_unified_rgb555(frame_data, dst);
     }
-}
-
-IWRAM_CODE bool VideoDecoder::is_i_frame(const u8* frame_data)
-{
-    u8 frame_type = *frame_data;
-    return frame_type == FRAME_TYPE_I;
 }

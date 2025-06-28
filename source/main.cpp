@@ -37,8 +37,14 @@ IWRAM_CODE void isr_vbl() {
 
 IWRAM_CODE void doit(){
     
-    *(vu32*)(0x4000800) = 0x0E000020;//EWRAM Overclock
-    // 初始化音频播放
+    // *(vu32*)(0x4000800) = 0x0E000020;//EWRAM Overclock
+    // u32 wait_state = 0x00000000;
+    // wait_state |= (2)<<2;
+    // wait_state |= 1<<4;
+
+    // *(vu32*)(0x4000204) = wait_state;//wait_state Overclock
+    
+    // 初始化音频播放   
     sound_init();
     VideoDecoder::reset_codebook();
     force_sound_sync = true;

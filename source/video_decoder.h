@@ -95,7 +95,7 @@ public:
     // 查找表（移到public以便外部函数访问）
     static u8 clip_lookup_table_raw[2048];
     static u8 *clip_lookup_table;
-    static void find_next_i_frame(const u8* video_data,int start_frame){
+    static IWRAM_CODE void find_next_i_frame(const u8* video_data,int start_frame){
         constexpr int max_find_count = 30; // 一次最多查找30帧
         if(last_check_frame == -1){
             last_check_frame = start_frame;
@@ -119,7 +119,10 @@ public:
     static void load_codebook_and_convert(const u8* src);
     
     // 检查是否为I帧
-    static bool is_i_frame(const u8* frame_data);
+    IWRAM_CODE static bool inline is_i_frame(const u8* frame_data){
+        u8 frame_type = *frame_data;
+        return frame_type == FRAME_TYPE_I;
+    }
     
     // 获取码本状态
     static bool is_codebook_preloaded() { return code_book_preloaded; }
