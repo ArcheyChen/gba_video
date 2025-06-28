@@ -100,16 +100,15 @@ IWRAM_CODE void VideoDecoder::decode_color_block_rgb555(const RGB555_Struct &rgb
     
     // 预计算颜色对
     u16 color1 = rgb555_data.rgb[0][0];
-    u16 color2 = rgb555_data.rgb[0][1];
-    u16 color3 = rgb555_data.rgb[1][0];
-    u16 color4 = rgb555_data.rgb[1][1];
-    
     color_pair[0].u16_vals[0] = color1;  // 颜色1
     color_pair[0].u16_vals[1] = color1;
+    u16 color2 = rgb555_data.rgb[0][1];
     color_pair[1].u16_vals[0] = color2;  // 颜色2
     color_pair[1].u16_vals[1] = color2;
+    u16 color3 = rgb555_data.rgb[1][0];
     color_pair[2].u16_vals[0] = color3;  // 颜色3   
     color_pair[2].u16_vals[1] = color3;
+    u16 color4 = rgb555_data.rgb[1][1];
     color_pair[3].u16_vals[0] = color4;  // 颜色4
     color_pair[3].u16_vals[1] = color4;
 

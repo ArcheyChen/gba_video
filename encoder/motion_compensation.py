@@ -25,7 +25,7 @@ TOTAL_ZONES = (BLOCKS_8X8_HEIGHT + BLOCKS_8X8_PER_ZONE_HEIGHT - 1) // BLOCKS_8X8
 MOTION_RANGE = 7
 
 # 损失函数参数
-DEFAULT_UPDATE_THRESHOLD = 12  # 8×8块内需要更新的2×2块数量阈值（总共16个2×2块的75%）
+DEFAULT_UPDATE_THRESHOLD = 6  
 DEFAULT_MIN_IMPROVEMENT_THRESHOLD = 2  # 运动补偿相比不运动至少要减少的块数
 
 @njit
@@ -63,14 +63,14 @@ def get_8x8_block_zone_info(block_8x8_idx: int) -> Tuple[int, int]:
     return zone_idx, zone_relative_idx
 
 @njit
-def calculate_sad_8x8_blocks(current_blocks: np.ndarray, prev_blocks: np.ndarray, 
+def calculate_mse_8x8_blocks(current_blocks: np.ndarray, prev_blocks: np.ndarray, 
                             cur_start_y: int, cur_start_x: int,
                             ref_start_y: int, ref_start_x: int) -> float:
     """
-    计算两个8×8块区域的SAD（Sum of Absolute Differences）
+    计算两个8×8块区域的MSE（Mean Squared Error）
     使用YUV444格式的Y分量进行比较
     """
-    sad = 0.0
+    mse = 0.0
     blocks_h, blocks_w = current_blocks.shape[:2]
     
     # 8×8像素 = 4×4个2×2块
@@ -85,16 +85,17 @@ def calculate_sad_8x8_blocks(current_blocks: np.ndarray, prev_blocks: np.ndarray
             if (cur_y >= blocks_h or cur_x >= blocks_w or 
                 ref_y >= blocks_h or ref_x >= blocks_w or
                 ref_y < 0 or ref_x < 0):
-                sad += 1000.0  # 边界外的大惩罚
+                mse += 10000.0  # 边界外的大惩罚（相当于100的平方差）
                 continue
             
             # 计算2×2块的Y分量差异
             for i in range(4):  # Y分量的4个像素
                 cur_val = float(current_blocks[cur_y, cur_x, i])
                 ref_val = float(prev_blocks[ref_y, ref_x, i])
-                sad += abs(cur_val - ref_val)
+                diff = cur_val - ref_val
+                mse += diff * diff  # 使用平方差
     
-    return sad
+    return mse / 16.0  # 除以总像素数得到平均值
 
 @njit
 def count_updated_2x2_blocks_after_motion(current_blocks: np.ndarray, prev_blocks: np.ndarray,
@@ -102,6 +103,7 @@ def count_updated_2x2_blocks_after_motion(current_blocks: np.ndarray, prev_block
                                         dx: int, dy: int, diff_threshold: float) -> int:
     """
     计算运动补偿后还需要更新的2×2块数量
+    使用统一的块差异计算方法
     """
     updated_count = 0
     blocks_h, blocks_w = current_blocks.shape[:2]
@@ -125,15 +127,12 @@ def count_updated_2x2_blocks_after_motion(current_blocks: np.ndarray, prev_block
                 updated_count += 1
                 continue
             
-            # 计算2×2块的Y分量差异
-            y_diff_sum = 0.0
-            for i in range(4):  # Y分量的4个像素
-                cur_val = float(current_blocks[cur_y, cur_x, i])
-                ref_val = float(prev_blocks[ref_y, ref_x, i])
-                y_diff_sum += abs(cur_val - ref_val)
+            # 使用统一的块差异计算
+            diff = calculate_2x2_block_difference_unified(
+                current_blocks[cur_y, cur_x], prev_blocks[ref_y, ref_x]
+            )
             
-            avg_diff = y_diff_sum / 4.0
-            if avg_diff > diff_threshold:
+            if diff > diff_threshold:
                 updated_count += 1
     
     return updated_count
@@ -145,6 +144,7 @@ def count_updated_2x2_blocks_no_motion(current_blocks: np.ndarray, prev_blocks: 
     """
     计算不进行运动补偿时需要更新的2×2块数量
     直接比较当前帧和前一帧对应位置的8×8块
+    使用统一的块差异计算方法
     """
     updated_count = 0
     blocks_h, blocks_w = current_blocks.shape[:2]
@@ -160,15 +160,12 @@ def count_updated_2x2_blocks_no_motion(current_blocks: np.ndarray, prev_blocks: 
                 updated_count += 1
                 continue
             
-            # 计算2×2块的Y分量差异
-            y_diff_sum = 0.0
-            for i in range(4):  # Y分量的4个像素
-                cur_val = float(current_blocks[cur_y, cur_x, i])
-                ref_val = float(prev_blocks[cur_y, cur_x, i])
-                y_diff_sum += abs(cur_val - ref_val)
+            # 使用统一的块差异计算
+            diff = calculate_2x2_block_difference_unified(
+                current_blocks[cur_y, cur_x], prev_blocks[cur_y, cur_x]
+            )
             
-            avg_diff = y_diff_sum / 4.0
-            if avg_diff > diff_threshold:
+            if diff > diff_threshold:
                 updated_count += 1
     
     return updated_count
@@ -177,13 +174,13 @@ def count_updated_2x2_blocks_no_motion(current_blocks: np.ndarray, prev_blocks: 
 def diamond_search_iteration(current_blocks: np.ndarray, prev_blocks: np.ndarray,
                            cur_start_y: int, cur_start_x: int,
                            best_mv: Tuple[int, int], diamond_pattern: List[Tuple[int, int]],
-                           best_sad: float) -> Tuple[Tuple[int, int], float, bool]:
+                           best_mse: float) -> Tuple[Tuple[int, int], float, bool]:
     """
     执行一次钻石搜索迭代
-    返回: (新的最佳运动向量, 新的最佳SAD, 是否有更新)
+    返回: (新的最佳运动向量, 新的最佳MSE, 是否有更新)
     """
     current_best_mv = (0, 0)
-    current_best_sad = best_sad
+    current_best_mse = best_mse
     have_update = False
     
     for dx, dy in diamond_pattern:
@@ -194,23 +191,23 @@ def diamond_search_iteration(current_blocks: np.ndarray, prev_blocks: np.ndarray
             ref_start_y = cur_start_y + new_dy
             ref_start_x = cur_start_x + new_dx
             
-            sad = calculate_sad_8x8_blocks(current_blocks, prev_blocks,
+            mse = calculate_mse_8x8_blocks(current_blocks, prev_blocks,
                                         cur_start_y, cur_start_x,
                                         ref_start_y, ref_start_x)
             
-            if sad < current_best_sad:
-                current_best_sad = sad
+            if mse < current_best_mse:
+                current_best_mse = mse
                 current_best_mv = (new_dx, new_dy)
                 have_update = True
     
-    return current_best_mv, current_best_sad, have_update
+    return current_best_mv, current_best_mse, have_update
 
 def hierarchical_diamond_search(current_blocks: np.ndarray, prev_blocks: np.ndarray,
                                block_8x8_y: int, block_8x8_x: int, 
                                diff_threshold: float) -> Tuple[Tuple[int, int], float, int, int]:
     """
     分层钻石搜索算法
-    返回: (最佳运动向量(dx, dy), SAD值, 运动后更新块数量, 不运动时更新块数量)
+    返回: (最佳运动向量(dx, dy), MSE值, 运动后更新块数量, 不运动时更新块数量)
     """
     # 当前8×8块在2×2块坐标系中的起始位置
     cur_start_y = block_8x8_y * 4
@@ -222,24 +219,24 @@ def hierarchical_diamond_search(current_blocks: np.ndarray, prev_blocks: np.ndar
     )
     
     best_mv = (0, 0)
-    best_sad = float('inf')
+    best_mse = float('inf')
     
     # 第一层：大钻石搜索（步长4）
     large_diamond = [(0,0), (0, 4), (4, 0), (0, -4), (-4, 0), (2, 2), (2, -2), (-2, 2), (-2, -2)]
     
     # 初始搜索
-    best_mv, best_sad, _ = diamond_search_iteration(current_blocks, prev_blocks,
+    best_mv, best_mse, _ = diamond_search_iteration(current_blocks, prev_blocks,
                                                    cur_start_y, cur_start_x,
-                                                   best_mv, large_diamond, best_sad)
+                                                   best_mv, large_diamond, best_mse)
     
     # 继续大钻石搜索直到没有改进
     while True:
-        new_mv, new_sad, have_update = diamond_search_iteration(current_blocks, prev_blocks,
+        new_mv, new_mse, have_update = diamond_search_iteration(current_blocks, prev_blocks,
                                                                cur_start_y, cur_start_x,
-                                                               best_mv, large_diamond, best_sad)
+                                                               best_mv, large_diamond, best_mse)
         if not have_update:
             break
-        best_mv, best_sad = new_mv, new_sad
+        best_mv, best_mse = new_mv, new_mse
 
     # 第二层：中钻石搜索（步长2）
     small_diamond = [(0, 2), (2, 0), (0, -2), (-2, 0),  # 上下左右
@@ -247,12 +244,12 @@ def hierarchical_diamond_search(current_blocks: np.ndarray, prev_blocks: np.ndar
     
     # 继续小钻石搜索直到没有改进
     while True:
-        new_mv, new_sad, have_update = diamond_search_iteration(current_blocks, prev_blocks,
+        new_mv, new_mse, have_update = diamond_search_iteration(current_blocks, prev_blocks,
                                                                cur_start_y, cur_start_x,
-                                                               best_mv, small_diamond, best_sad)
+                                                               best_mv, small_diamond, best_mse)
         if not have_update:
             break
-        best_mv, best_sad = new_mv, new_sad
+        best_mv, best_mse = new_mv, new_mse
     
     # 第三层：小钻石搜索（步长1）
     small_diamond = [(0, 1), (1, 0), (0, -1), (-1, 0),  # 上下左右
@@ -260,12 +257,12 @@ def hierarchical_diamond_search(current_blocks: np.ndarray, prev_blocks: np.ndar
     
     # 继续小钻石搜索直到没有改进
     while True:
-        new_mv, new_sad, have_update = diamond_search_iteration(current_blocks, prev_blocks,
+        new_mv, new_mse, have_update = diamond_search_iteration(current_blocks, prev_blocks,
                                                                cur_start_y, cur_start_x,
-                                                               best_mv, small_diamond, best_sad)
+                                                               best_mv, small_diamond, best_mse)
         if not have_update:
             break
-        best_mv, best_sad = new_mv, new_sad
+        best_mv, best_mse = new_mv, new_mse
     
     # 计算最佳运动向量下需要更新的块数
     dx, dy = best_mv
@@ -273,7 +270,7 @@ def hierarchical_diamond_search(current_blocks: np.ndarray, prev_blocks: np.ndar
         current_blocks, prev_blocks, cur_start_y, cur_start_x, dx, dy, diff_threshold
     )
     
-    return best_mv, best_sad, updates_needed, no_motion_updates
+    return best_mv, best_mse, updates_needed, no_motion_updates
 
 def detect_motion_compensation_candidates(current_blocks: np.ndarray, prev_blocks: np.ndarray,
                                         diff_threshold: float, 
@@ -314,7 +311,7 @@ def detect_motion_compensation_candidates(current_blocks: np.ndarray, prev_block
             continue
         
         # 进行运动搜索
-        best_mv, sad, updates_needed, _ = hierarchical_diamond_search(
+        best_mv, mse, updates_needed, _ = hierarchical_diamond_search(
             current_blocks, prev_blocks, block_8x8_y, block_8x8_x, diff_threshold
         )
         
@@ -344,7 +341,7 @@ def detect_motion_compensation_candidates(current_blocks: np.ndarray, prev_block
                 'updates_needed': updates_needed,
                 'no_motion_updates': no_motion_updates,
                 'improvement': improvement,
-                'sad': sad,
+                'mse': mse,
                 'block_8x8_pos': (block_8x8_y, block_8x8_x)
             })
         elif is_real_motion and not has_significant_improvement:
@@ -683,3 +680,17 @@ class MotionCompensationStats:
 
 # 全局统计实例
 motion_stats = MotionCompensationStats()
+
+@njit
+def calculate_2x2_block_difference_unified(current_block: np.ndarray, prev_block: np.ndarray) -> float:
+    """
+    统一的2×2块差异计算函数，与core_encoder保持一致
+    计算Y分量的平均平方差（MSE）
+    """
+    y_diff_sum = 0.0
+    for i in range(4):  # Y分量的4个像素
+        current_val = float(current_block[i])
+        prev_val = float(prev_block[i])
+        diff = current_val - prev_val
+        y_diff_sum += diff * diff  # 使用平方差（MSE）
+    return y_diff_sum / 4.0

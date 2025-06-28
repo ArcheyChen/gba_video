@@ -358,19 +358,16 @@ def quantize_blocks_unified_medium(blocks_data: np.ndarray, codebook: np.ndarray
 
 @njit
 def compute_2x2_block_differences_numba(current_flat, prev_flat, blocks_h, blocks_w):
-    """Numba加速的2x2块差异计算（YUV444格式，只比较Y分量）"""
+    """Numba加速的2x2块差异计算（YUV444格式，只比较Y分量，使用MSE）"""
     block_diffs = np.zeros((blocks_h, blocks_w), dtype=np.float64)
     
     for i in range(blocks_h * blocks_w):
         y_diff_sum = 0.0
         for j in range(4):  # 只计算Y分量差异（前4个字节）
-            current_val = int(current_flat[i, j])
-            prev_val = int(prev_flat[i, j])
-            if current_val >= prev_val:
-                diff = current_val - prev_val
-            else:
-                diff = prev_val - current_val
-            y_diff_sum += diff
+            current_val = float(current_flat[i, j])
+            prev_val = float(prev_flat[i, j])
+            diff = current_val - prev_val
+            y_diff_sum += diff * diff  # 使用平方差（MSE）
         block_diffs[i // blocks_w, i % blocks_w] = y_diff_sum / 4.0
     
     return block_diffs
