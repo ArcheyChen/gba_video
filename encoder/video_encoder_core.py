@@ -13,6 +13,7 @@ from core_encoder import *
 from gop_processor import generate_gop_unified_codebooks
 from video_encoder_stats import EncodingStats
 from video_encoder_utils import write_header, write_source
+from motion_compensation import motion_stats
 
 # 全局函数，用于多进程
 def sort_single_gop_worker(args):
@@ -94,10 +95,15 @@ class SimpleStats:
         self.small_blocks_distribution = {1: 0, 2: 0, 3: 0, 4: 0}
         self.medium_blocks_distribution = {1: 0, 2: 0, 3: 0, 4: 0}
         self.full_blocks_distribution = {1: 0, 2: 0, 3: 0, 4: 0}
+        # 运动补偿统计信息
+        self.motion_stats_dict = None
 
 def encode_frame_chunk_worker(args):
     """帧编码chunk的worker函数"""
-    start_idx, end_idx, frames_chunk, gop_codebooks_chunk, i_frame_interval, diff_threshold, force_i_threshold, enabled_segments_bitmap, enabled_medium_segments_bitmap, codebook_size, color_fallback_threshold = args
+    start_idx, end_idx, frames_chunk, gop_codebooks_chunk, i_frame_interval, diff_threshold, force_i_threshold, enabled_segments_bitmap, enabled_medium_segments_bitmap, codebook_size, color_fallback_threshold, motion_compensation_enabled, motion_update_threshold = args
+    
+    # 重置当前进程的运动补偿统计
+    motion_stats.reset()
     
     encoded_frames = []
     frame_offsets = []
@@ -147,8 +153,9 @@ def encode_frame_chunk_worker(args):
             )
             is_i_frame = True
             
-            # 计算码本和索引大小
-            codebook_size_bytes = codebook_size * 7  # BYTES_PER_BLOCK
+            # 计算码本和索引大小（使用输出的YUV420格式）
+            OUTPUT_BYTES_PER_BLOCK = 6  # YUV420格式：4Y + 1Cb + 1Cr
+            codebook_size_bytes = codebook_size * OUTPUT_BYTES_PER_BLOCK
             index_size = len(frame_data) - 1 - codebook_size_bytes
             
             # 更新统计
@@ -169,11 +176,13 @@ def encode_frame_chunk_worker(args):
                 accumulated_frame, prev_frame,
                 unified_codebook, block_types,
                 diff_threshold, force_i_threshold, enabled_segments_bitmap,
-                enabled_medium_segments_bitmap, color_fallback_threshold
+                enabled_medium_segments_bitmap, color_fallback_threshold,
+                motion_compensation_enabled, motion_update_threshold
             )
             
             if is_i_frame:
-                codebook_size_bytes = codebook_size * 7  # BYTES_PER_BLOCK
+                OUTPUT_BYTES_PER_BLOCK = 6  # YUV420格式：4Y + 1Cb + 1Cr
+                codebook_size_bytes = codebook_size * OUTPUT_BYTES_PER_BLOCK
                 index_size = len(frame_data) - 1 - codebook_size_bytes
                 
                 # 更新统计
@@ -228,7 +237,10 @@ def encode_frame_chunk_worker(args):
             prev_frame = accumulated_frame.copy() if accumulated_frame.size > 0 else None
         
         if frame_idx % 30 == 0 or frame_idx == end_idx - 1:
-            print(f"  已编码 {frame_idx + 1} 帧")
+            print(f"  已编码 {frame_idx + 1}/{end_idx} 帧")
+    
+    # 收集运动补偿统计信息
+    local_stats.motion_stats_dict = motion_stats.get_stats_dict()
     
     # 返回编码结果和统计信息
     return encoded_frames, frame_offsets, start_idx, local_stats
@@ -243,7 +255,7 @@ class VideoEncoderCore:
                     force_i_threshold=0.7, variance_threshold=5.0, color_fallback_threshold=50.0, codebook_size=256,
                     kmeans_max_iter=200, i_frame_weight=3, max_workers=None,
                     enabled_segments_bitmap=0xFFFF, enabled_medium_segments_bitmap=0x0F,
-                    use_parallel=True, fps=30.0):
+                    fps=30.0, motion_compensation_enabled=True, motion_update_threshold=8):
         """编码视频的主要流程"""
         
         print(f"码本配置: 统一码本{codebook_size}项")
@@ -255,54 +267,30 @@ class VideoEncoderCore:
             kmeans_max_iter, i_frame_weight, max_workers
         )
 
-        if use_parallel:
-            # 并行执行：先并行完成码本排序，再并行完成帧编码
-            print("正在并行执行码本排序和帧编码...")
-            start_time = time.time()
-            
-            # 使用进程池并行执行
-            if max_workers is None:
-                max_workers = max(1, mp.cpu_count() - 1)
-            
-            try:
-                # 第一阶段：并行码本排序
-                print("正在根据使用频次对码本进行排序...")
-                sorted_gop_codebooks = self._parallel_sort_codebooks(
-                    frames, gop_codebooks, i_frame_interval, diff_threshold, max_workers
-                )
-                
-                # 第二阶段：并行帧编码
-                print("正在编码帧...")
-                encoded_frames, frame_offsets = self._parallel_encode_frames(
-                    frames, sorted_gop_codebooks, i_frame_interval, diff_threshold, force_i_threshold,
-                    enabled_segments_bitmap, enabled_medium_segments_bitmap, codebook_size, color_fallback_threshold, max_workers
-                )
-                
-                end_time = time.time()
-                print(f"并行执行完成，耗时: {end_time - start_time:.2f}秒")
-                
-            except Exception as e:
-                print(f"并行执行失败，回退到串行模式: {e}")
-                use_parallel = False
+        # 并行执行码本排序和帧编码
+        print("正在并行执行码本排序和帧编码...")
+        start_time = time.time()
         
-        if not use_parallel:
-            # 串行执行
-            print("正在串行执行码本排序和帧编码...")
-            start_time = time.time()
-            
-            # 基于 GOP 内 P 帧纹理块使用频次，对每个码本项降序重排
-            print("正在根据使用频次对码本进行排序...")
-            self._sort_codebooks_by_usage(frames, gop_codebooks, i_frame_interval, diff_threshold)
-            
-            # 编码所有帧
-            print("正在编码帧...")
-            encoded_frames, frame_offsets = self._encode_all_frames(
-                frames, gop_codebooks, i_frame_interval, diff_threshold, force_i_threshold,
-                enabled_segments_bitmap, enabled_medium_segments_bitmap, codebook_size, color_fallback_threshold
-            )
-            
-            end_time = time.time()
-            print(f"串行执行完成，耗时: {end_time - start_time:.2f}秒")
+        # 使用进程池并行执行
+        if max_workers is None:
+            max_workers = max(1, mp.cpu_count() - 1)
+        
+        # 第一阶段：并行码本排序
+        print("正在根据使用频次对码本进行排序...")
+        sorted_gop_codebooks = self._parallel_sort_codebooks(
+            frames, gop_codebooks, i_frame_interval, diff_threshold, max_workers
+        )
+        
+        # 第二阶段：并行帧编码
+        print("正在编码帧...")
+        encoded_frames, frame_offsets = self._parallel_encode_frames(
+            frames, sorted_gop_codebooks, i_frame_interval, diff_threshold, force_i_threshold,
+            enabled_segments_bitmap, enabled_medium_segments_bitmap, codebook_size, color_fallback_threshold, 
+            motion_compensation_enabled, motion_update_threshold, max_workers
+        )
+        
+        end_time = time.time()
+        print(f"执行完成，耗时: {end_time - start_time:.2f}秒")
         
         all_data = b''.join(encoded_frames)
         
@@ -345,7 +333,9 @@ class VideoEncoderCore:
         return sorted_gop_codebooks
     
     def _parallel_encode_frames(self, frames, gop_codebooks, i_frame_interval, diff_threshold, 
-                               force_i_threshold, enabled_segments_bitmap, enabled_medium_segments_bitmap, codebook_size, color_fallback_threshold, max_workers):
+                               force_i_threshold, enabled_segments_bitmap, enabled_medium_segments_bitmap, 
+                               codebook_size, color_fallback_threshold, motion_compensation_enabled, 
+                               motion_update_threshold, max_workers):
         """并行帧编码"""
         # 优化分块策略：按GOP分组，减少通信开销
         num_frames = len(frames)
@@ -371,7 +361,8 @@ class VideoEncoderCore:
                 
                 chunk_data = (start_frame, end_frame, frames_chunk, gop_codebooks_chunk, i_frame_interval, 
                             diff_threshold, force_i_threshold, enabled_segments_bitmap, 
-                            enabled_medium_segments_bitmap, codebook_size, color_fallback_threshold)
+                            enabled_medium_segments_bitmap, codebook_size, color_fallback_threshold,
+                            motion_compensation_enabled, motion_update_threshold)
                 chunk_data_list.append(chunk_data)
         else:
             # 如果GOP数量很多，按帧数分组，但确保每个分块包含完整的GOP
@@ -396,7 +387,8 @@ class VideoEncoderCore:
                 
                 chunk_data = (i, end_frame, frames_chunk, gop_codebooks_chunk, i_frame_interval, 
                             diff_threshold, force_i_threshold, enabled_segments_bitmap, 
-                            enabled_medium_segments_bitmap, codebook_size, color_fallback_threshold)
+                            enabled_medium_segments_bitmap, codebook_size, color_fallback_threshold,
+                            motion_compensation_enabled, motion_update_threshold)
                 chunk_data_list.append(chunk_data)
         
         print(f"  并行编码：{len(chunk_data_list)}个分块，每个分块约{len(frames) // len(chunk_data_list)}帧")
@@ -459,193 +451,9 @@ class VideoEncoderCore:
                     self.encoding_stats.small_blocks_distribution[block_count] += local_stats.small_blocks_distribution.get(block_count, 0)
                     self.encoding_stats.medium_blocks_distribution[block_count] += local_stats.medium_blocks_distribution.get(block_count, 0)
                     self.encoding_stats.full_blocks_distribution[block_count] += local_stats.full_blocks_distribution.get(block_count, 0)
+                
+                # 合并运动补偿统计
+                if local_stats.motion_stats_dict is not None:
+                    self.encoding_stats.merge_motion_compensation_stats(local_stats.motion_stats_dict)
         
-        return all_encoded_frames, all_frame_offsets
-    
-    @njit(cache=True, fastmath=True)
-    def count_codebook_usage_numba(cur_frames, prev_frames, block_types_arr, codebook, diff_threshold):
-        n_frames = cur_frames.shape[0]
-        counts = np.zeros(codebook.shape[0], dtype=np.int64)
-        for i in range(n_frames):
-            cur = cur_frames[i]
-            prev = prev_frames[i]
-            bt_map = block_types_arr[i]
-            blocks_h, blocks_w = cur.shape[:2]
-            big_blocks_h = blocks_h // 2
-            big_blocks_w = blocks_w // 2
-            for big_by in range(big_blocks_h):
-                for big_bx in range(big_blocks_w):
-                    # 只处理 detail 块
-                    if bt_map[big_by, big_bx, 0] == 1:
-                        for sy in (0,1):
-                            for sx in (0,1):
-                                y, x = big_by*2+sy, big_bx*2+sx
-                                if y < blocks_h and x < blocks_w:
-                                    b = cur[y, x]
-                                    # 量化
-                                    min_dist = 1e10
-                                    best_idx = 0
-                                    for j in range(codebook.shape[0]):
-                                        dist = 0.0
-                                        for k in range(b.shape[0]):
-                                            diff = float(b[k]) - float(codebook[j, k])
-                                            dist += diff * diff
-                                        if dist < min_dist:
-                                            min_dist = dist
-                                            best_idx = j
-                                    counts[best_idx] += 1
-        return counts
-
-    def _sort_codebooks_by_usage(self, frames, gop_codebooks, i_frame_interval, diff_threshold):
-        """根据使用频次对码本进行排序（JIT加速统计）"""
-        for gop_start, gop_data in gop_codebooks.items():
-            codebook = gop_data['unified_codebook']
-            gop_end = min(gop_start + i_frame_interval, len(frames))
-            # 收集所有需要统计的帧和 block_types
-            cur_frames = []
-            prev_frames = []
-            block_types_arr = []
-            for fid in range(gop_start + 1, gop_end):
-                cur = frames[fid]
-                prev = frames[fid - 1]
-                bt_map = None
-                for fno, bt in gop_data['block_types_list']:
-                    if fno == fid:
-                        bt_map = bt; break
-                # 将 block_types dict 转为 numpy 数组，0=color, 1=detail
-                blocks_h, blocks_w = cur.shape[:2]
-                big_blocks_h = blocks_h // 2
-                big_blocks_w = blocks_w // 2
-                bt_arr = np.zeros((big_blocks_h, big_blocks_w, 2), dtype=np.int32)
-                for (by, bx), (typ, indices) in bt_map.items():
-                    if typ == 'color':
-                        bt_arr[by, bx, 0] = 0
-                    else:
-                        bt_arr[by, bx, 0] = 1
-                cur_frames.append(cur)
-                prev_frames.append(prev)
-                block_types_arr.append(bt_arr)
-            if len(cur_frames) == 0:
-                counts = np.zeros(len(codebook), dtype=int)
-            else:
-                cur_frames_np = np.stack(cur_frames)
-                prev_frames_np = np.stack(prev_frames)
-                block_types_np = np.stack(block_types_arr)
-                counts = self.count_codebook_usage_numba(cur_frames_np, prev_frames_np, block_types_np, codebook, diff_threshold)
-            max_count = counts.max()
-            min_count = counts.min()
-            total_usage = counts.sum()
-            if max_count > min_count and total_usage > 0:
-                print(f"  GOP {gop_start}: 最大使用频次 {max_count}, 最小使用频次 {min_count}, 总使用次数 {total_usage}")
-                order = np.argsort(-counts, kind='stable')
-                gop_data['unified_codebook'] = codebook[order]
-                index_mapping = np.zeros(len(codebook), dtype=int)
-                for new_idx, old_idx in enumerate(order):
-                    index_mapping[old_idx] = new_idx
-                for fid, bt in gop_data['block_types_list']:
-                    if bt is not None:
-                        for (big_by, big_bx), (block_type, block_indices) in bt.items():
-                            if block_type == 'detail':
-                                new_indices = []
-                                for old_idx in block_indices:
-                                    if old_idx < len(index_mapping):
-                                        new_indices.append(index_mapping[old_idx])
-                                    else:
-                                        new_indices.append(old_idx)
-                                bt[(big_by, big_bx)] = (block_type, new_indices)
-    
-    def _encode_all_frames(self, frames, gop_codebooks, i_frame_interval, diff_threshold, 
-                          force_i_threshold, enabled_segments_bitmap, enabled_medium_segments_bitmap, codebook_size, color_fallback_threshold):
-        """编码所有帧（原始串行版本）"""
-        encoded_frames = []
-        frame_offsets = []
-        current_offset = 0
-        prev_frame = None
-        
-        for frame_idx, current_frame in enumerate(frames):
-            frame_offsets.append(current_offset)
-            
-            # 找到当前GOP
-            gop_start = (frame_idx // i_frame_interval) * i_frame_interval
-            gop_data = gop_codebooks[gop_start]
-            
-            unified_codebook = gop_data['unified_codebook']
-            
-            # 找到当前帧的block_types，处理缺失的情况
-            block_types = None
-            for fid, bt in gop_data['block_types_list']:
-                if fid == frame_idx:
-                    block_types = bt
-                    break
-            
-            # 如果block_types仍然为None，生成默认的block_types
-            if block_types is None:
-                print(f"  ⚠️ 帧 {frame_idx} 缺少block_types，使用默认分类")
-                # 临时生成block_types
-                _, block_types = classify_4x4_blocks_unified(current_frame, 5.0)
-            
-            force_i_frame = (frame_idx % i_frame_interval == 0) or frame_idx == 0
-            
-            if force_i_frame or prev_frame is None:
-                frame_data = encode_i_frame_unified(
-                    current_frame, unified_codebook, block_types, color_fallback_threshold
-                )
-                is_i_frame = True
-                
-                # 计算码本和索引大小
-                codebook_size_bytes = codebook_size * 7  # BYTES_PER_BLOCK
-                index_size = len(frame_data) - 1 - codebook_size_bytes
-                
-                self.encoding_stats.add_i_frame(
-                    len(frame_data), 
-                    is_forced=force_i_frame,
-                    codebook_size=codebook_size_bytes,
-                    index_size=max(0, index_size)
-                )
-            else:
-                # P帧编码前，先将未更新的块从前一帧累积到当前帧，避免渐变残影
-                accumulated_frame = accumulate_unchanged_blocks(current_frame, prev_frame, diff_threshold)
-                
-                frame_data, is_i_frame, used_zones, color_updates, detail_updates, small_updates, medium_updates, full_updates, small_bytes, medium_bytes, full_bytes, small_segments, medium_segments, small_blocks_per_update, medium_blocks_per_update, full_blocks_per_update = encode_p_frame_unified(
-                    accumulated_frame, prev_frame,
-                    unified_codebook, block_types,
-                    diff_threshold, force_i_threshold, enabled_segments_bitmap,
-                    enabled_medium_segments_bitmap, color_fallback_threshold
-                )
-                
-                if is_i_frame:
-                    codebook_size_bytes = codebook_size * 7  # BYTES_PER_BLOCK
-                    index_size = len(frame_data) - 1 - codebook_size_bytes
-                    
-                    self.encoding_stats.add_i_frame(
-                        len(frame_data), 
-                        is_forced=False,
-                        codebook_size=codebook_size_bytes,
-                        index_size=max(0, index_size)
-                    )
-                else:
-                    total_updates = color_updates + detail_updates
-                    
-                    self.encoding_stats.add_p_frame(
-                        len(frame_data), total_updates, used_zones,
-                        color_updates, detail_updates,
-                        small_updates, medium_updates, full_updates,
-                        small_bytes, medium_bytes, full_bytes,
-                        small_segments, medium_segments,
-                        small_blocks_per_update, medium_blocks_per_update, full_blocks_per_update
-                    )
-            
-            encoded_frames.append(frame_data)
-            current_offset += len(frame_data)
-            
-            # 更新前一帧引用：I帧直接使用当前帧，P帧使用累积后的帧
-            if force_i_frame or prev_frame is None:
-                prev_frame = current_frame.copy() if current_frame.size > 0 else None
-            else:
-                # P帧使用累积后的帧作为下一帧的参考，以便累积渐变差异
-                prev_frame = accumulated_frame.copy() if accumulated_frame.size > 0 else None
-            
-            if frame_idx % 30 == 0 or frame_idx == len(frames) - 1:
-                print(f"  已编码 {frame_idx + 1}/{len(frames)} 帧")
-        
-        return encoded_frames, frame_offsets 
+        return all_encoded_frames, all_frame_offsets 

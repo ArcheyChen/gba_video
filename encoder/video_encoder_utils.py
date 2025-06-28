@@ -2,10 +2,14 @@
 
 import pathlib
 import textwrap
+from core_encoder import BYTES_PER_BLOCK
 
 def write_header(path_h: pathlib.Path, frame_cnt: int, total_bytes: int, codebook_size: int, output_fps: float):
     """生成C语言头文件"""
     guard = "VIDEO_DATA_H"
+    
+    # 解码器期望的BYTES_PER_BLOCK（YUV420格式）
+    DECODER_BYTES_PER_BLOCK = 6  # 4Y + 1Cb + 1Cr (YUV420)
     
     with path_h.open("w", encoding="utf-8") as f:
         f.write(textwrap.dedent(f"""\
@@ -30,7 +34,7 @@ def write_header(path_h: pathlib.Path, frame_cnt: int, total_bytes: int, codeboo
             // 块参数
             #define BLOCK_WIDTH         2
             #define BLOCK_HEIGHT        2
-            #define BYTES_PER_BLOCK     7
+            #define BYTES_PER_BLOCK     {DECODER_BYTES_PER_BLOCK}
             
             extern const unsigned char video_data[VIDEO_TOTAL_BYTES];
             extern const unsigned int frame_offsets[VIDEO_FRAME_COUNT];
@@ -60,7 +64,7 @@ def extract_frames_from_video(video_path: str, duration: float, fps: int, full_d
     """从视频文件中提取帧"""
     import cv2
     import numpy as np
-    from core_encoder import pack_yuv420_frame
+    from core_encoder import pack_yuv444_frame
     from dither_opt import apply_dither_optimized
     
     cap = cv2.VideoCapture(video_path)
@@ -99,7 +103,7 @@ def extract_frames_from_video(video_path: str, duration: float, fps: int, full_d
             if dither:
                 frm = apply_dither_optimized(frm)
             
-            frame_blocks = pack_yuv420_frame(frm)
+            frame_blocks = pack_yuv444_frame(frm)
             frames.append(frame_blocks)
             
             if len(frames) % 30 == 0:

@@ -14,6 +14,8 @@ IWRAM_CODE void inline sound_stop(void) {
 constexpr static inline u16 timer_reload(u32 sample_rate) {
     return (u16)(0x10000 - (TIMER_FREQ / sample_rate));
 }
+
+
 // 音频播放函数声明
 void sound_init(void);
 IWRAM_CODE void inline sound_play(const u8 *data) {

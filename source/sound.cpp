@@ -2,8 +2,6 @@
 #include "sound.h"
 #include "audio_data.h"
 
-
-
 void sound_init(void) {
     REG_SOUNDCNT_X = SNDSTAT_ENABLE;  // 开启总音频电源
 

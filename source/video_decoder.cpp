@@ -21,13 +21,30 @@ RGB555_Struct* VideoDecoder::rgb555_codebook = VideoDecoder::rgb555_codebook_buf
 bool VideoDecoder::rgb555_codebook_preloaded = false;
 
 // 查找表定义
-u8 VideoDecoder::clip_lookup_table[512];
-u16 VideoDecoder::big_block_relative_offsets[240/4*160/4];
-u16 VideoDecoder::zone_block_relative_offsets[240];
+u8 VideoDecoder::clip_lookup_table_raw[2048];
+u8* VideoDecoder::clip_lookup_table = nullptr;
+IWRAM_DATA u16 VideoDecoder::big_block_relative_offsets[240/4*160/4];
+IWRAM_DATA u16 VideoDecoder::zone_block_relative_offsets[240];
+IWRAM_DATA u16 VideoDecoder::zone_motion_block_relative_offsets[240];
 
+int inline cal_motion_block_dst_offset(int motion_block_idx){
+    int relative_8x8_row = motion_block_idx / MOTION_BLOCKS_8X8_PER_ZONE_ROW;
+    int relative_8x8_col = motion_block_idx % MOTION_BLOCKS_8X8_PER_ZONE_ROW;
+    
+    int block_8x8_y = relative_8x8_row;
+    int block_8x8_x = relative_8x8_col;
+
+    int dst_start_y = block_8x8_y * MOTION_BLOCK_8X8_SIZE;
+    int dst_start_x = block_8x8_x * MOTION_BLOCK_8X8_SIZE;
+    int dst_offset = dst_start_y * SCREEN_WIDTH + dst_start_x;
+    return dst_offset;
+}
 void VideoDecoder::init() {
     // 初始化查找表
-    for(int i=-128;i<512-128;i++){
+    int table_size = sizeof(clip_lookup_table_raw) / sizeof(clip_lookup_table_raw[0]);
+    int offset = 1024;
+    clip_lookup_table = clip_lookup_table_raw + offset;
+    for(int i=-offset;i<table_size-offset;i++){
         u8 raw_val;
         if(i<=0)
             raw_val = 0;
@@ -35,7 +52,7 @@ void VideoDecoder::init() {
             raw_val = 255;
         else
             raw_val = static_cast<u8>(i);
-        clip_lookup_table[i+128] = raw_val>>2;
+        clip_lookup_table[i] = raw_val>>3;
     }
     
     // 初始化块偏移查找表
@@ -55,51 +72,65 @@ void VideoDecoder::init() {
         u16 zone_big_by = zone_block_idx / zone_big_blocks_w;
         zone_block_relative_offsets[zone_block_idx] = 
             (zone_big_by * BLOCK_HEIGHT * 2 * SCREEN_WIDTH) + (zone_big_bx * BLOCK_WIDTH * 2);
+        
+        zone_motion_block_relative_offsets[zone_block_idx] = cal_motion_block_dst_offset(zone_block_idx);
     }
+
+    
 }
 
 // RGB555码本解码函数 - 直接使用预计算的RGB555值
 IWRAM_CODE void VideoDecoder::decode_block_rgb555(const RGB555_Struct &rgb555_data, u16* dst)
 {
-    u16* dst_row = dst;
-    // 直接拷贝预计算的RGB555值
-    dst_row[0] = rgb555_data.rgb[0][0];
-    dst_row[1] = rgb555_data.rgb[0][1];
-    dst_row[SCREEN_WIDTH] = rgb555_data.rgb[1][0];
-    dst_row[SCREEN_WIDTH + 1] = rgb555_data.rgb[1][1];
+    // 直接使用结构体中的union进行高效访问
+    *(u32*)(&dst[0]) = rgb555_data.row[0].u32_val;
+    *(u32*)(&dst[SCREEN_WIDTH]) = rgb555_data.row[1].u32_val;
 }
 
 // RGB555码本解码色块（2x2上采样到4x4）
-IWRAM_CODE void VideoDecoder::decode_color_block_rgb555(const RGB555_Struct &rgb555_data, u16* dst)
+IWRAM_CODE void VideoDecoder::decode_color_block_rgb555(const RGB555_Struct &rgb555_data, u16* __restrict__ dst)
 {
     u16* dst_row = dst;
     
-    // 第一行：1122
-    dst_row[0] = rgb555_data.rgb[0][0];
-    dst_row[1] = rgb555_data.rgb[0][0];
-    dst_row[2] = rgb555_data.rgb[0][1];
-    dst_row[3] = rgb555_data.rgb[0][1];
+    // 使用union避免strict-aliasing警告
+    union {
+        u16 u16_vals[2];
+        u32 u32_val;
+    } color_pair[4];
     
+    // 预计算颜色对
+    u16 color1 = rgb555_data.rgb[0][0];
+    color_pair[0].u16_vals[0] = color1;  // 颜色1
+    color_pair[0].u16_vals[1] = color1;
+    u16 color2 = rgb555_data.rgb[0][1];
+    color_pair[1].u16_vals[0] = color2;  // 颜色2
+    color_pair[1].u16_vals[1] = color2;
+    u16 color3 = rgb555_data.rgb[1][0];
+    color_pair[2].u16_vals[0] = color3;  // 颜色3   
+    color_pair[2].u16_vals[1] = color3;
+    u16 color4 = rgb555_data.rgb[1][1];
+    color_pair[3].u16_vals[0] = color4;  // 颜色4
+    color_pair[3].u16_vals[1] = color4;
+
+    // 第一行：1122
+    *(u32*)dst_row = color_pair[0].u32_val;
+    *(u32*)(dst_row + 2) = color_pair[1].u32_val;
     // 第二行：1122
     dst_row += SCREEN_WIDTH;
-    dst_row[0] = rgb555_data.rgb[0][0];
-    dst_row[1] = rgb555_data.rgb[0][0];
-    dst_row[2] = rgb555_data.rgb[0][1];
-    dst_row[3] = rgb555_data.rgb[0][1];
+    *(u32*)dst_row = color_pair[0].u32_val;
+    *(u32*)(dst_row + 2) = color_pair[1].u32_val;
     
     // 第三行：3344
     dst_row += SCREEN_WIDTH;
-    dst_row[0] = rgb555_data.rgb[1][0];
-    dst_row[1] = rgb555_data.rgb[1][0];
-    dst_row[2] = rgb555_data.rgb[1][1];
-    dst_row[3] = rgb555_data.rgb[1][1];
+    dst_row[0] = color3;
+    dst_row[1] = color3;
+    dst_row[2] = color4;
+    dst_row[3] = color4;
     
     // 第四行：3344
     dst_row += SCREEN_WIDTH;
-    dst_row[0] = rgb555_data.rgb[1][0];
-    dst_row[1] = rgb555_data.rgb[1][0];
-    dst_row[2] = rgb555_data.rgb[1][1];
-    dst_row[3] = rgb555_data.rgb[1][1];
+    *(u32*)dst_row = color_pair[2].u32_val;
+    *(u32*)(dst_row + 2) = color_pair[3].u32_val;
 }
 IWRAM_CODE void VideoDecoder::decode_segment_rgb555(u8 CODE_BOOK_SIZE,u8 INDEX_BIT_LEN,u8 INDEX_BIT_MASK ,u16 seg_idx, const u8** src, u16* zone_dst, 
                                             const RGB555_Struct* unified_codebook)
@@ -123,22 +154,24 @@ IWRAM_CODE void VideoDecoder::decode_segment_rgb555(u8 CODE_BOOK_SIZE,u8 INDEX_B
     
     // 解码每2个块为一组
     const u8* bitmap_ptr = bitmap_and_indices_ptr;
-    for (u8 i = 0; i < (num_blocks >> 1); i++) {
+    bool is_odd = num_blocks & 1;
+    num_blocks >>= 1;  // 每次处理2个块
+    while(num_blocks--) {
         u8 valid_bitmap = *bitmap_ptr++;
-        u8 zone_relative_idx1 = *bitmap_ptr++;
-        u8 zone_relative_idx2 = *bitmap_ptr++;
         
         // 解码第一个4x4块
-        u16* big_block_dst = zone_dst + zone_block_relative_offsets[zone_relative_idx1];
+        u8 zone_relative_idx = *bitmap_ptr++;
+        u16* big_block_dst = zone_dst + zone_block_relative_offsets[zone_relative_idx];
         decode_normal_4x4_block(valid_bitmap, reader, big_block_dst, codebook);
         
         // 解码第二个4x4块
-        big_block_dst = zone_dst + zone_block_relative_offsets[zone_relative_idx2];
+        zone_relative_idx = *bitmap_ptr++;
+        big_block_dst = zone_dst + zone_block_relative_offsets[zone_relative_idx];
         decode_normal_4x4_block(valid_bitmap, reader, big_block_dst, codebook);
     }
     
     // 处理最后一个奇数块（如果存在）
-    if (num_blocks & 1) {
+    if (is_odd) {
         u8 valid_bitmap = *bitmap_ptr++;
         u8 zone_relative_idx1 = *bitmap_ptr++;
         
@@ -190,30 +223,52 @@ IWRAM_CODE void VideoDecoder::copy_unified_codebook(u8* dst_raw, const u8* src, 
 // 将YUV码本转换为RGB555码本
 IWRAM_CODE void VideoDecoder::convert_yuv_to_rgb555_codebook(const YUV_Struct* yuv_codebook, RGB555_Struct* rgb555_codebook, int codebook_size)
 {
+    auto lookup_table = clip_lookup_table_raw + 1024;
     for(int i = 0; i < codebook_size; i++) {
         const YUV_Struct& yuv = yuv_codebook[i];
         RGB555_Struct& rgb555 = rgb555_codebook[i];
-        
-        auto lookup_table = clip_lookup_table + 128;
+        s8 cb = yuv.cb;
+        s8 cr = yuv.cr;
+        int d_r = (cr << 1);
+        int d_g = (cb >> 1) + cr;
+        int d_b = (cb << 1);
         // 转换2x2块的每个像素
         for(int y = 0; y < 2; y++) {
             for(int x = 0; x < 2; x++) {
                 u8 y_val = yuv.y[y][x];
-                s8 d_r = yuv.d_r;
-                s8 d_g = yuv.d_g;
-                s8 d_b = yuv.d_b;
                 
+                // 使用快速YUV到RGB转换矩阵：
+                // R = Y + (Cr << 1)
+                // G = Y - (Cb >> 1) - Cr  
+                // B = Y + (Cb << 1)
                 u16 r = lookup_table[y_val + d_r];
-                u16 g = lookup_table[y_val + d_g];
+                u16 g = lookup_table[y_val - d_g];
                 u16 b = lookup_table[y_val + d_b];
                 
-                rgb555.rgb[y][x] = r | (g << 5) | (b << 10);
+                // 直接设置union中的值，这样u32_val会自动更新
+                rgb555.row[y].u16_vals[x] = r | (g << 5) | (b << 10);
             }
         }
     }
 }
 
 IWRAM_CODE void VideoDecoder::decode_normal_4x4_block(u8 &valid_bitmap, BitReader &reader, u16* big_block_dst, const RGB555_Struct * codebook){
+        for (u8 sub_idx = 0; sub_idx < 4; sub_idx++) {
+            if (valid_bitmap & 1) {
+                u8 codebook_idx = reader.read();
+                u16* subblock_dst;
+                switch (sub_idx) {
+                    case 0: subblock_dst = big_block_dst;/* 左上 */  break;
+                    case 1: subblock_dst = big_block_dst + 2; break; /* 右上 */
+                    case 2: subblock_dst = big_block_dst + SCREEN_WIDTH * 2; break; /* 左下 */
+                    case 3: subblock_dst = big_block_dst + SCREEN_WIDTH * 2 + 2; break; /* 右下 */
+                }
+                decode_block_rgb555(codebook[codebook_idx], subblock_dst);
+            }
+            valid_bitmap >>= 1;
+        }
+    }
+IWRAM_CODE void VideoDecoder::decode_normal_4x4_block_full_codebook(u8 &valid_bitmap, BitReader &reader, u16* big_block_dst, const RGB555_Struct * codebook){
         for (u8 sub_idx = 0; sub_idx < 4; sub_idx++) {
             if (valid_bitmap & 1) {
                 u8 codebook_idx = reader.read();
@@ -229,6 +284,95 @@ IWRAM_CODE void VideoDecoder::decode_normal_4x4_block(u8 &valid_bitmap, BitReade
             valid_bitmap >>= 1;
         }
     }
+
+// 运动补偿相关函数
+
+// 解码运动向量
+IWRAM_CODE void VideoDecoder::decode_motion_vector(u8 encoded, int* dx, int* dy)
+{
+    *dx = (encoded & 0x0F) - MOTION_RANGE;
+    *dy = ((encoded >> 4) & 0x0F) - MOTION_RANGE;
+}
+
+// 应用8x8块的运动补偿
+IWRAM_CODE void VideoDecoder::apply_motion_compensation_8x8_block(u16* dst, u16* vram_src,
+                                                                 int block_8x8_y, int block_8x8_x,
+                                                                 int motion_dx, int motion_dy)
+{
+    // 计算8x8块在屏幕中的起始位置
+    int dst_start_y = block_8x8_y * MOTION_BLOCK_8X8_SIZE;
+    int dst_start_x = block_8x8_x * MOTION_BLOCK_8X8_SIZE;
+    
+    // 计算运动补偿后的源位置
+    int src_start_y = dst_start_y + motion_dy;
+    int src_start_x = dst_start_x + motion_dx;
+    
+    // 复制8x8像素块（从VRAM复制到buffer）
+    int dst_y = dst_start_y * SCREEN_WIDTH + dst_start_x;
+    int src_y = src_start_y * SCREEN_WIDTH + src_start_x;
+    for (int y = 0; y < MOTION_BLOCK_8X8_SIZE; y++) {
+        // memcpy(&dst[dst_y],&vram_src[src_y],MOTION_BLOCK_8X8_SIZE*sizeof(u16));
+        DMA3COPY(&vram_src[src_y],&dst[dst_y],(MOTION_BLOCK_8X8_SIZE>>1)|DMA32);
+        dst_y += SCREEN_WIDTH;
+        src_y += SCREEN_WIDTH;
+    }
+}
+
+
+// 解码运动补偿数据
+// 解码运动补偿数据（新格式：条带式）
+IWRAM_CODE void VideoDecoder::decode_motion_compensation_data(const u8* &src, u16* dst, u16* vram_src)
+{
+    // 读取zone bitmap
+    u8 zone_bitmap = *src++;
+    int zone_idx = 0;
+    // 遍历每个zone
+    u16* zone_src = vram_src;
+    u16* zone_dst = dst;
+    while(zone_bitmap){
+        if(zone_bitmap & 1){
+            // 读取该zone的运动补偿条带数量
+            u8 motion_strips_count = *src++;
+            
+            // 解码每个运动补偿条带
+            for (u8 i = 0; i < motion_strips_count; i++) {
+                // 读取条带数据：zone内相对索引 + 编码的运动向量 + 连续块数量
+                u8 motion_block_idx = src[0];
+                u8 encoded_mv = src[1];
+                u8 continuous_count = src[2];
+                src += 3;
+                
+                // 解码运动向量
+                int motion_dx, motion_dy;
+                motion_dx = (encoded_mv & 0x0F) - MOTION_RANGE;
+                motion_dy = (encoded_mv >> 4) - MOTION_RANGE;
+                
+                // 计算条带起始位置的相对偏移
+                int dst_offset = zone_motion_block_relative_offsets[motion_block_idx];
+                int src_offset = dst_offset + motion_dy * SCREEN_WIDTH + motion_dx;
+                
+                // 使用条带式DMA拷贝：一次拷贝连续的8×N像素条带
+                int strip_width = MOTION_BLOCK_8X8_SIZE * continuous_count; // 8 * N 像素宽度
+                
+                // 复制8×N像素条带（从VRAM复制到buffer）
+                for (int y = 0; y < MOTION_BLOCK_8X8_SIZE; y++) {
+                    // 一次DMA拷贝整个条带的一行
+                    int dma_words = (strip_width >> 1) | DMA32; // 转换为32位字数
+                    DMA3COPY(&zone_src[src_offset], &zone_dst[dst_offset], dma_words);
+                    
+                    dst_offset += SCREEN_WIDTH;
+                    src_offset += SCREEN_WIDTH;
+                }
+            }
+        }
+        zone_idx++;
+        zone_bitmap >>= 1;
+        constexpr int zone_offset = MOTION_BLOCK_8X8_SIZE * MOTION_BLOCK_8X8_SIZE * 240;
+        zone_src += zone_offset;
+        zone_dst += zone_offset;
+    }
+}
+
 IWRAM_CODE void VideoDecoder::load_codebook_and_convert(const u8* src)
 {
     // 预加载码本
@@ -272,7 +416,7 @@ IWRAM_CODE void VideoDecoder::decode_i_frame_unified(const u8* src, u16* dst)
     current_rgb555_codebook_index ^= 1; // 切换到另一个RGB555码本缓冲区
     rgb555_codebook = rgb555_codebook_buf[current_rgb555_codebook_index];
     
-    u16 tot_big_blocks = (VIDEO_WIDTH / (BLOCK_WIDTH * 2)) * (VIDEO_HEIGHT / (BLOCK_HEIGHT * 2));
+    constexpr u16 tot_big_blocks = (VIDEO_WIDTH / (BLOCK_WIDTH * 2)) * (VIDEO_HEIGHT / (BLOCK_HEIGHT * 2));
     
     // 解码所有4x4大块
     for (int big_block_idx = 0; big_block_idx < tot_big_blocks; big_block_idx++) {
@@ -320,6 +464,10 @@ IWRAM_CODE void VideoDecoder::decode_full_index_segment_rgb555(const u8** src, u
 // RGB555版本的P帧解码函数
 IWRAM_CODE void VideoDecoder::decode_p_frame_unified_rgb555(const u8* src, u16* dst)
 {
+    
+    // 然后解码运动补偿数据，从VRAM的其他位置复制到buffer的目标位置
+    decode_motion_compensation_data(src, dst, (u16*)VRAM);
+    
     // 读取两个区域bitmap：纹理块和色块
     u16 detail_zone_bitmap = src[0] | (src[1] << 8);
     u16 color_zone_bitmap = src[2] | (src[3] << 8);
@@ -398,10 +546,4 @@ IWRAM_CODE void VideoDecoder::decode_frame(const u8* frame_data, u16* dst)
     } else if (frame_type == FRAME_TYPE_P) {
         decode_p_frame_unified_rgb555(frame_data, dst);
     }
-}
-
-IWRAM_CODE bool VideoDecoder::is_i_frame(const u8* frame_data)
-{
-    u8 frame_type = *frame_data;
-    return frame_type == FRAME_TYPE_I;
 }
