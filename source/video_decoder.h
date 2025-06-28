@@ -29,7 +29,15 @@ struct YUV_Struct{
 
 // 解码后的RGB555数据结构（直接存储RGB555值，避免实时转换）
 struct RGB555_Struct{
-    u16 rgb[2][2];  // 直接存储RGB555值
+    union {
+        u16 rgb[2][2];  // 普通访问方式
+        struct {
+            union {
+                u16 u16_vals[2];
+                u32 u32_val;
+            } row[2];
+        };
+    };
 } __attribute__((packed));
 
 // 视频解码器类

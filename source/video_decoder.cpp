@@ -82,49 +82,56 @@ void VideoDecoder::init() {
 // RGB555码本解码函数 - 直接使用预计算的RGB555值
 IWRAM_CODE void VideoDecoder::decode_block_rgb555(const RGB555_Struct &rgb555_data, u16* dst)
 {
-    // 直接拷贝预计算的RGB555值
-    *(u32*)(&dst[0]) = *(u32*)(&rgb555_data.rgb[0][0]);
-    *(u32*)(&dst[SCREEN_WIDTH]) = *(u32*)(&rgb555_data.rgb[1][0]);
+    // 直接使用结构体中的union进行高效访问
+    *(u32*)(&dst[0]) = rgb555_data.row[0].u32_val;
+    *(u32*)(&dst[SCREEN_WIDTH]) = rgb555_data.row[1].u32_val;
 }
 
 // RGB555码本解码色块（2x2上采样到4x4）
 IWRAM_CODE void VideoDecoder::decode_color_block_rgb555(const RGB555_Struct &rgb555_data, u16* __restrict__ dst)
 {
     u16* dst_row = dst;
-    u16 rgb_raw[8];
-    u16 color = rgb555_data.rgb[0][0];
-    rgb_raw[0] = color;  // 颜色1
-    rgb_raw[1] = color;  
-    color = rgb555_data.rgb[0][1];
-    rgb_raw[2] = color;  // 颜色2
-    rgb_raw[3] = color;
-    color = rgb555_data.rgb[1][0];
-    rgb_raw[4] = color;  // 颜色3   
-    rgb_raw[5] = color;
-    color = rgb555_data.rgb[1][1];
-    rgb_raw[6] = color;  // 颜色4
-    rgb_raw[7] = color;
+    
+    // 使用union避免strict-aliasing警告
+    union {
+        u16 u16_vals[2];
+        u32 u32_val;
+    } color_pair[4];
+    
+    // 预计算颜色对
+    u16 color1 = rgb555_data.rgb[0][0];
+    u16 color2 = rgb555_data.rgb[0][1];
+    u16 color3 = rgb555_data.rgb[1][0];
+    u16 color4 = rgb555_data.rgb[1][1];
+    
+    color_pair[0].u16_vals[0] = color1;  // 颜色1
+    color_pair[0].u16_vals[1] = color1;
+    color_pair[1].u16_vals[0] = color2;  // 颜色2
+    color_pair[1].u16_vals[1] = color2;
+    color_pair[2].u16_vals[0] = color3;  // 颜色3   
+    color_pair[2].u16_vals[1] = color3;
+    color_pair[3].u16_vals[0] = color4;  // 颜色4
+    color_pair[3].u16_vals[1] = color4;
 
     // 第一行：1122
-    *(u32*)dst_row = *(u32*)&rgb_raw[0];
-    *(u32*)(dst_row + 2) = *(u32*)&rgb_raw[2];
+    *(u32*)dst_row = color_pair[0].u32_val;
+    *(u32*)(dst_row + 2) = color_pair[1].u32_val;
     // 第二行：1122
     dst_row += SCREEN_WIDTH;
-    *(u32*)dst_row = *(u32*)&rgb_raw[0];
-    *(u32*)(dst_row + 2) = *(u32*)&rgb_raw[2];
+    *(u32*)dst_row = color_pair[0].u32_val;
+    *(u32*)(dst_row + 2) = color_pair[1].u32_val;
     
     // 第三行：3344
     dst_row += SCREEN_WIDTH;
-    // dst_row[3] = rgb555_data.rgb[1][1];
-    *(dst_row) = *(u32*)&rgb_raw[4];
-    *(dst_row + 1) = *(u32*)&rgb_raw[4];
-    *(dst_row + 2) = *(u32*)&rgb_raw[6];
-    *(dst_row + 3) = *(u32*)&rgb_raw[6];
+    dst_row[0] = color3;
+    dst_row[1] = color3;
+    dst_row[2] = color4;
+    dst_row[3] = color4;
     
     // 第四行：3344
     dst_row += SCREEN_WIDTH;
-    *(u32*)dst_row = *(u32*)&rgb_raw[4];
-    *(u32*)(dst_row + 2) = *(u32*)&rgb_raw[6];
+    *(u32*)dst_row = color_pair[2].u32_val;
+    *(u32*)(dst_row + 2) = color_pair[3].u32_val;
 }
 IWRAM_CODE void VideoDecoder::decode_segment_rgb555(u8 CODE_BOOK_SIZE,u8 INDEX_BIT_LEN,u8 INDEX_BIT_MASK ,u16 seg_idx, const u8** src, u16* zone_dst, 
                                             const RGB555_Struct* unified_codebook)
@@ -239,7 +246,8 @@ IWRAM_CODE void VideoDecoder::convert_yuv_to_rgb555_codebook(const YUV_Struct* y
                 u16 g = lookup_table[y_val - d_g];
                 u16 b = lookup_table[y_val + d_b];
                 
-                rgb555.rgb[y][x] = r | (g << 5) | (b << 10);
+                // 直接设置union中的值，这样u32_val会自动更新
+                rgb555.row[y].u16_vals[x] = r | (g << 5) | (b << 10);
             }
         }
     }
