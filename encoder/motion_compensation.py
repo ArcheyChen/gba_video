@@ -26,6 +26,7 @@ MOTION_RANGE = 7
 
 # 损失函数参数
 DEFAULT_UPDATE_THRESHOLD = 12  # 8×8块内需要更新的2×2块数量阈值（总共16个2×2块的75%）
+DEFAULT_MIN_IMPROVEMENT_THRESHOLD = 2  # 运动补偿相比不运动至少要减少的块数
 
 @njit
 def encode_motion_vector(dx: int, dy: int) -> int:
@@ -138,6 +139,41 @@ def count_updated_2x2_blocks_after_motion(current_blocks: np.ndarray, prev_block
     return updated_count
 
 @njit
+def count_updated_2x2_blocks_no_motion(current_blocks: np.ndarray, prev_blocks: np.ndarray,
+                                      cur_start_y: int, cur_start_x: int,
+                                      diff_threshold: float) -> int:
+    """
+    计算不进行运动补偿时需要更新的2×2块数量
+    直接比较当前帧和前一帧对应位置的8×8块
+    """
+    updated_count = 0
+    blocks_h, blocks_w = current_blocks.shape[:2]
+    
+    # 检查4×4个2×2块
+    for dy_block in range(4):
+        for dx_block in range(4):
+            cur_y = cur_start_y + dy_block
+            cur_x = cur_start_x + dx_block
+            
+            # 边界检查
+            if cur_y >= blocks_h or cur_x >= blocks_w:
+                updated_count += 1
+                continue
+            
+            # 计算2×2块的Y分量差异
+            y_diff_sum = 0.0
+            for i in range(4):  # Y分量的4个像素
+                cur_val = float(current_blocks[cur_y, cur_x, i])
+                ref_val = float(prev_blocks[cur_y, cur_x, i])
+                y_diff_sum += abs(cur_val - ref_val)
+            
+            avg_diff = y_diff_sum / 4.0
+            if avg_diff > diff_threshold:
+                updated_count += 1
+    
+    return updated_count
+
+@njit
 def diamond_search_iteration(current_blocks: np.ndarray, prev_blocks: np.ndarray,
                            cur_start_y: int, cur_start_x: int,
                            best_mv: Tuple[int, int], diamond_pattern: List[Tuple[int, int]],
@@ -171,14 +207,19 @@ def diamond_search_iteration(current_blocks: np.ndarray, prev_blocks: np.ndarray
 
 def hierarchical_diamond_search(current_blocks: np.ndarray, prev_blocks: np.ndarray,
                                block_8x8_y: int, block_8x8_x: int, 
-                               diff_threshold: float) -> Tuple[Tuple[int, int], float, int]:
+                               diff_threshold: float) -> Tuple[Tuple[int, int], float, int, int]:
     """
     分层钻石搜索算法
-    返回: (最佳运动向量(dx, dy), SAD值, 更新块数量)
+    返回: (最佳运动向量(dx, dy), SAD值, 运动后更新块数量, 不运动时更新块数量)
     """
     # 当前8×8块在2×2块坐标系中的起始位置
     cur_start_y = block_8x8_y * 4
     cur_start_x = block_8x8_x * 4
+    
+    # 首先计算不运动时需要更新的块数（基准）
+    no_motion_updates = count_updated_2x2_blocks_no_motion(
+        current_blocks, prev_blocks, cur_start_y, cur_start_x, diff_threshold
+    )
     
     best_mv = (0, 0)
     best_sad = float('inf')
@@ -232,31 +273,66 @@ def hierarchical_diamond_search(current_blocks: np.ndarray, prev_blocks: np.ndar
         current_blocks, prev_blocks, cur_start_y, cur_start_x, dx, dy, diff_threshold
     )
     
-    return best_mv, best_sad, updates_needed
+    return best_mv, best_sad, updates_needed, no_motion_updates
 
 def detect_motion_compensation_candidates(current_blocks: np.ndarray, prev_blocks: np.ndarray,
                                         diff_threshold: float, 
-                                        update_threshold: int = DEFAULT_UPDATE_THRESHOLD) -> Dict:
+                                        update_threshold: int = DEFAULT_UPDATE_THRESHOLD,
+                                        min_improvement_threshold: int = DEFAULT_MIN_IMPROVEMENT_THRESHOLD) -> Dict:
     """
     检测可以进行运动补偿的8×8块
+    增加了运动补偿效果判断：只有当运动补偿显著减少更新块数时才采用
+    增加了早期退出优化：如果块本身就很好则跳过运动搜索
+    
+    参数:
+    - min_improvement_threshold: 运动补偿相比不运动至少要减少的块数（默认2个）
+    
     返回按zone组织的运动补偿候选
     """
     motion_candidates = {}
     total_8x8_blocks = BLOCKS_8X8_WIDTH * BLOCKS_8X8_HEIGHT
+    
+    # 统计信息
+    motion_rejected_count = 0  # 因效果不明显被拒绝的运动补偿数量
+    early_skip_count = 0  # 因块本身就很好而跳过搜索的数量
     
     # 遍历所有8×8块
     for block_8x8_idx in range(total_8x8_blocks):
         block_8x8_y = block_8x8_idx // BLOCKS_8X8_WIDTH
         block_8x8_x = block_8x8_idx % BLOCKS_8X8_WIDTH
         
+        # 首先计算不运动时需要更新的块数
+        cur_start_y = block_8x8_y * 4
+        cur_start_x = block_8x8_x * 4
+        no_motion_updates = count_updated_2x2_blocks_no_motion(
+            current_blocks, prev_blocks, cur_start_y, cur_start_x, diff_threshold
+        )
+        
+        # 早期退出优化：如果块本身就很好（需要更新的块数很少），跳过运动搜索
+        if no_motion_updates < min_improvement_threshold:
+            early_skip_count += 1
+            continue
+        
         # 进行运动搜索
-        best_mv, sad, updates_needed = hierarchical_diamond_search(
+        best_mv, sad, updates_needed, _ = hierarchical_diamond_search(
             current_blocks, prev_blocks, block_8x8_y, block_8x8_x, diff_threshold
         )
         
-        # 如果更新块数少于阈值且有真实运动（非零向量），标记为候选
+        # 计算运动补偿的改进效果
+        improvement = no_motion_updates - updates_needed
+        
+        # 判断是否采用运动补偿的条件：
+        # 1. 更新块数少于阈值
+        # 2. 有真实运动（非零向量）
+        # 3. 运动补偿相比不运动有明显改进
         dx, dy = best_mv
-        if updates_needed <= update_threshold and (dx != 0 or dy != 0):
+        is_real_motion = (dx != 0 or dy != 0)
+        has_significant_improvement = improvement >= min_improvement_threshold
+        
+        if (updates_needed <= update_threshold and 
+            is_real_motion and 
+            has_significant_improvement):
+            
             zone_idx, zone_relative_idx = get_8x8_block_zone_info(block_8x8_idx)
             
             if zone_idx not in motion_candidates:
@@ -266,17 +342,24 @@ def detect_motion_compensation_candidates(current_blocks: np.ndarray, prev_block
                 'zone_relative_idx': zone_relative_idx,
                 'motion_vector': best_mv,
                 'updates_needed': updates_needed,
+                'no_motion_updates': no_motion_updates,
+                'improvement': improvement,
                 'sad': sad,
                 'block_8x8_pos': (block_8x8_y, block_8x8_x)
             })
+        elif is_real_motion and not has_significant_improvement:
+            # 统计因效果不明显被拒绝的运动补偿
+            motion_rejected_count += 1
     
     # 更新统计信息
     motion_stats.update_frame_stats(motion_candidates, total_8x8_blocks)
-        # 调试信息
-    # total_compensated_blocks = sum(len(candidates) for candidates in motion_candidates.values())
-    # if total_compensated_blocks > 0:
-    #     print(f"  运动补偿: {total_compensated_blocks}/{total_8x8_blocks} 个8x8块")
+    motion_stats.motion_rejected_count += motion_rejected_count
+    motion_stats.early_skip_count += early_skip_count
     
+    # 调试信息（注释掉，改为在最后汇总时输出）
+    # total_compensated_blocks = sum(len(candidates) for candidates in motion_candidates.values())
+    # if total_compensated_blocks > 0 or motion_rejected_count > 0:
+    #     print(f"  运动补偿: {total_compensated_blocks}/{total_8x8_blocks} 个8x8块采用, {motion_rejected_count} 个因效果不明显被拒绝")
 
     return motion_candidates
 
@@ -469,6 +552,12 @@ class MotionCompensationStats:
         self.total_8x8_blocks_compensated = 0
         self.motion_compensation_ratio = 0.0
         
+        # 运动补偿效果统计
+        self.motion_rejected_count = 0  # 因效果不明显被拒绝的运动补偿数量
+        self.motion_rejection_ratio = 0.0  # 拒绝率
+        self.early_skip_count = 0  # 因块本身就很好而跳过搜索的数量
+        self.early_skip_ratio = 0.0  # 早期跳过率
+        
         # 运动向量统计
         self.motion_vector_distribution = defaultdict(int)  # 按(dx, dy)统计
         self.motion_magnitude_histogram = defaultdict(int)  # 按幅度统计
@@ -531,9 +620,15 @@ class MotionCompensationStats:
         """计算最终统计数据"""
         if self.total_8x8_blocks_evaluated > 0:
             self.motion_compensation_ratio = self.total_8x8_blocks_compensated / self.total_8x8_blocks_evaluated
+            self.early_skip_ratio = self.early_skip_count / self.total_8x8_blocks_evaluated
         
         if self.total_8x8_blocks_compensated > 0:
             self.average_blocks_saved_per_compensation = self.total_2x2_blocks_saved / self.total_8x8_blocks_compensated
+        
+        # 计算运动补偿拒绝率
+        total_motion_attempts = self.total_8x8_blocks_compensated + self.motion_rejected_count
+        if total_motion_attempts > 0:
+            self.motion_rejection_ratio = self.motion_rejected_count / total_motion_attempts
         
         # 计算合并效率
         if self.blocks_before_merge > 0:
@@ -560,6 +655,10 @@ class MotionCompensationStats:
                 'total_8x8_evaluated': self.total_8x8_blocks_evaluated,
                 'total_8x8_compensated': self.total_8x8_blocks_compensated,
                 'motion_compensation_ratio': self.motion_compensation_ratio,
+                'motion_rejected_count': self.motion_rejected_count,
+                'motion_rejection_ratio': self.motion_rejection_ratio,
+                'early_skip_count': self.early_skip_count,
+                'early_skip_ratio': self.early_skip_ratio,
                 'total_2x2_blocks_saved': self.total_2x2_blocks_saved,
                 'average_blocks_saved_per_compensation': self.average_blocks_saved_per_compensation
             },
