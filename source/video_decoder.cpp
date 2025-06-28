@@ -216,20 +216,23 @@ IWRAM_CODE void VideoDecoder::convert_yuv_to_rgb555_codebook(const YUV_Struct* y
         RGB555_Struct& rgb555 = rgb555_codebook[i];
         
         auto lookup_table = clip_lookup_table_raw + 1024;
+        s8 cb = yuv.cb;
+        s8 cr = yuv.cr;
+        int d_r = (cr << 1);
+        int d_g = (cb >> 1) + cr;
+        int d_b = (cb << 1);
         // 转换2x2块的每个像素
         for(int y = 0; y < 2; y++) {
             for(int x = 0; x < 2; x++) {
                 u8 y_val = yuv.y[y][x];
-                s8 cb = yuv.cb;
-                s8 cr = yuv.cr;
                 
-                // 使用您的快速YUV到RGB转换矩阵：
+                // 使用快速YUV到RGB转换矩阵：
                 // R = Y + (Cr << 1)
                 // G = Y - (Cb >> 1) - Cr  
                 // B = Y + (Cb << 1)
-                u16 r = lookup_table[y_val + (cr << 1)];
-                u16 g = lookup_table[y_val - (cb >> 1) - cr];
-                u16 b = lookup_table[y_val + (cb << 1)];
+                u16 r = lookup_table[y_val + d_r];
+                u16 g = lookup_table[y_val - d_g];
+                u16 b = lookup_table[y_val + d_b];
                 
                 rgb555.rgb[y][x] = r | (g << 5) | (b << 10);
             }

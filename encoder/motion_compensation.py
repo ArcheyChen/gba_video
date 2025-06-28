@@ -141,44 +141,44 @@ def hierarchical_diamond_search(current_blocks: np.ndarray, prev_blocks: np.ndar
                                block_8x8_y: int, block_8x8_x: int, 
                                diff_threshold: float) -> Tuple[Tuple[int, int], float, int]:
     """
-    分层钻石搜索算法
+    完整的分层钻石搜索算法，支持提前剪枝和迭代搜索
     返回: (最佳运动向量(dx, dy), SAD值, 更新块数量)
     """
     # 当前8×8块在2×2块坐标系中的起始位置
     cur_start_y = block_8x8_y * 4
     cur_start_x = block_8x8_x * 4
     
+    # 第一步：检查原始位置(0,0) - 提前剪枝优化
+    zero_mv_sad = calculate_sad_8x8_blocks(current_blocks, prev_blocks,
+                                         cur_start_y, cur_start_x,
+                                         cur_start_y, cur_start_x)
+    zero_mv_updates = count_updated_2x2_blocks_after_motion(
+        current_blocks, prev_blocks, cur_start_y, cur_start_x, 0, 0, diff_threshold
+    )
+    
+    # 提前剪枝：如果原始位置已经很好，直接返回
+    if zero_mv_updates <= 2:  # 如果只有很少块需要更新，不值得运动补偿
+        return (0, 0), zero_mv_sad, zero_mv_updates
+    
     best_mv = (0, 0)
-    best_sad = float('inf')
-    best_updates = 16  # 最坏情况：所有块都需要更新
+    best_sad = zero_mv_sad
     
-    # 第一层：大钻石搜索（步长4）
-    large_diamond = [(0, 4), (4, 0), (0, -4), (-4, 0), (0, 0)]
-    for dx, dy in large_diamond:
-        if abs(dx) <= MOTION_RANGE and abs(dy) <= MOTION_RANGE:
-            ref_start_y = cur_start_y + dy // 2
-            ref_start_x = cur_start_x + dx // 2
-            
-            sad = calculate_sad_8x8_blocks(current_blocks, prev_blocks,
-                                         cur_start_y, cur_start_x,
-                                         ref_start_y, ref_start_x)
-            
-            if sad < best_sad:
-                best_sad = sad
-                best_mv = (dx, dy)
+    # 第一阶段：大钻石搜索（步长4），迭代式
+    search_step = 4
+    center_x, center_y = 0, 0
     
-    # 第二层：小钻石搜索（步长1）
-    center_x, center_y = best_mv
-    small_diamond = [
-        (0, 1), (1, 0), (0, -1), (-1, 0),  # 上下左右
-        (1, 1), (1, -1), (-1, 1), (-1, -1)  # 对角线
-    ]
-    
-    for dx_offset, dy_offset in small_diamond:
-        dx = center_x + dx_offset
-        dy = center_y + dy_offset
+    while search_step >= 2:  # 从步长4降到步长2
+        improved = False
+        large_diamond = [(0, search_step), (search_step, 0), (0, -search_step), (-search_step, 0),(1, 1), (1, -1), (-1, 1), (-1, -1)]
         
-        if abs(dx) <= MOTION_RANGE and abs(dy) <= MOTION_RANGE:
+        for dx_offset, dy_offset in large_diamond:
+            dx = center_x + dx_offset
+            dy = center_y + dy_offset
+            
+            # 边界检查
+            if abs(dx) > MOTION_RANGE or abs(dy) > MOTION_RANGE:
+                continue
+                
             ref_start_y = cur_start_y + dy // 2
             ref_start_x = cur_start_x + dx // 2
             
@@ -189,6 +189,53 @@ def hierarchical_diamond_search(current_blocks: np.ndarray, prev_blocks: np.ndar
             if sad < best_sad:
                 best_sad = sad
                 best_mv = (dx, dy)
+                center_x, center_y = dx, dy
+                improved = True
+        
+        # 如果这一轮没有改进，减小步长
+        if not improved:
+            search_step //= 2
+        # 如果改进了，继续用当前步长搜索
+    
+    # 第二阶段：精细搜索（步长1），迭代式
+    center_x, center_y = best_mv
+    max_iterations = 5  # 防止无限循环
+    iteration = 0
+    
+    while iteration < max_iterations:
+        improved = False
+        iteration += 1
+        
+        # 8方向小钻石
+        small_diamond = [
+            (0, 1), (1, 0), (0, -1), (-1, 0),  # 上下左右
+            (1, 1), (1, -1), (-1, 1), (-1, -1)  # 对角线
+        ]
+        
+        for dx_offset, dy_offset in small_diamond:
+            dx = center_x + dx_offset
+            dy = center_y + dy_offset
+            
+            # 边界检查
+            if abs(dx) > MOTION_RANGE or abs(dy) > MOTION_RANGE:
+                continue
+            
+            ref_start_y = cur_start_y + dy // 2
+            ref_start_x = cur_start_x + dx // 2
+            
+            sad = calculate_sad_8x8_blocks(current_blocks, prev_blocks,
+                                         cur_start_y, cur_start_x,
+                                         ref_start_y, ref_start_x)
+            
+            if sad < best_sad:
+                best_sad = sad
+                best_mv = (dx, dy)
+                center_x, center_y = dx, dy
+                improved = True
+        
+        # 如果这一轮没有改进，说明已经收敛到局部最优
+        if not improved:
+            break
     
     # 计算最佳运动向量下需要更新的块数
     dx, dy = best_mv
@@ -196,31 +243,74 @@ def hierarchical_diamond_search(current_blocks: np.ndarray, prev_blocks: np.ndar
         current_blocks, prev_blocks, cur_start_y, cur_start_x, dx, dy, diff_threshold
     )
     
+    # 第二次剪枝：如果运动补偿效果不明显，回退到零向量
+    zero_mv_benefit = zero_mv_updates - updates_needed
+    if zero_mv_benefit < 4:  # 如果运动补偿节省的块数太少，不值得
+        return (0, 0), zero_mv_sad, zero_mv_updates
+    
     return best_mv, best_sad, updates_needed
 
 def detect_motion_compensation_candidates(current_blocks: np.ndarray, prev_blocks: np.ndarray,
                                         diff_threshold: float, 
                                         update_threshold: int = DEFAULT_UPDATE_THRESHOLD) -> Dict:
     """
-    检测可以进行运动补偿的8×8块
+    检测可以进行运动补偿的8×8块，支持多种剪枝优化
     返回按zone组织的运动补偿候选
     """
     motion_candidates = {}
     total_8x8_blocks = BLOCKS_8X8_WIDTH * BLOCKS_8X8_HEIGHT
+    early_termination_count = 0
+    beneficial_motion_count = 0
     
     # 遍历所有8×8块
     for block_8x8_idx in range(total_8x8_blocks):
         block_8x8_y = block_8x8_idx // BLOCKS_8X8_WIDTH
         block_8x8_x = block_8x8_idx % BLOCKS_8X8_WIDTH
         
+        # 快速预筛选：检查8×8块是否有足够的变化值得搜索
+        cur_start_y = block_8x8_y * 4
+        cur_start_x = block_8x8_x * 4
+        
+        # 计算8×8块的总体差异
+        total_diff = 0.0
+        valid_blocks = 0
+        blocks_h, blocks_w = current_blocks.shape[:2]
+        
+        for dy in range(4):
+            for dx in range(4):
+                cur_y = cur_start_y + dy
+                cur_x = cur_start_x + dx
+                
+                if cur_y < blocks_h and cur_x < blocks_w:
+                    # 计算2×2块的Y分量差异
+                    block_diff = 0.0
+                    for i in range(4):  # Y分量的4个像素
+                        cur_val = float(current_blocks[cur_y, cur_x, i])
+                        prev_val = float(prev_blocks[cur_y, cur_x, i])
+                        block_diff += abs(cur_val - prev_val)
+                    
+                    total_diff += block_diff / 4.0
+                    valid_blocks += 1
+        
+        # 剪枝1：如果整个8×8块变化很小，跳过运动搜索
+        if valid_blocks > 0:
+            avg_diff = total_diff / valid_blocks
+            if avg_diff < diff_threshold * 0.5:  # 阈值的一半
+                early_termination_count += 1
+                continue
+        
         # 进行运动搜索
         best_mv, sad, updates_needed = hierarchical_diamond_search(
             current_blocks, prev_blocks, block_8x8_y, block_8x8_x, diff_threshold
         )
         
-        # 如果更新块数少于阈值且有真实运动（非零向量），标记为候选
+        # 剪枝2：如果更新块数在阈值内且有真实运动，标记为候选
         dx, dy = best_mv
-        if updates_needed <= update_threshold and (dx != 0 or dy != 0):
+        has_motion = (dx != 0 or dy != 0)
+        is_beneficial = updates_needed <= update_threshold
+        
+        if has_motion and is_beneficial:
+            beneficial_motion_count += 1
             zone_idx, zone_relative_idx = get_8x8_block_zone_info(block_8x8_idx)
             
             if zone_idx not in motion_candidates:
@@ -236,11 +326,12 @@ def detect_motion_compensation_candidates(current_blocks: np.ndarray, prev_block
     
     # 更新统计信息
     motion_stats.update_frame_stats(motion_candidates, total_8x8_blocks)
-        # 调试信息
+    
+    # 调试信息（可选）
     # total_compensated_blocks = sum(len(candidates) for candidates in motion_candidates.values())
     # if total_compensated_blocks > 0:
     #     print(f"  运动补偿: {total_compensated_blocks}/{total_8x8_blocks} 个8x8块")
-    
+    #     print(f"  剪枝优化: 提前终止 {early_termination_count} 个块, 有效运动 {beneficial_motion_count} 个块")
 
     return motion_candidates
 
@@ -433,6 +524,11 @@ class MotionCompensationStats:
         self.total_8x8_blocks_compensated = 0
         self.motion_compensation_ratio = 0.0
         
+        # 优化统计
+        self.early_termination_blocks = 0  # 提前剪枝的块数
+        self.zero_vector_selected = 0  # 选择零向量的块数
+        self.beneficial_motion_blocks = 0  # 有效运动块数
+        
         # 运动向量统计
         self.motion_vector_distribution = defaultdict(int)  # 按(dx, dy)统计
         self.motion_magnitude_histogram = defaultdict(int)  # 按幅度统计
@@ -526,6 +622,12 @@ class MotionCompensationStats:
                 'motion_compensation_ratio': self.motion_compensation_ratio,
                 'total_2x2_blocks_saved': self.total_2x2_blocks_saved,
                 'average_blocks_saved_per_compensation': self.average_blocks_saved_per_compensation
+            },
+            'optimization': {
+                'early_termination_blocks': self.early_termination_blocks,
+                'zero_vector_selected': self.zero_vector_selected,
+                'beneficial_motion_blocks': self.beneficial_motion_blocks,
+                'search_efficiency': self.early_termination_blocks / max(1, self.total_8x8_blocks_evaluated)
             },
             'motion_vectors': {
                 'top_vectors': top_motion_vectors,
