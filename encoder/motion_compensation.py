@@ -284,10 +284,83 @@ def apply_motion_compensation_to_blocks(current_blocks: np.ndarray, prev_blocks:
     
     return compensated_blocks
 
+def merge_consecutive_motion_blocks(candidates: List[Dict]) -> List[Dict]:
+    """
+    合并同一zone内运动向量相同且连续的8x8块
+    约束：连续块只能在同一行内，不能跨行
+    返回：合并后的运动补偿条带列表，格式为{'zone_relative_idx': int, 'motion_vector': tuple, 'count': int}
+    """
+    if not candidates:
+        return []
+    
+    # 按zone内相对索引排序
+    sorted_candidates = sorted(candidates, key=lambda x: x['zone_relative_idx'])
+    
+    merged_strips = []
+    current_strip = None
+    
+    for candidate in sorted_candidates:
+        zone_relative_idx = candidate['zone_relative_idx']
+        motion_vector = candidate['motion_vector']
+        
+        # 将zone内相对索引转换为8x8块的全局坐标
+        block_8x8_y, block_8x8_x = candidate['block_8x8_pos']
+        
+        if current_strip is None:
+            # 开始新的条带
+            current_strip = {
+                'zone_relative_idx': zone_relative_idx,
+                'motion_vector': motion_vector,
+                'count': 1,
+                'start_x': block_8x8_x,
+                'start_y': block_8x8_y
+            }
+        else:
+            # 检查是否可以合并到当前条带  
+            can_merge = (
+                motion_vector == current_strip['motion_vector'] and  # 运动向量相同
+                block_8x8_y == current_strip['start_y'] and  # 在同一行
+                block_8x8_x == current_strip['start_x'] + current_strip['count'] and  # 连续
+                block_8x8_x < BLOCKS_8X8_WIDTH  # 当前块不超出行边界
+            )
+            
+            if can_merge:
+                # 合并到当前条带
+                current_strip['count'] += 1
+            else:
+                # 结束当前条带，开始新条带
+                # 移除临时字段
+                strip_data = {
+                    'zone_relative_idx': current_strip['zone_relative_idx'],
+                    'motion_vector': current_strip['motion_vector'],
+                    'count': current_strip['count']
+                }
+                merged_strips.append(strip_data)
+                
+                current_strip = {
+                    'zone_relative_idx': zone_relative_idx,
+                    'motion_vector': motion_vector,
+                    'count': 1,
+                    'start_x': block_8x8_x,
+                    'start_y': block_8x8_y
+                }
+    
+    # 添加最后一个条带
+    if current_strip is not None:
+        strip_data = {
+            'zone_relative_idx': current_strip['zone_relative_idx'],
+            'motion_vector': current_strip['motion_vector'],
+            'count': current_strip['count']
+        }
+        merged_strips.append(strip_data)
+    
+    return merged_strips
+
 def encode_motion_compensation_data(motion_candidates: Dict) -> bytes:
     """
     编码运动补偿数据
     格式：zone_bitmap + 各zone的数据
+    新格式支持连续块合并：u8 offset + u8 motion_vector + u8 count
     """
     data = bytearray()
     
@@ -300,27 +373,46 @@ def encode_motion_compensation_data(motion_candidates: Dict) -> bytes:
     data.append(zone_bitmap)
     
     # 写入各zone的数据
+    total_strips = 0
+    total_blocks_before_merge = 0
+    total_blocks_after_merge = 0
+    
     for zone_idx in range(TOTAL_ZONES):
         if zone_idx in motion_candidates:
             candidates = motion_candidates[zone_idx]
+            total_blocks_before_merge += len(candidates)
             
-            # 写入该zone的运动补偿块数量
-            data.append(len(candidates))
+            # 合并连续的运动补偿块
+            merged_strips = merge_consecutive_motion_blocks(candidates)
+            total_strips += len(merged_strips)
             
-            # 写入每个运动补偿块的数据
-            for candidate in candidates:
+            # 计算合并后的总块数（用于验证）
+            for strip in merged_strips:
+                total_blocks_after_merge += strip['count']
+            
+            # 写入该zone的条带数量
+            data.append(len(merged_strips))
+            
+            # 写入每个条带的数据
+            for strip in merged_strips:
                 # zone内相对索引（u8）
-                data.append(candidate['zone_relative_idx'])
+                data.append(strip['zone_relative_idx'])
                 
                 # 运动向量（u8）
-                dx, dy = candidate['motion_vector']
+                dx, dy = strip['motion_vector']
                 encoded_mv = encode_motion_vector(dx, dy)
                 data.append(encoded_mv)
+                
+                # 连续块数量（u8）
+                data.append(strip['count'])
     
     motion_data = bytes(data)
     
-    # 更新统计信息（暂时不知道总帧大小，后面会在编码器中更新）
+    # 更新统计信息
     motion_stats.motion_data_bytes += len(motion_data)
+    motion_stats.total_strips += total_strips
+    motion_stats.blocks_before_merge += total_blocks_before_merge
+    motion_stats.blocks_after_merge += total_blocks_after_merge
     
     return motion_data
 
@@ -348,6 +440,12 @@ class MotionCompensationStats:
         # 效果统计
         self.total_2x2_blocks_saved = 0  # 通过运动补偿节省的2x2块数
         self.average_blocks_saved_per_compensation = 0.0
+        
+        # 合并统计
+        self.total_strips = 0  # 合并后的条带总数
+        self.blocks_before_merge = 0  # 合并前的块数
+        self.blocks_after_merge = 0  # 合并后的块数（用于验证）
+        self.merge_efficiency = 0.0  # 合并效率：(blocks_before - strips) / blocks_before
         
         # Zone统计
         self.zone_usage_count = defaultdict(int)  # 每个zone被使用的次数
@@ -400,6 +498,10 @@ class MotionCompensationStats:
         
         if self.total_8x8_blocks_compensated > 0:
             self.average_blocks_saved_per_compensation = self.total_2x2_blocks_saved / self.total_8x8_blocks_compensated
+        
+        # 计算合并效率
+        if self.blocks_before_merge > 0:
+            self.merge_efficiency = (self.blocks_before_merge - self.total_strips) / self.blocks_before_merge
     
     def get_stats_dict(self) -> Dict:
         """获取统计信息字典"""
@@ -431,6 +533,12 @@ class MotionCompensationStats:
             },
             'zones': {
                 'usage_count': dict(self.zone_usage_count)
+            },
+            'merging': {
+                'total_strips': self.total_strips,
+                'blocks_before_merge': self.blocks_before_merge,
+                'blocks_after_merge': self.blocks_after_merge,
+                'merge_efficiency': self.merge_efficiency
             },
             'data_size': {
                 'motion_data_bytes': self.motion_data_bytes,

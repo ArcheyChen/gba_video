@@ -277,6 +277,15 @@ class EncodingStats:
         if blocks['total_8x8_compensated'] > 0:
             print(f"   平均每个补偿块节省: {blocks['average_blocks_saved_per_compensation']:.1f} 个2×2块")
         
+        # 合并统计
+        if 'merging' in mc_stats and mc_stats['merging']['blocks_before_merge'] > 0:
+            merging = mc_stats['merging']
+            print(f"\n🔗 连续块合并统计:")
+            print(f"   合并前块数: {merging['blocks_before_merge']:,}")
+            print(f"   合并后条带数: {merging['total_strips']:,}")
+            print(f"   验证块数: {merging['blocks_after_merge']:,}")
+            print(f"   合并效率: {merging['merge_efficiency']*100:.1f}% (减少 {merging['blocks_before_merge'] - merging['total_strips']:,} 个编码单位)")
+        
         # 运动向量统计
         motion_vectors = mc_stats['motion_vectors']
         if motion_vectors['top_vectors']:
@@ -386,6 +395,12 @@ class EncodingStats:
                 'zones': {
                     'usage_count': defaultdict(int)
                 },
+                'merging': {
+                    'total_strips': 0,
+                    'blocks_before_merge': 0,
+                    'blocks_after_merge': 0,
+                    'merge_efficiency': 0.0
+                },
                 'data_size': {
                     'motion_data_bytes': 0,
                     'motion_data_ratio': 0.0
@@ -425,6 +440,13 @@ class EncodingStats:
         for zone_idx, count in zones['usage_count'].items():
             self.motion_compensation_stats['zones']['usage_count'][zone_idx] += count
         
+        # 合并合并统计
+        if 'merging' in motion_stats_dict:
+            merging = motion_stats_dict['merging']
+            self.motion_compensation_stats['merging']['total_strips'] += merging['total_strips']
+            self.motion_compensation_stats['merging']['blocks_before_merge'] += merging['blocks_before_merge']
+            self.motion_compensation_stats['merging']['blocks_after_merge'] += merging['blocks_after_merge']
+        
         # 合并数据大小统计
         data_size = motion_stats_dict['data_size']
         self.motion_compensation_stats['data_size']['motion_data_bytes'] += data_size['motion_data_bytes']
@@ -443,6 +465,12 @@ class EncodingStats:
             blocks['motion_compensation_ratio'] = blocks['total_8x8_compensated'] / blocks['total_8x8_evaluated']
         if blocks['total_8x8_compensated'] > 0:
             blocks['average_blocks_saved_per_compensation'] = blocks['total_2x2_blocks_saved'] / blocks['total_8x8_compensated']
+        
+        # 计算合并效率
+        if 'merging' in self.motion_compensation_stats:
+            merging = self.motion_compensation_stats['merging']
+            if merging['blocks_before_merge'] > 0:
+                merging['merge_efficiency'] = (merging['blocks_before_merge'] - merging['total_strips']) / merging['blocks_before_merge']
         
         # 排序运动向量
         self.motion_compensation_stats['motion_vectors']['top_vectors'].sort(key=lambda x: x[1], reverse=True)
