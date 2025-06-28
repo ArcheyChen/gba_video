@@ -82,9 +82,9 @@ IWRAM_CODE void doit(){
         frame++;
         if(frame >= VIDEO_FRAME_COUNT) {
             frame = 0;
+            sound_stop(); // 重置音频播放
             VideoDecoder::reset_codebook();
             // 视频循环时，音频也应该重新开始
-            sound_play((const u8*)audio_data);
             force_sound_sync = true; // 强制音频同步
         }
         scanKeys();
