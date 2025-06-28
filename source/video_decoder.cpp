@@ -92,14 +92,18 @@ IWRAM_CODE void VideoDecoder::decode_color_block_rgb555(const RGB555_Struct &rgb
 {
     u16* dst_row = dst;
     u16 rgb_raw[8];
-    rgb_raw[0] = rgb555_data.rgb[0][0];  // 颜色1
-    rgb_raw[1] = rgb555_data.rgb[0][0];  
-    rgb_raw[2] = rgb555_data.rgb[0][1];  // 颜色2
-    rgb_raw[3] = rgb555_data.rgb[0][1];
-    rgb_raw[4] = rgb555_data.rgb[1][0];  // 颜色3
-    rgb_raw[5] = rgb555_data.rgb[1][0];
-    rgb_raw[6] = rgb555_data.rgb[1][1];  // 颜色4
-    rgb_raw[7] = rgb555_data.rgb[1][1];
+    u16 color = rgb555_data.rgb[0][0];
+    rgb_raw[0] = color;  // 颜色1
+    rgb_raw[1] = color;  
+    color = rgb555_data.rgb[0][1];
+    rgb_raw[2] = color;  // 颜色2
+    rgb_raw[3] = color;
+    color = rgb555_data.rgb[1][0];
+    rgb_raw[4] = color;  // 颜色3   
+    rgb_raw[5] = color;
+    color = rgb555_data.rgb[1][1];
+    rgb_raw[6] = color;  // 颜色4
+    rgb_raw[7] = color;
 
     // 第一行：1122
     *(u32*)dst_row = *(u32*)&rgb_raw[0];
@@ -213,11 +217,10 @@ IWRAM_CODE void VideoDecoder::copy_unified_codebook(u8* dst_raw, const u8* src, 
 // 将YUV码本转换为RGB555码本
 IWRAM_CODE void VideoDecoder::convert_yuv_to_rgb555_codebook(const YUV_Struct* yuv_codebook, RGB555_Struct* rgb555_codebook, int codebook_size)
 {
+    auto lookup_table = clip_lookup_table_raw + 1024;
     for(int i = 0; i < codebook_size; i++) {
         const YUV_Struct& yuv = yuv_codebook[i];
         RGB555_Struct& rgb555 = rgb555_codebook[i];
-        
-        auto lookup_table = clip_lookup_table_raw + 1024;
         s8 cb = yuv.cb;
         s8 cr = yuv.cr;
         int d_r = (cr << 1);
@@ -246,12 +249,12 @@ IWRAM_CODE void VideoDecoder::decode_normal_4x4_block(u8 &valid_bitmap, BitReade
         for (u8 sub_idx = 0; sub_idx < 4; sub_idx++) {
             if (valid_bitmap & 1) {
                 u8 codebook_idx = reader.read();
-                u16* subblock_dst = big_block_dst;
+                u16* subblock_dst;
                 switch (sub_idx) {
-                    case 0: /* 左上 */ break;
-                    case 1: subblock_dst += 2; break; /* 右上 */
-                    case 2: subblock_dst += SCREEN_WIDTH * 2; break; /* 左下 */
-                    case 3: subblock_dst += SCREEN_WIDTH * 2 + 2; break; /* 右下 */
+                    case 0: subblock_dst = big_block_dst;/* 左上 */  break;
+                    case 1: subblock_dst = big_block_dst + 2; break; /* 右上 */
+                    case 2: subblock_dst = big_block_dst + SCREEN_WIDTH * 2; break; /* 左下 */
+                    case 3: subblock_dst = big_block_dst + SCREEN_WIDTH * 2 + 2; break; /* 右下 */
                 }
                 decode_block_rgb555(codebook[codebook_idx], subblock_dst);
             }
