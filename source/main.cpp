@@ -16,8 +16,17 @@ struct YUV_Struct{
     s8 cr;      // Cr 色度分量 (-128~127)
     u8 y[16];   // Y 亮度分量 (0~255)
 } __attribute__((packed));
-// EWRAM 单缓冲
+// EWRAM 单缓冲和RGB555码表
 EWRAM_BSS u16 ewramBuffer[PIXELS_PER_FRAME];
+
+union RGB555_Struct
+{
+    u16 rgb[4][4];//y,x的访问，因为内存中是这么排布的
+    u16 rgb_array[16];  // 直接访问4x4块的RGB555值
+    u32 rgb_u32[4][2];
+}__attribute__((packed));
+
+EWRAM_BSS RGB555_Struct rgb555_codebook[VIDEO_CODEBOOK_SIZE];  // 预解码的RGB555码表，每个码字16个像素
 
 // 裁切查找表
 IWRAM_DATA static u8 clip_table_raw[1024];
@@ -35,39 +44,54 @@ void init_clip_table(){
         clip_lookup_table[i] = raw_val >> 3;
     }
 }
-// 从码表中解码一个4x4块
-IWRAM_CODE void decode_block_from_codebook(const s8* codeword, u16* dst, int dst_stride)
+
+// 预解码YUV码表到RGB555格式
+IWRAM_CODE void precompute_rgb555_codebook()
 {
-    // 从码字中提取数据：16个Y + 1个Cb + 1个Cr
-    YUV_Struct yuv_data = *(YUV_Struct*)codeword;
-
-    // 计算色度偏移
-    s16 cr = yuv_data.cr;           // Cr 色度分量
-    s16 cb = yuv_data.cb;           // Cb 色度分量
-    s16 d_r = cr << 1;           // 2*Cr
-    s16 d_g = -(cb >> 1) - cr;   // -Cb/2 - Cr
-    s16 d_b = cb << 1;           // 2*Cb
-
-    // 填充4x4块
-    for(int y = 0; y < 4; y++) {
-        u16* row = dst + y * dst_stride;
-        for(int x = 0; x < 4; x++) {
-            u8 luma = yuv_data.y[y * 4 + x];
+    const s8* codebook = video_codebook;
+    
+    for(int codeword_idx = 0; codeword_idx < VIDEO_CODEBOOK_SIZE; codeword_idx++)
+    {
+        const s8* codeword = codebook + codeword_idx * VIDEO_BLOCK_SIZE;
+        YUV_Struct yuv_data = *(YUV_Struct*)codeword;
+        
+        // 计算色度偏移
+        s16 cr = yuv_data.cr;
+        s16 cb = yuv_data.cb;
+        s16 d_r = cr << 1;           // 2*Cr
+        s16 d_g = -(cb >> 1) - cr;   // -Cb/2 - Cr
+        s16 d_b = cb << 1;           // 2*Cb
+        
+        // 预计算4x4块的所有RGB555值
+        RGB555_Struct* rgb555_block = rgb555_codebook + codeword_idx;
+        for(int i = 0; i < 16; i++)
+        {
+            u8 luma = yuv_data.y[i];
             
             s16 r = clip_lookup_table[luma + d_r];
             s16 g = clip_lookup_table[luma + d_g]; 
             s16 b = clip_lookup_table[luma + d_b];
 
-            row[x] = (r) | ((g) << 5) | ((b) << 10);  // RGB555
+            rgb555_block->rgb_array[i] = (r) | ((g) << 5) | ((b) << 10);  // RGB555
         }
+    }
+}
+// 从预解码的RGB555码表中解码一个4x4块
+IWRAM_CODE void decode_block_from_rgb555_codebook(u16 codeword_idx, u16* dst, int dst_stride)
+{
+    const RGB555_Struct* rgb555_block = rgb555_codebook + codeword_idx;
+
+    // 直接复制预解码的RGB555数据
+    for(int y = 0; y < 4; y++) {
+        u16* row = dst + y * dst_stride;
+        ((u32*)(row))[0] = rgb555_block->rgb_u32[y][0]; // 每次复制2个像素
+        ((u32*)(row))[1] = rgb555_block->rgb_u32[y][1]; // 每次复制2个像素
     }
 }
 
 
 IWRAM_CODE void decode_frame(const u16* frame_indices, u16* dst)
 {
-    const s8* codebook = video_codebook;
-    
     int block_idx = 0;
     for (int y = 0; y < SCREEN_HEIGHT; y += 4)
     {
@@ -76,12 +100,9 @@ IWRAM_CODE void decode_frame(const u16* frame_indices, u16* dst)
             // 获取当前块的码字索引
             u16 codeword_idx = frame_indices[block_idx++];
             
-            // 从码表中获取码字 (18个s8值)
-            const s8* codeword = codebook + codeword_idx * VIDEO_BLOCK_SIZE;
-            
-            // 解码4x4块到目标位置
+            // 解码4x4块到目标位置，使用预解码的RGB555码表
             u16* block_dst = dst + y * SCREEN_WIDTH + x;
-            decode_block_from_codebook(codeword, block_dst, SCREEN_WIDTH);
+            decode_block_from_rgb555_codebook(codeword_idx, block_dst, SCREEN_WIDTH);
         }
     }
 }
@@ -102,6 +123,9 @@ int main()
 
     int frame = 0;
     init_clip_table();
+    
+    // 预解码RGB555码表，提升播放性能
+    precompute_rgb555_codebook();
     
     while (1)
     {
