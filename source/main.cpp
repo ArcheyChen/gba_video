@@ -108,7 +108,6 @@ int main()
 
         decode_frame(current_frame_indices, ewramBuffer);
 
-        VBlankIntrWait();
         DMA3COPY(ewramBuffer, VRAM, PIXELS_PER_FRAME | DMA16);
 
         frame++;
@@ -118,5 +117,14 @@ int main()
         }
 
         // 想加暂停 / 退出可自行检测按键
+        scanKeys();
+        u16 keys = keysDown();
+        if (keys & (KEY_START | KEY_A)) {
+            // 暂停功能
+            while (!(keysDown() & (KEY_START | KEY_A))) {
+                scanKeys();
+                VBlankIntrWait();
+            }
+        }
     }
 }
