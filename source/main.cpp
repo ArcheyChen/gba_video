@@ -23,7 +23,7 @@ union RGB555_Struct
 {
     u16 rgb[4][4];//y,x的访问，因为内存中是这么排布的
     u16 rgb_array[16];  // 直接访问4x4块的RGB555值
-    u32 rgb_u32[4][2];
+    u32 rgb_u32[4][2]; //u32访问更快速
 }__attribute__((packed));
 
 EWRAM_BSS RGB555_Struct rgb555_codebook[VIDEO_CODEBOOK_SIZE];  // 预解码的RGB555码表，每个码字16个像素
@@ -48,12 +48,11 @@ void init_clip_table(){
 // 预解码YUV码表到RGB555格式
 IWRAM_CODE void precompute_rgb555_codebook()
 {
-    const s8* codebook = video_codebook;
+    const YUV_Struct* codebook = (YUV_Struct*)video_codebook;
     
     for(int codeword_idx = 0; codeword_idx < VIDEO_CODEBOOK_SIZE; codeword_idx++)
     {
-        const s8* codeword = codebook + codeword_idx * VIDEO_BLOCK_SIZE;
-        YUV_Struct yuv_data = *(YUV_Struct*)codeword;
+        YUV_Struct yuv_data = codebook[codeword_idx];
         
         // 计算色度偏移
         s16 cr = yuv_data.cr;
@@ -79,13 +78,14 @@ IWRAM_CODE void precompute_rgb555_codebook()
 // 从预解码的RGB555码表中解码一个4x4块
 IWRAM_CODE void decode_block_from_rgb555_codebook(u16 codeword_idx, u16* dst, int dst_stride)
 {
-    const RGB555_Struct* rgb555_block = rgb555_codebook + codeword_idx;
+    const RGB555_Struct &rgb555_block = rgb555_codebook[codeword_idx];
 
     // 直接复制预解码的RGB555数据
+    u16* row = dst;
     for(int y = 0; y < 4; y++) {
-        u16* row = dst + y * dst_stride;
-        ((u32*)(row))[0] = rgb555_block->rgb_u32[y][0]; // 每次复制2个像素
-        ((u32*)(row))[1] = rgb555_block->rgb_u32[y][1]; // 每次复制2个像素
+        ((u32*)(row))[0] = rgb555_block.rgb_u32[y][0]; // 每次复制2个像素
+        ((u32*)(row))[1] = rgb555_block.rgb_u32[y][1]; // 每次复制2个像素
+        row += dst_stride;
     }
 }
 
