@@ -11,6 +11,11 @@
 
 constexpr int PIXELS_PER_FRAME = SCREEN_WIDTH * SCREEN_HEIGHT;
 
+struct YUV_Struct{
+    s16 cb;     // Cb 色度分量
+    s16 cr;     // Cr 色度分量
+    u16 y[16];
+} __attribute__((packed));
 // EWRAM 单缓冲
 EWRAM_BSS u16 ewramBuffer[PIXELS_PER_FRAME];
 
@@ -34,23 +39,20 @@ void init_clip_table(){
 IWRAM_CODE void decode_block_from_codebook(const s16* codeword, u16* dst, int dst_stride)
 {
     // 从码字中提取数据：16个Y + 1个Cb + 1个Cr
-    u8 Y[16];
-    for(int i = 0; i < 16; i++) {
-        Y[i] = static_cast<u8>(codeword[i]);
-    }
-    s8 Cb = static_cast<s8>(codeword[16]);
-    s8 Cr = static_cast<s8>(codeword[17]);
+    YUV_Struct yuv_data = *(YUV_Struct*)codeword;
 
     // 计算色度偏移
-    s16 d_r = Cr << 1;           // 2*Cr
-    s16 d_g = -(Cb >> 1) - Cr;   // -Cb/2 - Cr
-    s16 d_b = Cb << 1;           // 2*Cb
+    s16 cr = yuv_data.cr;           // Cr 色度分量
+    s16 cb = yuv_data.cb;           // Cb 色度分量
+    s16 d_r = cr << 1;           // 2*Cr
+    s16 d_g = -(cb >> 1) - cr;   // -Cb/2 - Cr
+    s16 d_b = cb << 1;           // 2*Cb
 
     // 填充4x4块
     for(int y = 0; y < 4; y++) {
         u16* row = dst + y * dst_stride;
         for(int x = 0; x < 4; x++) {
-            u8 luma = Y[y * 4 + x];
+            u8 luma = yuv_data.y[y * 4 + x];
             
             s16 r = clip_lookup_table[luma + d_r];
             s16 g = clip_lookup_table[luma + d_g]; 

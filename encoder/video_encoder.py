@@ -115,9 +115,9 @@ def yuv444_to_yuv9_jit(yuv444_block):
     
     # 返回YUV9格式：16Y + 1Cb + 1Cr
     result = np.zeros(18, dtype=np.int16)
-    result[:16] = y_values.astype(np.int16)  # Y值直接复制
-    result[16] = np.int16(cb_avg)            # Cb已减去128偏移
-    result[17] = np.int16(cr_avg)            # Cr已减去128偏移
+    result[0] = np.int16(cb_avg)            # Cb已减去128偏移
+    result[1] = np.int16(cr_avg)            # Cr已减去128偏移
+    result[2:18] = y_values.astype(np.int16)  # Y值直接复制
     
     return result
 
