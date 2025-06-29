@@ -205,8 +205,8 @@ def write_header(path_h: pathlib.Path, frame_cnt: int):
             #define VIDEO_BLOCKS_PER_FRAME {BLOCKS_PER_FRAME}
             #define VIDEO_BLOCK_SIZE      18
 
-            /* 码表：512 * 18 字节 (16Y + Cb + Cr) */
-            extern const signed short video_codebook[VIDEO_CODEBOOK_SIZE * VIDEO_BLOCK_SIZE];
+            /* 码表：1024 * 18 字节 (16Y + Cb + Cr) */
+            extern const signed char video_codebook[VIDEO_CODEBOOK_SIZE * VIDEO_BLOCK_SIZE];
 
             /* I帧数据：每帧 2400 个 u16 索引 */
             extern const unsigned short video_frame_indices[VIDEO_FRAME_COUNT * VIDEO_BLOCKS_PER_FRAME];
@@ -219,7 +219,7 @@ def write_source(path_c: pathlib.Path, codebook_yuv444: np.ndarray, all_frame_in
         f.write('#include "video_data.h"\n\n')
         
         # 将YUV444码表转换为YUV9格式后写入
-        f.write("const signed short video_codebook[] = {\n")
+        f.write("const signed char video_codebook[] = {\n")
         for i, codeword_yuv444 in enumerate(codebook_yuv444):
             # 将YUV444码字转换为YUV9格式
             # 注意：这里会将Cb/Cr从uint8(0-255)转换为int8(-128~127)
@@ -227,11 +227,16 @@ def write_source(path_c: pathlib.Path, codebook_yuv444: np.ndarray, all_frame_in
             
             line = "    "
             for j, val in enumerate(codeword_yuv9):
+                # 确保Cb/Cr在int8范围内，Y在uint8范围内
+                if j < 2:  # Cb, Cr
+                    val = max(-128, min(127, int(val)))
+                else:  # Y values
+                    val = max(0, min(255, int(val)))
                 line += f"{val:4d}"
                 if j < len(codeword_yuv9) - 1:
                     line += ","
             line += ","
-            f.write(line + f"  /* 码字 {i}: Y[0-15]={codeword_yuv9[0]}-{codeword_yuv9[15]}, Cb={codeword_yuv9[16]}, Cr={codeword_yuv9[17]} */\n")
+            f.write(line + f"  /* 码字 {i}: Cb={codeword_yuv9[0]}, Cr={codeword_yuv9[1]}, Y[0-15]={codeword_yuv9[2]}-{codeword_yuv9[17]} */\n")
         f.write("};\n\n")
         
         # 写帧索引数据

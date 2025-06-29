@@ -12,9 +12,9 @@
 constexpr int PIXELS_PER_FRAME = SCREEN_WIDTH * SCREEN_HEIGHT;
 
 struct YUV_Struct{
-    s16 cb;     // Cb 色度分量
-    s16 cr;     // Cr 色度分量
-    u16 y[16];
+    s8 cb;      // Cb 色度分量 (-128~127)
+    s8 cr;      // Cr 色度分量 (-128~127)
+    u8 y[16];   // Y 亮度分量 (0~255)
 } __attribute__((packed));
 // EWRAM 单缓冲
 EWRAM_BSS u16 ewramBuffer[PIXELS_PER_FRAME];
@@ -36,7 +36,7 @@ void init_clip_table(){
     }
 }
 // 从码表中解码一个4x4块
-IWRAM_CODE void decode_block_from_codebook(const s16* codeword, u16* dst, int dst_stride)
+IWRAM_CODE void decode_block_from_codebook(const s8* codeword, u16* dst, int dst_stride)
 {
     // 从码字中提取数据：16个Y + 1个Cb + 1个Cr
     YUV_Struct yuv_data = *(YUV_Struct*)codeword;
@@ -66,7 +66,7 @@ IWRAM_CODE void decode_block_from_codebook(const s16* codeword, u16* dst, int ds
 
 IWRAM_CODE void decode_frame(const u16* frame_indices, u16* dst)
 {
-    const s16* codebook = video_codebook;
+    const s8* codebook = video_codebook;
     
     int block_idx = 0;
     for (int y = 0; y < SCREEN_HEIGHT; y += 4)
@@ -76,8 +76,8 @@ IWRAM_CODE void decode_frame(const u16* frame_indices, u16* dst)
             // 获取当前块的码字索引
             u16 codeword_idx = frame_indices[block_idx++];
             
-            // 从码表中获取码字 (18个s16值)
-            const s16* codeword = codebook + codeword_idx * VIDEO_BLOCK_SIZE;
+            // 从码表中获取码字 (18个s8值)
+            const s8* codeword = codebook + codeword_idx * VIDEO_BLOCK_SIZE;
             
             // 解码4x4块到目标位置
             u16* block_dst = dst + y * SCREEN_WIDTH + x;
