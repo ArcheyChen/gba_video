@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 
 import argparse, cv2, numpy as np, pathlib, textwrap
-from sklearn.cluster import KMeans
+from sklearn.cluster import KMeans,MiniBatchKMeans
+from sklearnex import patch_sklearn
+patch_sklearn()         # 只有这一句是新的
 from numba import jit, prange
 
 WIDTH, HEIGHT = 240, 160
-CODEBOOK_SIZE = 1024
-BLOCK_W, BLOCK_H = 4, 4
-PIXELS_PER_BLOCK = BLOCK_W * BLOCK_H  # 16
-BLOCKS_PER_FRAME = (WIDTH // BLOCK_W) * (HEIGHT // BLOCK_H)  # 60 * 40 = 2400
+CODEBOOK_SIZE = 256
+BLOCK_W, BLOCK_H = 4, 2
+PIXELS_PER_BLOCK = BLOCK_W * BLOCK_H  # 8
+BLOCKS_PER_FRAME = (WIDTH // BLOCK_W) * (HEIGHT // BLOCK_H)  # 60 * 80 = 4800
 
 # YUV转换系数（保持原来的）
 Y_COEFF  = np.array([0.28571429,  0.57142857,  0.14285714])
@@ -35,8 +37,8 @@ def extract_blocks_from_yuv(Y, Cb, Cr, height, width, block_h, block_w):
     num_blocks_x = width // block_w
     total_blocks = num_blocks_y * num_blocks_x
     
-    # 48 = 16Y + 16Cb + 16Cr，全部使用uint8
-    blocks = np.zeros((total_blocks, 48), dtype=np.uint8)
+    # 24 = 8Y + 8Cb + 8Cr，全部使用uint8
+    blocks = np.zeros((total_blocks, 24), dtype=np.uint8)
     
     block_idx = 0
     for by in range(num_blocks_y):
@@ -44,20 +46,20 @@ def extract_blocks_from_yuv(Y, Cb, Cr, height, width, block_h, block_w):
             y_start = by * block_h
             x_start = bx * block_w
             
-            # 提取16个Y值
+            # 提取8个Y值
             for py in range(block_h):
                 for px in range(block_w):
                     blocks[block_idx, py * block_w + px] = Y[y_start + py, x_start + px]
             
-            # 提取16个Cb值 (已加128偏移，范围0-255)
+            # 提取8个Cb值 (已加128偏移，范围0-255)
             for py in range(block_h):
                 for px in range(block_w):
-                    blocks[block_idx, 16 + py * block_w + px] = Cb[y_start + py, x_start + px]
+                    blocks[block_idx, 8 + py * block_w + px] = Cb[y_start + py, x_start + px]
             
-            # 提取16个Cr值 (已加128偏移，范围0-255)
+            # 提取8个Cr值 (已加128偏移，范围0-255)
             for py in range(block_h):
                 for px in range(block_w):
-                    blocks[block_idx, 32 + py * block_w + px] = Cr[y_start + py, x_start + px]
+                    blocks[block_idx, 16 + py * block_w + px] = Cr[y_start + py, x_start + px]
             
             block_idx += 1
     
@@ -65,8 +67,8 @@ def extract_blocks_from_yuv(Y, Cb, Cr, height, width, block_h, block_w):
 
 def extract_yuv444_blocks(frame_bgr: np.ndarray) -> np.ndarray:
     """
-    把 240×160×3 BGR 转换为 YUV444 4×4 块
-    返回 (num_blocks, 48) 的数组，每行是一个块的数据：16Y + 16Cb + 16Cr
+    把 240×160×3 BGR 转换为 YUV444 4×2 块
+    返回 (num_blocks, 24) 的数组，每行是一个块的数据：8Y + 8Cb + 8Cr
     内部统一使用uint8格式：Y: 0-255, Cb/Cr: 0-255 (已加128偏移)
     """
     B = frame_bgr[:, :, 0].astype(np.float32)
@@ -94,9 +96,9 @@ def yuv444_to_yuv9_jit(yuv444_block):
     输出：YUV9格式，Y: 0-255, Cb/Cr: -128~127 (已减去128偏移)
     """
     # 提取YUV444数据
-    y_values = yuv444_block[:16]  # 16个Y值保持不变
-    cb_values = yuv444_block[16:32].astype(np.float32)  # 16个Cb值 (0-255)
-    cr_values = yuv444_block[32:48].astype(np.float32)  # 16个Cr值 (0-255)
+    y_values = yuv444_block[:8]  # 8个Y值保持不变
+    cb_values = yuv444_block[8:16].astype(np.float32)  # 8个Cb值 (0-255)
+    cr_values = yuv444_block[16:24].astype(np.float32)  # 8个Cr值 (0-255)
     
     # 计算Cb和Cr的平均值，然后减去128偏移
     cb_avg = np.round(np.mean(cb_values)) - 128  # 转回 -128~127 范围
@@ -113,17 +115,17 @@ def yuv444_to_yuv9_jit(yuv444_block):
     elif cr_avg > 127:
         cr_avg = 127
     
-    # 返回YUV9格式：16Y + 1Cb + 1Cr
-    result = np.zeros(18, dtype=np.int16)
+    # 返回YUV9格式：8Y + 1Cb + 1Cr
+    result = np.zeros(10, dtype=np.int16)
     result[0] = np.int16(cb_avg)            # Cb已减去128偏移
     result[1] = np.int16(cr_avg)            # Cr已减去128偏移
-    result[2:18] = y_values.astype(np.int16)  # Y值直接复制
+    result[2:10] = y_values.astype(np.int16)  # Y值直接复制
     
     return result
 
 def yuv444_to_yuv9(yuv444_block: np.ndarray) -> np.ndarray:
     """
-    将YUV444块(16Y + 16Cb + 16Cr = 48字节)转换为YUV9格式(16Y + 1Cb + 1Cr = 18字节)
+    将YUV444块(8Y + 8Cb + 8Cr = 24字节)转换为YUV9格式(8Y + 1Cb + 1Cr = 10字节)
     输入：YUV444块，所有分量都是uint8 (Cb/Cr含128偏移: 0-255)
     输出：YUV9格式，Y: 0-255, Cb/Cr: -128~127 (已减去128偏移)
     """
@@ -138,14 +140,22 @@ def generate_codebook(all_blocks: np.ndarray) -> np.ndarray:
     
     # 预热JIT函数
     print("预热JIT编译器...")
-    dummy_blocks = np.random.randint(0, 255, (100, 48), dtype=np.uint8)
-    dummy_codebook = np.random.randint(0, 255, (10, 48), dtype=np.uint8).astype(np.float32)
+    dummy_blocks = np.random.randint(0, 255, (100, 24), dtype=np.uint8)
+    dummy_codebook = np.random.randint(0, 255, (10, 24), dtype=np.uint8).astype(np.float32)
     _ = compute_distances_jit(dummy_blocks, dummy_codebook)
     
     # 使用K-means聚类
     print("开始K-means聚类...")
-    kmeans = KMeans(n_clusters=CODEBOOK_SIZE, random_state=42, n_init=10, max_iter=300, verbose=0)
-    kmeans.fit(all_blocks.astype(np.float32))
+    train_data = all_blocks.astype(np.float32)
+    warm = MiniBatchKMeans(n_clusters=CODEBOOK_SIZE, random_state=42, n_init=20, max_iter=300, verbose=0).fit(train_data)
+    print("MinibatchKMeans预热完成")
+    kmeans = KMeans(
+        n_clusters=CODEBOOK_SIZE,
+        init=warm.cluster_centers_,
+        n_init=1,
+        max_iter=100
+    ).fit(train_data)
+
     
     # 码表就是聚类中心，转换回原来的数据类型
     codebook = kmeans.cluster_centers_
@@ -171,7 +181,7 @@ def compute_distances_jit(blocks, codebook):
         
         for j in range(num_codewords):
             dist = 0.0
-            for k in range(48):  # YUV444块有48个元素
+            for k in range(24):  # YUV444块有24个元素
                 diff = float(blocks[i, k]) - float(codebook[j, k])
                 dist += diff * diff
             
@@ -203,12 +213,12 @@ def write_header(path_h: pathlib.Path, frame_cnt: int):
             #define VIDEO_HEIGHT          {HEIGHT}
             #define VIDEO_CODEBOOK_SIZE   {CODEBOOK_SIZE}
             #define VIDEO_BLOCKS_PER_FRAME {BLOCKS_PER_FRAME}
-            #define VIDEO_BLOCK_SIZE      18
+            #define VIDEO_BLOCK_SIZE      10
 
-            /* 码表：1024 * 18 字节 (16Y + Cb + Cr) */
+            /* 码表：256 * 10 字节 (8Y + Cb + Cr) */
             extern const signed char video_codebook[VIDEO_CODEBOOK_SIZE * VIDEO_BLOCK_SIZE];
 
-            /* I帧数据：每帧 2400 个 u16 索引 */
+            /* I帧数据：每帧 4800 个 u16 索引 */
             extern const unsigned short video_frame_indices[VIDEO_FRAME_COUNT * VIDEO_BLOCKS_PER_FRAME];
 
             #endif /* {guard} */
@@ -236,7 +246,7 @@ def write_source(path_c: pathlib.Path, codebook_yuv444: np.ndarray, all_frame_in
                 if j < len(codeword_yuv9) - 1:
                     line += ","
             line += ","
-            f.write(line + f"  /* 码字 {i}: Cb={codeword_yuv9[0]}, Cr={codeword_yuv9[1]}, Y[0-15]={codeword_yuv9[2]}-{codeword_yuv9[17]} */\n")
+            f.write(line + f"  /* 码字 {i}: Cb={codeword_yuv9[0]}, Cr={codeword_yuv9[1]}, Y[0-7]={codeword_yuv9[2]}-{codeword_yuv9[9]} */\n")
         f.write("};\n\n")
         
         # 写帧索引数据
