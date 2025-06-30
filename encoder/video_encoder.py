@@ -7,10 +7,15 @@ patch_sklearn()         # 只有这一句是新的
 from numba import jit, prange
 
 WIDTH, HEIGHT = 240, 160
-CODEBOOK_SIZE = 256
+CODEBOOK_SIZE = 512
 BLOCK_W, BLOCK_H = 4, 2
 PIXELS_PER_BLOCK = BLOCK_W * BLOCK_H  # 8
 BLOCKS_PER_FRAME = (WIDTH // BLOCK_W) * (HEIGHT // BLOCK_H)  # 60 * 80 = 4800
+
+# IP帧编码参数
+GOP_SIZE = 30  # GOP大小，每30帧一个I帧
+I_FRAME_WEIGHT = 3  # I帧块的权重（用于K-means训练）
+DIFF_THRESHOLD = 100  # 块差异阈值，超过此值认为块需要更新
 
 # YUV转换系数（保持原来的）
 Y_COEFF  = np.array([0.28571429,  0.57142857,  0.14285714])
@@ -131,22 +136,38 @@ def yuv444_to_yuv9(yuv444_block: np.ndarray) -> np.ndarray:
     """
     return yuv444_to_yuv9_jit(yuv444_block)
 
-def generate_codebook(all_blocks: np.ndarray) -> np.ndarray:
+def generate_codebook_for_gop(i_frame_blocks: np.ndarray, p_frame_blocks_list: list, i_frame_weight: int = I_FRAME_WEIGHT) -> np.ndarray:
     """
-    使用K-means对所有YUV444块进行聚类，生成码表
-    输入：YUV444块，所有分量都是uint8 (Cb/Cr含128偏移: 0-255)
+    为一个GOP生成码表，I帧块有额外权重
+    输入：
+    - i_frame_blocks: I帧的所有块 (BLOCKS_PER_FRAME, 24)
+    - p_frame_blocks_list: P帧的变化块列表，每个元素是 (frame_idx, changed_blocks)
+    - i_frame_weight: I帧块的权重
     """
-    print(f"生成码表中...从 {len(all_blocks)} 个块中聚类出 {CODEBOOK_SIZE} 个码字")
+    print(f"为GOP生成码表...I帧块数: {len(i_frame_blocks)}, P帧变化块总数: {sum(len(blocks) for _, blocks in p_frame_blocks_list)}")
     
-    # 预热JIT函数
-    print("预热JIT编译器...")
-    dummy_blocks = np.random.randint(0, 255, (100, 24), dtype=np.uint8)
-    dummy_codebook = np.random.randint(0, 255, (10, 24), dtype=np.uint8).astype(np.float32)
-    _ = compute_distances_jit(dummy_blocks, dummy_codebook)
+    # 收集所有用于训练的块
+    training_blocks = []
+    
+    # 添加I帧块（带权重）
+    for _ in range(i_frame_weight):
+        training_blocks.append(i_frame_blocks)
+    
+    # 添加P帧的变化块
+    for frame_idx, changed_blocks in p_frame_blocks_list:
+        if len(changed_blocks) > 0:
+            training_blocks.append(changed_blocks)
+    
+    if not training_blocks:
+        raise ValueError("没有足够的块用于生成码表")
+    
+    all_training_blocks = np.vstack(training_blocks)
+    print(f"总训练块数: {len(all_training_blocks)} (I帧权重x{i_frame_weight})")
+    
     
     # 使用K-means聚类
     print("开始K-means聚类...")
-    train_data = all_blocks.astype(np.float32)
+    train_data = all_training_blocks.astype(np.float32)
     warm = MiniBatchKMeans(n_clusters=CODEBOOK_SIZE, random_state=42, n_init=20, max_iter=300, verbose=0).fit(train_data)
     print("MinibatchKMeans预热完成")
     kmeans = KMeans(
@@ -155,12 +176,11 @@ def generate_codebook(all_blocks: np.ndarray) -> np.ndarray:
         n_init=1,
         max_iter=100
     ).fit(train_data)
-
     
-    # 码表就是聚类中心，转换回原来的数据类型
+    # 码表就是聚类中心
     codebook = kmeans.cluster_centers_
     
-    # 确保所有值在uint8范围内 (0-255)
+    # 确保所有值在uint8范围内
     codebook = np.clip(codebook, 0, 255)
     
     return codebook.round().astype(np.uint8)
@@ -201,69 +221,147 @@ def encode_frame_with_codebook(blocks: np.ndarray, codebook: np.ndarray) -> np.n
     indices = compute_distances_jit(blocks, codebook.astype(np.float32))
     return indices
 
-def write_header(path_h: pathlib.Path, frame_cnt: int):
+def write_header(path_h: pathlib.Path, total_frames: int, gop_count: int, gop_size: int):
     guard = "VIDEO_DATA_H"
     with path_h.open("w", encoding="utf-8") as f:
         f.write(textwrap.dedent(f"""\
             #ifndef {guard}
             #define {guard}
 
-            #define VIDEO_FRAME_COUNT     {frame_cnt}
+            #define VIDEO_FRAME_COUNT     {total_frames}
             #define VIDEO_WIDTH           {WIDTH}
             #define VIDEO_HEIGHT          {HEIGHT}
             #define VIDEO_CODEBOOK_SIZE   {CODEBOOK_SIZE}
             #define VIDEO_BLOCKS_PER_FRAME {BLOCKS_PER_FRAME}
             #define VIDEO_BLOCK_SIZE      10
+            #define VIDEO_GOP_SIZE        {gop_size}
+            #define VIDEO_GOP_COUNT       {gop_count}
 
-            /* 码表：256 * 10 字节 (8Y + Cb + Cr) */
-            extern const signed char video_codebook[VIDEO_CODEBOOK_SIZE * VIDEO_BLOCK_SIZE];
+            /* 每个GOP的码表：GOP_COUNT * CODEBOOK_SIZE * BLOCK_SIZE 字节 */
+            extern const signed char video_codebooks[VIDEO_GOP_COUNT][VIDEO_CODEBOOK_SIZE][VIDEO_BLOCK_SIZE];
 
-            /* I帧数据：每帧 4800 个 u16 索引 */
-            extern const unsigned short video_frame_indices[VIDEO_FRAME_COUNT * VIDEO_BLOCKS_PER_FRAME];
+            /* 帧数据：变长编码的块索引 */
+            extern const unsigned short video_frame_data[];
+
+            /* 帧起始位置：每帧在frame_data中的起始偏移 */
+            extern const unsigned int video_frame_offsets[VIDEO_FRAME_COUNT + 1];
+
+            /* 帧类型：0=I帧，1=P帧 */
+            extern const unsigned char video_frame_types[VIDEO_FRAME_COUNT];
 
             #endif /* {guard} */
             """))
 
-def write_source(path_c: pathlib.Path, codebook_yuv444: np.ndarray, all_frame_indices: np.ndarray):
+def write_source(path_c: pathlib.Path, gop_codebooks: list, encoded_frames: list, frame_offsets: list, frame_types: list):
     with path_c.open("w", encoding="utf-8") as f:
         f.write('#include "video_data.h"\n\n')
         
-        # 将YUV444码表转换为YUV9格式后写入
-        f.write("const signed char video_codebook[] = {\n")
-        for i, codeword_yuv444 in enumerate(codebook_yuv444):
-            # 将YUV444码字转换为YUV9格式
-            # 注意：这里会将Cb/Cr从uint8(0-255)转换为int8(-128~127)
-            codeword_yuv9 = yuv444_to_yuv9(codeword_yuv444)
-            
-            line = "    "
-            for j, val in enumerate(codeword_yuv9):
-                # 确保Cb/Cr在int8范围内，Y在uint8范围内
-                if j < 2:  # Cb, Cr
-                    val = max(-128, min(127, int(val)))
-                else:  # Y values
-                    val = max(0, min(255, int(val)))
-                line += f"{val:4d}"
-                if j < len(codeword_yuv9) - 1:
+        # 写入所有GOP的码表
+        f.write("const signed char video_codebooks[][VIDEO_CODEBOOK_SIZE][VIDEO_BLOCK_SIZE] = {\n")
+        for gop_idx, codebook_yuv444 in enumerate(gop_codebooks):
+            f.write(f"    {{ // GOP {gop_idx}\n")
+            for i, codeword_yuv444 in enumerate(codebook_yuv444):
+                # 将YUV444码字转换为YUV9格式
+                codeword_yuv9 = yuv444_to_yuv9(codeword_yuv444)
+                
+                line = "        {"
+                for j, val in enumerate(codeword_yuv9):
+                    # 确保Cb/Cr在int8范围内，Y在uint8范围内
+                    if j < 2:  # Cb, Cr
+                        val = max(-128, min(127, int(val)))
+                    else:  # Y values
+                        val = max(0, min(255, int(val)))
+                    line += f"{val:4d}"
+                    if j < len(codeword_yuv9) - 1:
+                        line += ","
+                line += "}"
+                if i < len(codebook_yuv444) - 1:
                     line += ","
-            line += ","
-            f.write(line + f"  /* 码字 {i}: Cb={codeword_yuv9[0]}, Cr={codeword_yuv9[1]}, Y[0-7]={codeword_yuv9[2]}-{codeword_yuv9[9]} */\n")
+                f.write(line + f"  /* 码字 {i} */\n")
+            f.write("    }")
+            if gop_idx < len(gop_codebooks) - 1:
+                f.write(",")
+            f.write("\n")
         f.write("};\n\n")
         
-        # 写帧索引数据
-        f.write("const unsigned short video_frame_indices[] = {\n")
+        # 写入帧数据（变长编码）
+        f.write("const unsigned short video_frame_data[] = {\n")
+        all_data = []
+        for frame_data in encoded_frames:
+            all_data.extend(frame_data)
+        
         per_line = 16
-        for i in range(0, len(all_frame_indices), per_line):
-            chunk = ', '.join(f"{idx:3d}" for idx in all_frame_indices[i:i+per_line])
+        for i in range(0, len(all_data), per_line):
+            chunk = ', '.join(f"{val:5d}" for val in all_data[i:i+per_line])
+            f.write("    " + chunk + ",\n")
+        f.write("};\n\n")
+        
+        # 写入帧偏移表
+        f.write("const unsigned int video_frame_offsets[] = {\n")
+        per_line = 8
+        for i in range(0, len(frame_offsets), per_line):
+            chunk = ', '.join(f"{offset:8d}" for offset in frame_offsets[i:i+per_line])
+            f.write("    " + chunk + ",\n")
+        f.write("};\n\n")
+        
+        # 写入帧类型表
+        f.write("const unsigned char video_frame_types[] = {\n")
+        per_line = 32
+        for i in range(0, len(frame_types), per_line):
+            chunk = ', '.join(f"{ftype}" for ftype in frame_types[i:i+per_line])
             f.write("    " + chunk + ",\n")
         f.write("};\n")
 
+@jit(nopython=True, cache=True)
+def calculate_block_difference(block1, block2):
+    """
+    计算两个YUV444块之间的差异
+    使用平方差之和作为差异度量
+    """
+    diff = 0.0
+    for i in range(24):  # YUV444块有24个元素
+        d = float(block1[i]) - float(block2[i])
+        diff += d * d
+    return diff
+
+@jit(nopython=True, cache=True)
+def find_changed_blocks(current_blocks, previous_blocks, threshold):
+    """
+    找出相对于前一帧发生变化的块
+    返回变化块的索引数组
+    """
+    num_blocks = current_blocks.shape[0]
+    # 预分配最大可能大小的数组
+    temp_indices = np.zeros(num_blocks, dtype=np.int32)
+    count = 0
+    
+    for i in range(num_blocks):
+        diff = calculate_block_difference(current_blocks[i], previous_blocks[i])
+        if diff > threshold:
+            temp_indices[count] = i
+            count += 1
+    
+    # 返回实际大小的数组
+    if count > 0:
+        return temp_indices[:count].copy()
+    else:
+        return np.zeros(0, dtype=np.int32)
+
 def main():
-    pa = argparse.ArgumentParser(description="Encode to GBA I-Frame with Codebook")
+    pa = argparse.ArgumentParser(description="Encode to GBA IP-Frame with Codebook")
     pa.add_argument("input")
     pa.add_argument("--duration", type=float, default=5.0)
     pa.add_argument("--fps",      type=int,   default=30)
+    pa.add_argument("--gop-size", type=int,   default=30, help="GOP大小")
+    pa.add_argument("--i-weight", type=int,   default=3, help="I帧权重")
+    pa.add_argument("--diff-threshold", type=float, default=100, help="P帧块差异阈值")
     pa.add_argument("--out", default="video_data")
     args = pa.parse_args()
+
+    # 使用局部变量而不是修改全局变量
+    gop_size = args.gop_size
+    i_frame_weight = args.i_weight
+    diff_threshold = args.diff_threshold
 
     cap = cv2.VideoCapture(args.input)
     if not cap.isOpened():
@@ -273,10 +371,9 @@ def main():
     every = int(round(src_fps / args.fps))
     grab_max = int(args.duration * src_fps)
 
-    all_blocks = []  # 收集所有帧的所有块用于聚类
-    frame_blocks_list = []  # 保存每帧的块数据
-    
+    # 读取所有帧
     print("读取视频帧...")
+    all_frame_blocks = []
     idx = 0
     while idx < grab_max:
         ret, frm = cap.read()
@@ -285,36 +382,99 @@ def main():
         if idx % every == 0:
             frm = cv2.resize(frm, (WIDTH, HEIGHT), cv2.INTER_AREA)
             blocks = extract_yuv444_blocks(frm)
-            frame_blocks_list.append(blocks)
-            all_blocks.append(blocks)
+            all_frame_blocks.append(blocks)
         idx += 1
     cap.release()
 
-    if not frame_blocks_list:
+    if not all_frame_blocks:
         raise SystemExit("❌ 没有任何帧被采样")
 
-    # 合并所有块用于K-means聚类
-    all_blocks = np.vstack(all_blocks)
-    print(f"总共收集了 {len(all_blocks)} 个块")
-    
-    # 生成码表
-    codebook = generate_codebook(all_blocks)
-    
-    # 对每帧进行编码
-    print("编码帧...")
-    all_frame_indices = []
-    for i, frame_blocks in enumerate(frame_blocks_list):
-        indices = encode_frame_with_codebook(frame_blocks, codebook)
-        all_frame_indices.extend(indices)
-        if (i + 1) % 10 == 0:
-            print(f"已编码 {i + 1}/{len(frame_blocks_list)} 帧")
-    
-    all_frame_indices = np.array(all_frame_indices, dtype=np.uint16)
+    total_frames = len(all_frame_blocks)
+    gop_count = (total_frames + gop_size - 1) // gop_size
+    print(f"总帧数: {total_frames}, GOP数量: {gop_count}, GOP大小: {gop_size}")
 
-    write_header(pathlib.Path(args.out).with_suffix(".h"), len(frame_blocks_list))
-    write_source(pathlib.Path(args.out).with_suffix(".c"), codebook, all_frame_indices)
+    # 为每个GOP生成编码数据
+    gop_codebooks = []
+    encoded_frames = []
+    frame_offsets = [0]  # 第一帧从0开始
+    frame_types = []
+    current_offset = 0
 
-    print(f"✅ 完成：{len(frame_blocks_list)} 帧, 码表大小 {CODEBOOK_SIZE}, 每帧 {BLOCKS_PER_FRAME} 个块")
+    for gop_idx in range(gop_count):
+        print(f"\n处理GOP {gop_idx + 1}/{gop_count}")
+        
+        # 确定当前GOP的帧范围
+        start_frame = gop_idx * gop_size
+        end_frame = min((gop_idx + 1) * gop_size, total_frames)
+        gop_frames = all_frame_blocks[start_frame:end_frame]
+        
+        # 第一帧是I帧
+        i_frame_blocks = gop_frames[0]
+        
+        # 分析P帧的变化块
+        p_frame_blocks_list = []
+        for frame_idx in range(1, len(gop_frames)):
+            current_blocks = gop_frames[frame_idx]
+            previous_blocks = gop_frames[frame_idx - 1]
+            
+            # 使用numba函数找出变化的块
+            changed_indices = find_changed_blocks(current_blocks, previous_blocks, diff_threshold)
+            if len(changed_indices) > 0:
+                changed_blocks = current_blocks[changed_indices]
+                p_frame_blocks_list.append((frame_idx, changed_blocks))
+                # print(f"  P帧 {frame_idx}: {len(changed_indices)} 个块发生变化")
+            else:
+                p_frame_blocks_list.append((frame_idx, np.array([], dtype=np.uint8).reshape(0, 24)))
+                # print(f"  P帧 {frame_idx}: 无变化")
+        
+        # 为当前GOP生成码表
+        gop_codebook = generate_codebook_for_gop(i_frame_blocks, p_frame_blocks_list, i_frame_weight)
+        gop_codebooks.append(gop_codebook)
+        
+        # 编码当前GOP的所有帧
+        for frame_idx, frame_blocks in enumerate(gop_frames):
+            global_frame_idx = start_frame + frame_idx
+            
+            if frame_idx == 0:  # I帧
+                # I帧编码所有块
+                indices = encode_frame_with_codebook(frame_blocks, gop_codebook)
+                frame_data = [BLOCKS_PER_FRAME] + indices.tolist()  # 前缀块数量
+                frame_types.append(0)  # I帧
+                print(f"  I帧 {global_frame_idx}: {BLOCKS_PER_FRAME} 个块")
+            else:  # P帧
+                # P帧只编码变化的块
+                previous_blocks = gop_frames[frame_idx - 1]
+                changed_indices = find_changed_blocks(frame_blocks, previous_blocks, diff_threshold)
+                
+                if len(changed_indices) > 0:
+                    changed_blocks = frame_blocks[changed_indices]
+                    block_indices = encode_frame_with_codebook(changed_blocks, gop_codebook)
+                    
+                    # P帧格式: [块数量, 位置1, 码字1, 位置2, 码字2, ...]
+                    frame_data = [len(changed_indices)]
+                    for pos, code in zip(changed_indices, block_indices):
+                        frame_data.extend([pos, code])
+                else:
+                    # 无变化的P帧
+                    frame_data = [0]
+                
+                frame_types.append(1)  # P帧
+                # print(f"  P帧 {global_frame_idx}: {len(changed_indices) if len(changed_indices) > 0 else 0} 个块变化")
+            
+            encoded_frames.append(frame_data)
+            current_offset += len(frame_data)
+            frame_offsets.append(current_offset)
+
+    # 移除最后一个多余的偏移
+    frame_offsets = frame_offsets[:-1]
+
+    # 写入文件
+    write_header(pathlib.Path(args.out).with_suffix(".h"), total_frames, gop_count, gop_size)
+    write_source(pathlib.Path(args.out).with_suffix(".c"), gop_codebooks, encoded_frames, frame_offsets, frame_types)
+
+    total_data_size = sum(len(frame_data) for frame_data in encoded_frames)
+    print(f"\n✅ 完成：{total_frames} 帧, {gop_count} 个GOP, 总数据大小: {total_data_size} 个u16")
+    print(f"I帧权重: {i_frame_weight}, 差异阈值: {diff_threshold}")
 
 if __name__ == "__main__":
     main()
