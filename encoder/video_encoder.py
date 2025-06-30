@@ -7,7 +7,7 @@ patch_sklearn()         # 只有这一句是新的
 from numba import jit, prange
 
 WIDTH, HEIGHT = 240, 160
-CODEBOOK_SIZE = 512
+CODEBOOK_SIZE = 1024
 BLOCK_W, BLOCK_H = 4, 2
 PIXELS_PER_BLOCK = BLOCK_W * BLOCK_H  # 8
 BLOCKS_PER_FRAME = (WIDTH // BLOCK_W) * (HEIGHT // BLOCK_H)  # 60 * 80 = 4800
@@ -472,9 +472,116 @@ def main():
     write_header(pathlib.Path(args.out).with_suffix(".h"), total_frames, gop_count, gop_size)
     write_source(pathlib.Path(args.out).with_suffix(".c"), gop_codebooks, encoded_frames, frame_offsets, frame_types)
 
+    # 详细统计信息
+    print("\n" + "="*60)
+    print("📊 编码统计信息")
+    print("="*60)
+    
+    # 基本信息
     total_data_size = sum(len(frame_data) for frame_data in encoded_frames)
-    print(f"\n✅ 完成：{total_frames} 帧, {gop_count} 个GOP, 总数据大小: {total_data_size} 个u16")
-    print(f"I帧权重: {i_frame_weight}, 差异阈值: {diff_threshold}")
+    i_frame_count = sum(1 for ft in frame_types if ft == 0)
+    p_frame_count = sum(1 for ft in frame_types if ft == 1)
+    
+    print(f"总帧数: {total_frames}")
+    print(f"  - I帧: {i_frame_count} 帧")
+    print(f"  - P帧: {p_frame_count} 帧")
+    print(f"GOP数量: {gop_count}, GOP大小: {gop_size}")
+    print(f"块尺寸: {BLOCK_W}×{BLOCK_H}, 每帧块数: {BLOCKS_PER_FRAME}")
+    print(f"码表大小: {CODEBOOK_SIZE}")
+    
+    # 计算各部分大小
+    # 1. 码表大小
+    codebook_size_bytes = gop_count * CODEBOOK_SIZE * 10  # 每个码字10字节
+    
+    # 2. 帧数据大小
+    frame_data_size_bytes = total_data_size * 2  # 每个u16是2字节
+    
+    # 3. 偏移表大小
+    offsets_size_bytes = len(frame_offsets) * 4  # 每个u32是4字节
+    
+    # 4. 帧类型表大小
+    frame_types_size_bytes = len(frame_types) * 1  # 每个u8是1字节
+    
+    # 5. I帧和P帧数据分析
+    i_frame_data_size = 0
+    p_frame_data_size = 0
+    
+    for i, (frame_data, frame_type) in enumerate(zip(encoded_frames, frame_types)):
+        if frame_type == 0:  # I帧
+            i_frame_data_size += len(frame_data)
+        else:  # P帧
+            p_frame_data_size += len(frame_data)
+    
+    i_frame_data_bytes = i_frame_data_size * 2
+    p_frame_data_bytes = p_frame_data_size * 2
+    
+    # 总文件大小
+    total_file_size = codebook_size_bytes + frame_data_size_bytes + offsets_size_bytes + frame_types_size_bytes
+    
+    print("\n💾 内存使用分析:")
+    print(f"码表数据: {codebook_size_bytes:,} 字节 ({codebook_size_bytes/1024:.1f} KB)")
+    print(f"  - {gop_count} 个GOP × {CODEBOOK_SIZE} 码字 × 10 字节")
+    print(f"帧数据: {frame_data_size_bytes:,} 字节 ({frame_data_size_bytes/1024:.1f} KB)")
+    print(f"  - I帧数据: {i_frame_data_bytes:,} 字节 ({i_frame_data_bytes/1024:.1f} KB)")
+    print(f"  - P帧数据: {p_frame_data_bytes:,} 字节 ({p_frame_data_bytes/1024:.1f} KB)")
+    print(f"偏移表: {offsets_size_bytes:,} 字节 ({offsets_size_bytes/1024:.1f} KB)")
+    print(f"帧类型表: {frame_types_size_bytes:,} 字节 ({frame_types_size_bytes/1024:.1f} KB)")
+    print(f"总计: {total_file_size:,} 字节 ({total_file_size/1024:.1f} KB)")
+    
+    # 百分比分析
+    print(f"\n📈 占比分析:")
+    print(f"码表占比: {codebook_size_bytes/total_file_size*100:.1f}%")
+    print(f"I帧占比: {i_frame_data_bytes/total_file_size*100:.1f}%")
+    print(f"P帧占比: {p_frame_data_bytes/total_file_size*100:.1f}%")
+    print(f"元数据占比: {(offsets_size_bytes+frame_types_size_bytes)/total_file_size*100:.1f}%")
+    
+    # 压缩效率分析
+    raw_frame_size = WIDTH * HEIGHT * 2  # RGB555每像素2字节
+    raw_video_size = raw_frame_size * total_frames
+    compression_ratio = raw_video_size / total_file_size
+    
+    print(f"\n🗜️ 压缩效率:")
+    print(f"原始视频大小: {raw_video_size:,} 字节 ({raw_video_size/1024/1024:.1f} MB)")
+    print(f"压缩后大小: {total_file_size:,} 字节 ({total_file_size/1024:.1f} KB)")
+    print(f"压缩比: {compression_ratio:.1f}:1")
+    print(f"压缩率: {(1-total_file_size/raw_video_size)*100:.1f}%")
+    
+    # 平均帧大小分析
+    avg_i_frame_size = i_frame_data_bytes / i_frame_count if i_frame_count > 0 else 0
+    avg_p_frame_size = p_frame_data_bytes / p_frame_count if p_frame_count > 0 else 0
+    
+    print(f"\n📏 帧大小分析:")
+    print(f"平均I帧大小: {avg_i_frame_size:.0f} 字节")
+    print(f"平均P帧大小: {avg_p_frame_size:.0f} 字节")
+    if avg_i_frame_size > 0 and avg_p_frame_size > 0:
+        print(f"P帧相对I帧大小: {avg_p_frame_size/avg_i_frame_size*100:.1f}%")
+    
+    # P帧变化统计
+    total_changed_blocks = 0
+    max_changed_blocks = 0
+    min_changed_blocks = float('inf')
+    p_frames_with_changes = 0
+    
+    for i, (frame_data, frame_type) in enumerate(zip(encoded_frames, frame_types)):
+        if frame_type == 1:  # P帧
+            changed_count = frame_data[0] if len(frame_data) > 0 else 0
+            if changed_count > 0:
+                p_frames_with_changes += 1
+                total_changed_blocks += changed_count
+                max_changed_blocks = max(max_changed_blocks, changed_count)
+                min_changed_blocks = min(min_changed_blocks, changed_count)
+    
+    if p_frames_with_changes > 0:
+        avg_changed_blocks = total_changed_blocks / p_frames_with_changes
+        print(f"\n🔄 P帧变化分析:")
+        print(f"有变化的P帧: {p_frames_with_changes}/{p_frame_count} ({p_frames_with_changes/p_frame_count*100:.1f}%)")
+        print(f"平均变化块数: {avg_changed_blocks:.1f}")
+        print(f"最大变化块数: {max_changed_blocks}")
+        print(f"最小变化块数: {min_changed_blocks if min_changed_blocks != float('inf') else 0}")
+        print(f"平均变化率: {avg_changed_blocks/BLOCKS_PER_FRAME*100:.1f}%")
+    
+    print(f"\n参数设置: I帧权重={i_frame_weight}, 差异阈值={diff_threshold}")
+    print("="*60)
 
 if __name__ == "__main__":
     main()
