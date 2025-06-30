@@ -28,6 +28,9 @@ union RGB555_Struct
 
 EWRAM_BSS RGB555_Struct rgb555_codebook[VIDEO_CODEBOOK_SIZE];  // 当前GOP的预解码RGB555码表，每个码字8个像素
 
+// 块位置到内存偏移的查找表
+EWRAM_DATA static u32 block_offset_table[VIDEO_BLOCKS_PER_FRAME];
+
 // 裁切查找表
 IWRAM_DATA static u8 clip_table_raw[1024];
 u8* clip_lookup_table = clip_table_raw + 256;
@@ -42,6 +45,17 @@ void init_clip_table(){
         else
             raw_val = static_cast<u8>(i);
         clip_lookup_table[i] = raw_val >> 3;
+    }
+}
+
+// 预计算块位置到内存偏移的查找表
+void init_block_offset_table(){
+    int block_pos = 0;
+    for (int y = 0; y < SCREEN_HEIGHT; y += 2) {
+        for (int x = 0; x < SCREEN_WIDTH; x += 4) {
+            block_offset_table[block_pos] = y * SCREEN_WIDTH + x;
+            block_pos++;
+        }
     }
 }
 
@@ -96,18 +110,14 @@ IWRAM_CODE void decode_i_frame(const u16* frame_data, u16* dst)
     u16 block_count = frame_data[0];
     const u16* indices = frame_data + 1;
     
-    int block_idx = 0;
-    for (int y = 0; y < SCREEN_HEIGHT; y += 2)
+    for (int block_pos = 0; block_pos < VIDEO_BLOCKS_PER_FRAME; block_pos++)
     {
-        for (int x = 0; x < SCREEN_WIDTH; x += 4)
-        {
-            // 获取当前块的码字索引
-            u16 codeword_idx = indices[block_idx++];
-            
-            // 解码4x2块到目标位置
-            u16* block_dst = dst + y * SCREEN_WIDTH + x;
-            decode_block_from_rgb555_codebook(codeword_idx, block_dst, SCREEN_WIDTH);
-        }
+        // 获取当前块的码字索引
+        u16 codeword_idx = indices[block_pos];
+        
+        // 使用查找表直接获取目标地址
+        u16* block_dst = dst + block_offset_table[block_pos];
+        decode_block_from_rgb555_codebook(codeword_idx, block_dst, SCREEN_WIDTH);
     }
 }
 
@@ -119,15 +129,11 @@ IWRAM_CODE void decode_p_frame(const u16* frame_data, u16* dst)
     
     for (int i = 0; i < changed_block_count; i++)
     {
-        u16 block_pos = data[i * 2];     // 块位置（线性索引）
-        u16 codeword_idx = data[i * 2 + 1]; // 码字索引
+        u16 block_pos = data[i * 2];         // 块位置（线性索引）
+        u16 codeword_idx = data[i * 2 + 1];  // 码字索引
         
-        // 将线性块位置转换为2D坐标
-        int block_y = (block_pos / (SCREEN_WIDTH / 4)) * 2;  // 每行60个块，每块高度2
-        int block_x = (block_pos % (SCREEN_WIDTH / 4)) * 4;  // 每块宽度4
-        
-        // 解码4x2块到目标位置
-        u16* block_dst = dst + block_y * SCREEN_WIDTH + block_x;
+        // 使用查找表直接获取目标地址，避免乘除法
+        u16* block_dst = dst + block_offset_table[block_pos];
         decode_block_from_rgb555_codebook(codeword_idx, block_dst, SCREEN_WIDTH);
     }
 }
@@ -148,6 +154,7 @@ int main()
     int current_gop = -1;  // 当前GOP索引
     
     init_clip_table();
+    init_block_offset_table();  // 初始化块位置查找表
     
     while (1)
     {
