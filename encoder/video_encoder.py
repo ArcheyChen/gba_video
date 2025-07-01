@@ -7,7 +7,7 @@ patch_sklearn()         # 只有这一句是新的
 from numba import jit, prange
 
 WIDTH, HEIGHT = 240, 160
-CODEBOOK_SIZE = 1024
+CODEBOOK_SIZE = 2048
 BLOCK_W, BLOCK_H = 4, 2
 PIXELS_PER_BLOCK = BLOCK_W * BLOCK_H  # 8
 BLOCKS_PER_FRAME = (WIDTH // BLOCK_W) * (HEIGHT // BLOCK_H)  # 60 * 80 = 4800
@@ -17,7 +17,7 @@ GOP_SIZE = 30  # GOP大小，每30帧一个I帧
 I_FRAME_WEIGHT = 3  # I帧块的权重（用于K-means训练）
 DIFF_THRESHOLD = 100  # 块差异阈值，超过此值认为块需要更新
 
-# YUV转换系数（保持原来的）
+# YUV转换系数（用于内部聚类）
 Y_COEFF  = np.array([0.28571429,  0.57142857,  0.14285714])
 CB_COEFF = np.array([-0.14285714, -0.28571429,  0.42857143])
 CR_COEFF = np.array([ 0.35714286, -0.28571429, -0.07142857])
@@ -27,9 +27,9 @@ def convert_bgr_to_yuv(B, G, R):
     """
     使用JIT加速的BGR到YUV转换
     """
-    Y  = (R*0.28571429  + G*0.57142857  + B*0.14285714)
-    Cb = (R*(-0.14285714) + G*(-0.28571429) + B*0.42857143)
-    Cr = (R*0.35714286 + G*(-0.28571429) + B*(-0.07142857))
+    Y  = 0.299 * R + 0.587 * G + 0.114 * B
+    Cb = -0.168736 * R - 0.331264 * G + 0.5 * B
+    Cr = 0.5 * R - 0.418688 * G - 0.081312 * B
     return Y, Cb, Cr
 
 @jit(nopython=True, cache=True)
@@ -94,47 +94,52 @@ def extract_yuv444_blocks(frame_bgr: np.ndarray) -> np.ndarray:
     return blocks
 
 @jit(nopython=True, cache=True)
-def yuv444_to_yuv9_jit(yuv444_block):
+def yuv444_to_bgr555_jit(yuv444_block):
     """
-    使用JIT加速的YUV444到YUV9转换
+    将YUV444块直接转换为BGR555格式
     输入：YUV444块，Y: 0-255, Cb/Cr: 0-255 (含128偏移)
-    输出：YUV9格式，Y: 0-255, Cb/Cr: -128~127 (已减去128偏移)
+    输出：8个BGR555值，每个用uint16表示
     """
     # 提取YUV444数据
-    y_values = yuv444_block[:8]  # 8个Y值保持不变
-    cb_values = yuv444_block[8:16].astype(np.float32)  # 8个Cb值 (0-255)
-    cr_values = yuv444_block[16:24].astype(np.float32)  # 8个Cr值 (0-255)
+    y_values = yuv444_block[:8].astype(np.float32)
+    cb_values = yuv444_block[8:16].astype(np.float32) - 128  # 减去偏移，范围-128~127
+    cr_values = yuv444_block[16:24].astype(np.float32) - 128  # 减去偏移，范围-128~127
     
-    # 计算Cb和Cr的平均值，然后减去128偏移
-    cb_avg = np.round(np.mean(cb_values)) - 128  # 转回 -128~127 范围
-    cr_avg = np.round(np.mean(cr_values)) - 128  # 转回 -128~127 范围
+    # BGR555结果
+    bgr555_values = np.zeros(8, dtype=np.uint16)
     
-    # 手动实现clip功能，确保范围正确
-    if cb_avg < -128:
-        cb_avg = -128
-    elif cb_avg > 127:
-        cb_avg = 127
+    for i in range(8):
+        Y = y_values[i]
+        Cb = cb_values[i]
+        Cr = cr_values[i]
+        
+        # YUV到RGB转换
+        R = Y + 1.402 * Cr
+        G = Y - 0.344136 * Cb - 0.714136 * Cr
+        B = Y + 1.772 * Cb
+        
+        # 裁剪到0-255范围
+        R = max(0.0, min(255.0, R))
+        G = max(0.0, min(255.0, G))
+        B = max(0.0, min(255.0, B))
+        
+        # 转换到5位精度 (0-31)
+        R5 = int(R * 31 / 255)
+        G5 = int(G * 31 / 255)
+        B5 = int(B * 31 / 255)
+        
+        # 打包为BGR555格式: BBBBBGGGGGRRRRR (15位)
+        bgr555_values[i] = (B5 << 10) | (G5 << 5) | R5
     
-    if cr_avg < -128:
-        cr_avg = -128
-    elif cr_avg > 127:
-        cr_avg = 127
-    
-    # 返回YUV9格式：8Y + 1Cb + 1Cr
-    result = np.zeros(10, dtype=np.int16)
-    result[0] = np.int16(cb_avg)            # Cb已减去128偏移
-    result[1] = np.int16(cr_avg)            # Cr已减去128偏移
-    result[2:10] = y_values.astype(np.int16)  # Y值直接复制
-    
-    return result
+    return bgr555_values
 
-def yuv444_to_yuv9(yuv444_block: np.ndarray) -> np.ndarray:
+def yuv444_to_bgr555(yuv444_block: np.ndarray) -> np.ndarray:
     """
-    将YUV444块(8Y + 8Cb + 8Cr = 24字节)转换为YUV9格式(8Y + 1Cb + 1Cr = 10字节)
-    输入：YUV444块，所有分量都是uint8 (Cb/Cr含128偏移: 0-255)
-    输出：YUV9格式，Y: 0-255, Cb/Cr: -128~127 (已减去128偏移)
+    将YUV444块转换为BGR555格式
+    输入：YUV444块 (24字节)
+    输出：BGR555格式 (8个uint16值)
     """
-    return yuv444_to_yuv9_jit(yuv444_block)
+    return yuv444_to_bgr555_jit(yuv444_block)
 
 def generate_codebook_for_gop(i_frame_blocks: np.ndarray, p_frame_blocks_list: list, i_frame_weight: int = I_FRAME_WEIGHT) -> np.ndarray:
     """
@@ -233,12 +238,12 @@ def write_header(path_h: pathlib.Path, total_frames: int, gop_count: int, gop_si
             #define VIDEO_HEIGHT          {HEIGHT}
             #define VIDEO_CODEBOOK_SIZE   {CODEBOOK_SIZE}
             #define VIDEO_BLOCKS_PER_FRAME {BLOCKS_PER_FRAME}
-            #define VIDEO_BLOCK_SIZE      10
+            #define VIDEO_BLOCK_SIZE      8
             #define VIDEO_GOP_SIZE        {gop_size}
             #define VIDEO_GOP_COUNT       {gop_count}
 
-            /* 每个GOP的码表：GOP_COUNT * CODEBOOK_SIZE * BLOCK_SIZE 字节 */
-            extern const signed char video_codebooks[VIDEO_GOP_COUNT][VIDEO_CODEBOOK_SIZE][VIDEO_BLOCK_SIZE];
+            /* 每个GOP的码表：GOP_COUNT * CODEBOOK_SIZE * BLOCK_SIZE 个uint16 */
+            extern const unsigned short video_codebooks[VIDEO_GOP_COUNT][VIDEO_CODEBOOK_SIZE][VIDEO_BLOCK_SIZE];
 
             /* 帧数据：变长编码的块索引 */
             extern const unsigned short video_frame_data[];
@@ -256,23 +261,18 @@ def write_source(path_c: pathlib.Path, gop_codebooks: list, encoded_frames: list
     with path_c.open("w", encoding="utf-8") as f:
         f.write('#include "video_data.h"\n\n')
         
-        # 写入所有GOP的码表
-        f.write("const signed char video_codebooks[][VIDEO_CODEBOOK_SIZE][VIDEO_BLOCK_SIZE] = {\n")
+        # 写入所有GOP的码表（BGR555格式）
+        f.write("const unsigned short video_codebooks[][VIDEO_CODEBOOK_SIZE][VIDEO_BLOCK_SIZE] = {\n")
         for gop_idx, codebook_yuv444 in enumerate(gop_codebooks):
             f.write(f"    {{ // GOP {gop_idx}\n")
             for i, codeword_yuv444 in enumerate(codebook_yuv444):
-                # 将YUV444码字转换为YUV9格式
-                codeword_yuv9 = yuv444_to_yuv9(codeword_yuv444)
+                # 将YUV444码字转换为BGR555格式
+                codeword_bgr555 = yuv444_to_bgr555(codeword_yuv444)
                 
                 line = "        {"
-                for j, val in enumerate(codeword_yuv9):
-                    # 确保Cb/Cr在int8范围内，Y在uint8范围内
-                    if j < 2:  # Cb, Cr
-                        val = max(-128, min(127, int(val)))
-                    else:  # Y values
-                        val = max(0, min(255, int(val)))
-                    line += f"{val:4d}"
-                    if j < len(codeword_yuv9) - 1:
+                for j, val in enumerate(codeword_bgr555):
+                    line += f"0x{val:04X}"
+                    if j < len(codeword_bgr555) - 1:
                         line += ","
                 line += "}"
                 if i < len(codebook_yuv444) - 1:
@@ -352,7 +352,7 @@ def main():
     pa.add_argument("input")
     pa.add_argument("--duration", type=float, default=5.0)
     pa.add_argument("--fps",      type=int,   default=30)
-    pa.add_argument("--gop-size", type=int,   default=30, help="GOP大小")
+    pa.add_argument("--gop-size", type=int,   default=60, help="GOP大小")
     pa.add_argument("--i-weight", type=int,   default=3, help="I帧权重")
     pa.add_argument("--diff-threshold", type=float, default=100, help="P帧块差异阈值")
     pa.add_argument("--out", default="video_data")
@@ -491,7 +491,7 @@ def main():
     
     # 计算各部分大小
     # 1. 码表大小
-    codebook_size_bytes = gop_count * CODEBOOK_SIZE * 10  # 每个码字10字节
+    codebook_size_bytes = gop_count * CODEBOOK_SIZE * 8 * 2  # 每个码字8个uint16，每个uint16是2字节
     
     # 2. 帧数据大小
     frame_data_size_bytes = total_data_size * 2  # 每个u16是2字节
@@ -520,7 +520,7 @@ def main():
     
     print("\n💾 内存使用分析:")
     print(f"码表数据: {codebook_size_bytes:,} 字节 ({codebook_size_bytes/1024:.1f} KB)")
-    print(f"  - {gop_count} 个GOP × {CODEBOOK_SIZE} 码字 × 10 字节")
+    print(f"  - {gop_count} 个GOP × {CODEBOOK_SIZE} 码字 × 8 像素 × 2 字节(BGR555)")
     print(f"帧数据: {frame_data_size_bytes:,} 字节 ({frame_data_size_bytes/1024:.1f} KB)")
     print(f"  - I帧数据: {i_frame_data_bytes:,} 字节 ({i_frame_data_bytes/1024:.1f} KB)")
     print(f"  - P帧数据: {p_frame_data_bytes:,} 字节 ({p_frame_data_bytes/1024:.1f} KB)")
