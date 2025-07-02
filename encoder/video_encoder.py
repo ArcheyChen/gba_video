@@ -17,23 +17,30 @@ from numba import jit, prange
 WIDTH, HEIGHT = 240, 160
 
 # 多级码表配置（默认值，将被命令行参数覆盖）
+DEFAULT_CODEBOOK_SIZE_8x4 = 64     # 8x4块码表大小
 DEFAULT_CODEBOOK_SIZE_4x4 = 128     # 4x4块码表大小
 DEFAULT_CODEBOOK_SIZE_4x2 = 512     # 4x2块码表大小
-DEFAULT_COVERAGE_RADIUS = 80.0      # 4x4块覆盖半径
+DEFAULT_COVERAGE_RADIUS_8x4 = 120.0 # 8x4块覆盖半径
+DEFAULT_COVERAGE_RADIUS_4x4 = 80.0  # 4x4块覆盖半径
 
 # 块尺寸定义
+BLOCK_8x4_W, BLOCK_8x4_H = 8, 4   # 8x4块
 BLOCK_4x4_W, BLOCK_4x4_H = 4, 4   # 4x4块
 BLOCK_4x2_W, BLOCK_4x2_H = 4, 2   # 4x2块
 
+PIXELS_PER_8x4_BLOCK = BLOCK_8x4_W * BLOCK_8x4_H  # 32
 PIXELS_PER_4x4_BLOCK = BLOCK_4x4_W * BLOCK_4x4_H  # 16
 PIXELS_PER_4x2_BLOCK = BLOCK_4x2_W * BLOCK_4x2_H  # 8
 
+# 8x4块数量（用于I帧主编码）
+BLOCKS_8x4_PER_FRAME = (WIDTH // BLOCK_8x4_W) * (HEIGHT // BLOCK_8x4_H)  # 30 * 40 = 1200
 # 4x4块数量（用于I帧主编码）
 BLOCKS_4x4_PER_FRAME = (WIDTH // BLOCK_4x4_W) * (HEIGHT // BLOCK_4x4_H)  # 60 * 40 = 2400
 # 4x2块数量（用于细分编码）
 BLOCKS_4x2_PER_FRAME = (WIDTH // BLOCK_4x2_W) * (HEIGHT // BLOCK_4x2_H)  # 60 * 80 = 4800
 
 # 特殊标记
+MARKER_8x4_BLOCK = 0xFFFE  # 标记这是8x4块的索引
 MARKER_4x4_BLOCK = 0xFFFF  # 标记这是4x4块的索引
 
 # IP帧编码参数
@@ -117,7 +124,28 @@ def extract_yuv444_blocks_4x2(frame_bgr: np.ndarray) -> np.ndarray:
     
     return blocks
 
-def extract_yuv444_blocks_4x4(frame_bgr: np.ndarray) -> np.ndarray:
+def extract_yuv444_blocks_8x4(frame_bgr: np.ndarray) -> np.ndarray:
+    """
+    把 240×160×3 BGR 转换为 YUV444 8×4 块
+    返回 (num_blocks, 96) 的数组，每行是一个块的数据：32Y + 32Cb + 32Cr
+    内部统一使用uint8格式：Y: 0-255, Cb/Cr: 0-255 (已加128偏移)
+    """
+    B = frame_bgr[:, :, 0].astype(np.float32)
+    G = frame_bgr[:, :, 1].astype(np.float32)
+    R = frame_bgr[:, :, 2].astype(np.float32)
+
+    # 使用JIT加速的转换函数
+    Y, Cb, Cr = convert_bgr_to_yuv(B, G, R)
+    
+    # 量化和裁剪，注意Cb/Cr加128偏移变为uint8
+    Y  = np.clip(np.round(Y), 0, 255).astype(np.uint8)
+    Cb = np.clip(np.round(Cb + 128), 0, 255).astype(np.uint8)  # 加128偏移：-128~127 -> 0~255
+    Cr = np.clip(np.round(Cr + 128), 0, 255).astype(np.uint8)  # 加128偏移：-128~127 -> 0~255
+
+    # 使用JIT加速的块提取，8x4块需要96维数据
+    blocks = extract_blocks_from_yuv_8x4(Y, Cb, Cr, HEIGHT, WIDTH, BLOCK_8x4_H, BLOCK_8x4_W)
+    
+    return blocks
     """
     把 240×160×3 BGR 转换为 YUV444 4×4 块
     返回 (num_blocks, 48) 的数组，每行是一个块的数据：16Y + 16Cb + 16Cr
@@ -236,14 +264,230 @@ def yuv444_to_bgr555_4x4(yuv444_block: np.ndarray) -> np.ndarray:
     """
     return yuv444_to_bgr555_4x4_jit(yuv444_block)
 
+@jit(nopython=True, cache=True)
+def yuv444_to_bgr555_8x4_jit(yuv444_block):
+    """
+    将8x4 YUV444块直接转换为BGR555格式
+    输入：YUV444块，Y: 0-255, Cb/Cr: 0-255 (含128偏移)，96字节
+    输出：32个BGR555值，每个用uint16表示
+    """
+    # 提取YUV444数据
+    y_values = yuv444_block[:32].astype(np.float32)
+    cb_values = yuv444_block[32:64].astype(np.float32) - 128  # 减去偏移，范围-128~127
+    cr_values = yuv444_block[64:96].astype(np.float32) - 128  # 减去偏移，范围-128~127
+    
+    # BGR555结果
+    bgr555_values = np.zeros(32, dtype=np.uint16)
+    
+    for i in range(32):
+        y = y_values[i]
+        cb = cb_values[i]
+        cr = cr_values[i]
+        
+        # YUV到RGB转换
+        R = y + 1.402 * cr
+        G = y - 0.344136 * cb - 0.714136 * cr
+        B = y + 1.772 * cb
+        
+        # 限制在[0, 255]范围内
+        R = max(0, min(255, R))
+        G = max(0, min(255, G))
+        B = max(0, min(255, B))
+        
+        # 转换为5位精度
+        R5 = int(R * 31 / 255)
+        G5 = int(G * 31 / 255)
+        B5 = int(B * 31 / 255)
+        
+        # 打包为BGR555格式: BBBBBGGGGGRRRRR (15位)
+        bgr555_values[i] = (B5 << 10) | (G5 << 5) | R5
+    
+    return bgr555_values
+
+def yuv444_to_bgr555_8x4(yuv444_block: np.ndarray) -> np.ndarray:
+    """
+    将8x4 YUV444块转换为BGR555格式
+    输入：YUV444块 (96字节)
+    输出：BGR555格式 (32个uint16值)
+    """
+    return yuv444_to_bgr555_8x4_jit(yuv444_block)
+
 def generate_multi_level_codebooks_for_gop(
-    i_frame_blocks_4x4: np.ndarray, 
-    p_frame_blocks_4x4_list: list,
+    i_frame_blocks_8x4: np.ndarray, 
+    p_frame_blocks_8x4_list: list,
     i_frame_weight: int = I_FRAME_WEIGHT,
-    coverage_radius: float = DEFAULT_COVERAGE_RADIUS,
+    coverage_radius_8x4: float = DEFAULT_COVERAGE_RADIUS_8x4,
+    coverage_radius_4x4: float = DEFAULT_COVERAGE_RADIUS_4x4,
+    codebook_size_8x4: int = DEFAULT_CODEBOOK_SIZE_8x4,
     codebook_size_4x4: int = DEFAULT_CODEBOOK_SIZE_4x4,
     codebook_size_4x2: int = DEFAULT_CODEBOOK_SIZE_4x2
 ) -> tuple:
+    """
+    为一个GOP生成多级码表（8x4 + 4x4 + 4x2）
+    
+    输入：
+    - i_frame_blocks_8x4: I帧的所有8x4块 (BLOCKS_8x4_PER_FRAME, 96)
+    - p_frame_blocks_8x4_list: P帧的变化8x4块列表，每个元素是 (frame_idx, changed_blocks_8x4)
+    - i_frame_weight: I帧块的权重
+    - coverage_radius_8x4: 8x4码表的覆盖半径
+    - coverage_radius_4x4: 4x4码表的覆盖半径
+    - codebook_size_8x4: 8x4码表大小
+    - codebook_size_4x4: 4x4码表大小
+    - codebook_size_4x2: 4x2码表大小
+    
+    返回：(codebook_8x4, codebook_4x4, codebook_4x2)
+    """
+    print(f"为GOP生成三级码表...")
+    print(f"I帧8x4块数: {len(i_frame_blocks_8x4)}")
+    print(f"P帧变化8x4块总数: {sum(len(blocks) for _, blocks in p_frame_blocks_8x4_list)}")
+    
+    # 第一步：收集所有8x4块用于训练
+    training_blocks_8x4 = []
+    
+    # 添加I帧8x4块（带权重）
+    for _ in range(i_frame_weight):
+        training_blocks_8x4.append(i_frame_blocks_8x4)
+    
+    # 添加P帧的变化8x4块
+    for frame_idx, changed_blocks_8x4 in p_frame_blocks_8x4_list:
+        if len(changed_blocks_8x4) > 0:
+            training_blocks_8x4.append(changed_blocks_8x4)
+    
+    if not training_blocks_8x4:
+        raise ValueError("没有足够的8x4块用于生成码表")
+    
+    all_training_blocks_8x4 = np.vstack(training_blocks_8x4)
+    print(f"总8x4训练块数: {len(all_training_blocks_8x4)} (I帧权重x{i_frame_weight})")
+    
+    # 第二步：使用最大覆盖方法生成8x4码表
+    print("生成8x4码表（最大覆盖方法）...")
+    codebook_8x4 = generate_codebook_8x4_max_coverage(
+        all_training_blocks_8x4, 
+        radius=coverage_radius_8x4, 
+        n_neighbors=codebook_size_8x4
+    )
+    
+    # 第三步：找出8x4码表无法很好覆盖的块，拆分为4x4块
+    print("寻找8x4码表无法覆盖的块...")
+    distances_8x4 = pairwise_distances(
+        all_training_blocks_8x4.astype(np.float32), 
+        codebook_8x4.astype(np.float32), 
+        metric="euclidean", 
+        n_jobs=1
+    )
+    min_distances_8x4 = distances_8x4.min(axis=1)
+    uncovered_8x4_mask = min_distances_8x4 > coverage_radius_8x4
+    uncovered_blocks_8x4 = all_training_blocks_8x4[uncovered_8x4_mask]
+    
+    print(f"8x4无法覆盖的块数: {len(uncovered_blocks_8x4)} / {len(all_training_blocks_8x4)}")
+    
+    # 第四步：将无法覆盖的8x4块拆分为4x4块
+    uncovered_blocks_4x4 = []
+    for block_8x4 in uncovered_blocks_8x4:
+        # 将96维的8x4块拆分为两个48维的4x4块
+        # 左半部分：前4列
+        left_4x4 = np.concatenate([
+            block_8x4[:16],      # 前16个Y值（左半4x4）
+            block_8x4[32:48],    # 前16个Cb值（左半4x4）
+            block_8x4[64:80]     # 前16个Cr值（左半4x4）
+        ])
+        # 右半部分：后4列
+        right_4x4 = np.concatenate([
+            block_8x4[16:32],    # 后16个Y值（右半4x4）
+            block_8x4[48:64],    # 后16个Cb值（右半4x4）
+            block_8x4[80:96]     # 后16个Cr值（右半4x4）
+        ])
+        uncovered_blocks_4x4.extend([left_4x4, right_4x4])
+    
+    uncovered_blocks_4x4 = np.array(uncovered_blocks_4x4) if uncovered_blocks_4x4 else np.zeros((0, 48), dtype=np.uint8)
+    print(f"拆分得到的4x4块数: {len(uncovered_blocks_4x4)}")
+    
+    # 第五步：使用最大覆盖方法为4x4块生成码表
+    if len(uncovered_blocks_4x4) > 0:
+        print("生成4x4码表（最大覆盖方法）...")
+        codebook_4x4 = generate_codebook_4x4_max_coverage(
+            uncovered_blocks_4x4, 
+            radius=coverage_radius_4x4, 
+            n_neighbors=codebook_size_4x4
+        )
+        
+        # 第六步：找出4x4码表无法很好覆盖的块，拆分为4x2块
+        print("寻找4x4码表无法覆盖的块...")
+        distances_4x4 = pairwise_distances(
+            uncovered_blocks_4x4.astype(np.float32), 
+            codebook_4x4.astype(np.float32), 
+            metric="euclidean", 
+            n_jobs=1
+        )
+        min_distances_4x4 = distances_4x4.min(axis=1)
+        uncovered_4x4_mask = min_distances_4x4 > coverage_radius_4x4
+        uncovered_blocks_4x4_for_4x2 = uncovered_blocks_4x4[uncovered_4x4_mask]
+        
+        print(f"4x4无法覆盖的块数: {len(uncovered_blocks_4x4_for_4x2)} / {len(uncovered_blocks_4x4)}")
+        
+        # 第七步：将无法覆盖的4x4块拆分为4x2块
+        uncovered_blocks_4x2 = []
+        for block_4x4 in uncovered_blocks_4x4_for_4x2:
+            # 将48维的4x4块拆分为两个24维的4x2块
+            # 上半部分：前2行
+            upper_4x2 = np.concatenate([
+                block_4x4[:8],      # 前8个Y值（前2行）
+                block_4x4[16:24],   # 前8个Cb值（前2行）
+                block_4x4[32:40]    # 前8个Cr值（前2行）
+            ])
+            # 下半部分：后2行
+            lower_4x2 = np.concatenate([
+                block_4x4[8:16],    # 后8个Y值（后2行）
+                block_4x4[24:32],   # 后8个Cb值（后2行）
+                block_4x4[40:48]    # 后8个Cr值（后2行）
+            ])
+            uncovered_blocks_4x2.extend([upper_4x2, lower_4x2])
+        
+        uncovered_blocks_4x2 = np.array(uncovered_blocks_4x2) if uncovered_blocks_4x2 else np.zeros((0, 24), dtype=np.uint8)
+        print(f"拆分得到的4x2块数: {len(uncovered_blocks_4x2)}")
+    else:
+        # 没有需要4x4码表的块，创建空码表
+        print("没有需要4x4编码的块，创建空码表")
+        codebook_4x4 = np.zeros((codebook_size_4x4, 48), dtype=np.uint8)
+        uncovered_blocks_4x2 = np.zeros((0, 24), dtype=np.uint8)
+    
+    # 第八步：使用K-means为4x2块生成码表
+    if len(uncovered_blocks_4x2) > 0:
+        print("生成4x2码表（K-means方法）...")
+        train_data_4x2 = uncovered_blocks_4x2.astype(np.float32)
+        
+        # 如果数据量足够，使用完整的K-means
+        if len(train_data_4x2) >= codebook_size_4x2:
+            warm = MiniBatchKMeans(
+                n_clusters=codebook_size_4x2, 
+                random_state=42, 
+                n_init=20, 
+                max_iter=300, 
+                verbose=0
+            ).fit(train_data_4x2)
+            print("MiniBatchKMeans预热完成")
+            
+            kmeans = KMeans(
+                n_clusters=codebook_size_4x2, 
+                init=warm.cluster_centers_, 
+                random_state=42, 
+                n_init=1
+            )
+            kmeans.fit(train_data_4x2)
+            codebook_4x2 = kmeans.cluster_centers_
+        else:
+            # 数据量不足时，直接用现有数据填充，剩余用零填充
+            codebook_4x2 = np.zeros((codebook_size_4x2, 24), dtype=np.float32)
+            codebook_4x2[:len(train_data_4x2)] = train_data_4x2
+        
+        codebook_4x2 = np.clip(codebook_4x2, 0, 255).round().astype(np.uint8)
+    else:
+        # 没有需要4x2码表的块，创建空码表
+        print("没有需要4x2编码的块，创建空码表")
+        codebook_4x2 = np.zeros((codebook_size_4x2, 24), dtype=np.uint8)
+    
+    print(f"三级码表生成完成: 8x4({len(codebook_8x4)}), 4x4({len(codebook_4x4)}), 4x2({len(codebook_4x2)})")
+    return codebook_8x4, codebook_4x4, codebook_4x2
     """
     为一个GOP生成多级码表（4x4 + 4x2）
     
@@ -364,6 +608,46 @@ def generate_multi_level_codebooks_for_gop(
     print(f"多级码表生成完成: 4x4({len(codebook_4x4)}), 4x2({len(codebook_4x2)})")
     return codebook_4x4, codebook_4x2
 
+def generate_codebook_8x4_max_coverage(blocks_8x4: np.ndarray, radius: float = 120.0, n_neighbors: int = 512) -> np.ndarray:
+    """
+    使用最大覆盖方法为8x4块生成码表
+    """
+    print(f"为8x4块生成最大覆盖码表...块数: {len(blocks_8x4)}")
+    
+    if len(blocks_8x4) == 0:
+        return np.zeros((n_neighbors, 96), dtype=np.uint8)
+    
+    # 转换为float32用于距离计算
+    X = blocks_8x4.astype(np.float32)
+    
+    # 构建稀疏相似度矩阵
+    print("构建稀疏相似度矩阵...")
+    S = build_sparse_similarity(X, radius=radius, n_neighbors=n_neighbors)
+    density = 100 * S.nnz / (len(X) ** 2)
+    print(f"稀疏矩阵密度: {density:.4f}% (nnz={S.nnz:,})")
+    
+    # 使用FacilityLocationSelection进行最大覆盖选择
+    print("执行最大覆盖选择...")
+    selector = FacilityLocationSelection(
+        n_samples=n_neighbors,
+        metric="precomputed",
+        optimizer="lazy",
+        verbose=False,
+    )
+    selector.fit(S)
+    
+    # 获取选中的码字索引
+    centres_idx = selector.ranking
+    codebook_8x4 = X[centres_idx]
+    
+    # 评估覆盖率
+    dists = pairwise_distances(X, codebook_8x4, metric="euclidean", n_jobs=1)
+    covered = (dists.min(axis=1) <= radius)
+    covered_ratio = covered.mean()
+    print(f"8x4码表覆盖率: {covered.sum():,} / {len(X):,} ({covered_ratio*100:.2f}%)")
+    
+    return np.clip(codebook_8x4, 0, 255).round().astype(np.uint8)
+
 def build_sparse_similarity(X: np.ndarray, radius: float, n_neighbors: int = 128) -> csr_matrix:
     """
     构建稀疏相似度矩阵，用于最大覆盖选择
@@ -466,7 +750,7 @@ def encode_frame_with_codebook(blocks: np.ndarray, codebook: np.ndarray) -> np.n
     indices = compute_distances_jit(blocks, codebook.astype(np.float32))
     return indices
 
-def write_header(path_h: pathlib.Path, total_frames: int, gop_count: int, gop_size: int, codebook_size_4x4: int, codebook_size_4x2: int):
+def write_header(path_h: pathlib.Path, total_frames: int, gop_count: int, gop_size: int, codebook_size_8x4: int, codebook_size_4x4: int, codebook_size_4x2: int):
     guard = "VIDEO_DATA_H"
     with path_h.open("w", encoding="utf-8") as f:
         f.write(textwrap.dedent(f"""\
@@ -476,15 +760,22 @@ def write_header(path_h: pathlib.Path, total_frames: int, gop_count: int, gop_si
             #define VIDEO_FRAME_COUNT     {total_frames}
             #define VIDEO_WIDTH           {WIDTH}
             #define VIDEO_HEIGHT          {HEIGHT}
+            #define VIDEO_CODEBOOK_SIZE_8x4   {codebook_size_8x4}
             #define VIDEO_CODEBOOK_SIZE_4x4   {codebook_size_4x4}
             #define VIDEO_CODEBOOK_SIZE_4x2   {codebook_size_4x2}
+            #define VIDEO_BLOCKS_8x4_PER_FRAME {BLOCKS_8x4_PER_FRAME}
             #define VIDEO_BLOCKS_4x4_PER_FRAME {BLOCKS_4x4_PER_FRAME}
             #define VIDEO_BLOCKS_4x2_PER_FRAME {BLOCKS_4x2_PER_FRAME}
+            #define VIDEO_BLOCK_SIZE_8x4  32
             #define VIDEO_BLOCK_SIZE_4x4  16
             #define VIDEO_BLOCK_SIZE_4x2  8
             #define VIDEO_GOP_SIZE        {gop_size}
             #define VIDEO_GOP_COUNT       {gop_count}
+            #define VIDEO_MARKER_8x4      0xFFFE
             #define VIDEO_MARKER_4x4      0xFFFF
+
+            /* 每个GOP的8x4码表：GOP_COUNT * CODEBOOK_SIZE_8x4 * BLOCK_SIZE_8x4 个uint16 */
+            extern const unsigned short video_codebooks_8x4[VIDEO_GOP_COUNT][VIDEO_CODEBOOK_SIZE_8x4][VIDEO_BLOCK_SIZE_8x4];
 
             /* 每个GOP的4x4码表：GOP_COUNT * CODEBOOK_SIZE_4x4 * BLOCK_SIZE_4x4 个uint16 */
             extern const unsigned short video_codebooks_4x4[VIDEO_GOP_COUNT][VIDEO_CODEBOOK_SIZE_4x4][VIDEO_BLOCK_SIZE_4x4];
@@ -504,13 +795,36 @@ def write_header(path_h: pathlib.Path, total_frames: int, gop_count: int, gop_si
             #endif /* {guard} */
             """))
 
-def write_source(path_c: pathlib.Path, gop_codebooks: list, encoded_frames: list, frame_offsets: list, frame_types: list, codebook_size_4x4: int, codebook_size_4x2: int):
+def write_source(path_c: pathlib.Path, gop_codebooks: list, encoded_frames: list, frame_offsets: list, frame_types: list, codebook_size_8x4: int, codebook_size_4x4: int, codebook_size_4x2: int):
     with path_c.open("w", encoding="utf-8") as f:
         f.write('#include "video_data.h"\n\n')
         
+        # 写入所有GOP的8x4码表（BGR555格式）
+        f.write("const unsigned short video_codebooks_8x4[][VIDEO_CODEBOOK_SIZE_8x4][VIDEO_BLOCK_SIZE_8x4] = {\n")
+        for gop_idx, (codebook_8x4, codebook_4x4, codebook_4x2) in enumerate(gop_codebooks):
+            f.write(f"    {{ // GOP {gop_idx} - 8x4码表\n")
+            for i, codeword_yuv444 in enumerate(codebook_8x4):
+                # 将YUV444码字转换为BGR555格式
+                codeword_bgr555 = yuv444_to_bgr555_8x4(codeword_yuv444)
+                
+                line = "        {"
+                for j, val in enumerate(codeword_bgr555):
+                    line += f"0x{val:04X}"
+                    if j < len(codeword_bgr555) - 1:
+                        line += ","
+                line += "}"
+                if i < len(codebook_8x4) - 1:
+                    line += ","
+                f.write(line + f"  /* 8x4码字 {i} */\n")
+            f.write("    }")
+            if gop_idx < len(gop_codebooks) - 1:
+                f.write(",")
+            f.write(f"  // GOP {gop_idx}\n")
+        f.write("};\n\n")
+        
         # 写入所有GOP的4x4码表（BGR555格式）
         f.write("const unsigned short video_codebooks_4x4[][VIDEO_CODEBOOK_SIZE_4x4][VIDEO_BLOCK_SIZE_4x4] = {\n")
-        for gop_idx, (codebook_4x4, codebook_4x2) in enumerate(gop_codebooks):
+        for gop_idx, (codebook_8x4, codebook_4x4, codebook_4x2) in enumerate(gop_codebooks):
             f.write(f"    {{ // GOP {gop_idx} - 4x4码表\n")
             for i, codeword_yuv444 in enumerate(codebook_4x4):
                 # 将YUV444码字转换为BGR555格式
@@ -533,7 +847,7 @@ def write_source(path_c: pathlib.Path, gop_codebooks: list, encoded_frames: list
         
         # 写入所有GOP的4x2码表（BGR555格式）
         f.write("const unsigned short video_codebooks_4x2[][VIDEO_CODEBOOK_SIZE_4x2][VIDEO_BLOCK_SIZE_4x2] = {\n")
-        for gop_idx, (codebook_4x4, codebook_4x2) in enumerate(gop_codebooks):
+        for gop_idx, (codebook_8x4, codebook_4x4, codebook_4x2) in enumerate(gop_codebooks):
             f.write(f"    {{ // GOP {gop_idx} - 4x2码表\n")
             for i, codeword_yuv444 in enumerate(codebook_4x2):
                 # 将YUV444码字转换为BGR555格式
@@ -595,6 +909,17 @@ def calculate_block_difference(block1, block2):
     return diff
 
 @jit(nopython=True, cache=True)
+def calculate_block_difference_8x4(block1, block2):
+    """
+    计算两个8x4 YUV444块之间的差异
+    使用平方差之和作为差异度量
+    """
+    diff = 0.0
+    for i in range(96):        
+        diff += (float(block1[i]) - float(block2[i])) ** 2
+    return diff
+
+@jit(nopython=True, cache=True)
 def calculate_block_difference_4x4(block1, block2):
     """
     计算两个4x4 YUV444块之间的差异
@@ -630,6 +955,29 @@ def find_changed_blocks(current_blocks, previous_blocks, threshold):
         return np.zeros(0, dtype=np.int32)
 
 @jit(nopython=True, cache=True)
+def find_changed_blocks_8x4(current_blocks, previous_blocks, threshold):
+    """
+    找出相对于前一帧发生变化的8x4块
+    返回变化块的索引数组
+    """
+    num_blocks = current_blocks.shape[0]
+    # 预分配最大可能大小的数组
+    temp_indices = np.zeros(num_blocks, dtype=np.int32)
+    count = 0
+    
+    for i in range(num_blocks):
+        diff = calculate_block_difference_8x4(current_blocks[i], previous_blocks[i])
+        if diff > threshold:
+            temp_indices[count] = i
+            count += 1
+    
+    # 返回实际大小的数组
+    if count > 0:
+        return temp_indices[:count]
+    else:
+        return np.zeros(0, dtype=np.int32)
+
+@jit(nopython=True, cache=True)
 def find_changed_blocks_4x4(current_blocks, previous_blocks, threshold):
     """
     找出相对于前一帧发生变化的4x4块
@@ -651,6 +999,42 @@ def find_changed_blocks_4x4(current_blocks, previous_blocks, threshold):
         return temp_indices[:count].copy()
     else:
         return np.zeros(0, dtype=np.int32)
+@jit(nopython=True, cache=True)
+def extract_blocks_from_yuv_8x4(Y, Cb, Cr, height, width, block_h, block_w):
+    """
+    使用JIT加速的8x4块提取函数
+    注意：这里Cb/Cr已经是uint8格式(0-255)，包含了128偏移
+    返回 (num_blocks, 96) 数组：32Y + 32Cb + 32Cr
+    """
+    num_blocks_y = height // block_h
+    num_blocks_x = width // block_w
+    total_blocks = num_blocks_y * num_blocks_x
+    
+    # 96 = 32Y + 32Cb + 32Cr，全部使用uint8
+    blocks = np.zeros((total_blocks, 96), dtype=np.uint8)
+    
+    block_idx = 0
+    for by in range(num_blocks_y):
+        for bx in range(num_blocks_x):
+            y_start, y_end = by * block_h, (by + 1) * block_h
+            x_start, x_end = bx * block_w, (bx + 1) * block_w
+            
+            # 提取Y分量（32个值）
+            y_block = Y[y_start:y_end, x_start:x_end].flatten()
+            blocks[block_idx, :32] = y_block
+            
+            # 提取Cb分量（32个值）
+            cb_block = Cb[y_start:y_end, x_start:x_end].flatten()
+            blocks[block_idx, 32:64] = cb_block
+            
+            # 提取Cr分量（32个值）
+            cr_block = Cr[y_start:y_end, x_start:x_end].flatten()
+            blocks[block_idx, 64:96] = cr_block
+            
+            block_idx += 1
+    
+    return blocks
+
 @jit(nopython=True, cache=True)
 def extract_blocks_from_yuv_4x4(Y, Cb, Cr, height, width, block_h, block_w):
     """
@@ -698,9 +1082,11 @@ def main():
     pa.add_argument("--gop-size", type=int,   default=60, help="GOP大小")
     pa.add_argument("--i-weight", type=int,   default=3, help="I帧权重")
     pa.add_argument("--diff-threshold", type=float, default=100, help="P帧块差异阈值")
+    pa.add_argument("--codebook-8x4", type=int, default=DEFAULT_CODEBOOK_SIZE_8x4, help="8x4码表大小")
     pa.add_argument("--codebook-4x4", type=int, default=DEFAULT_CODEBOOK_SIZE_4x4, help="4x4码表大小")
     pa.add_argument("--codebook-4x2", type=int, default=DEFAULT_CODEBOOK_SIZE_4x2, help="4x2码表大小")
-    pa.add_argument("--coverage-radius", type=float, default=DEFAULT_COVERAGE_RADIUS, help="4x4块覆盖半径")
+    pa.add_argument("--coverage-radius-8x4", type=float, default=DEFAULT_COVERAGE_RADIUS_8x4, help="8x4块覆盖半径")
+    pa.add_argument("--coverage-radius-4x4", type=float, default=DEFAULT_COVERAGE_RADIUS_4x4, help="4x4块覆盖半径")
     pa.add_argument("--out", default="video_data")
     args = pa.parse_args()
 
@@ -708,9 +1094,11 @@ def main():
     gop_size = args.gop_size
     i_frame_weight = args.i_weight
     diff_threshold = args.diff_threshold
+    codebook_size_8x4 = args.codebook_8x4
     codebook_size_4x4 = args.codebook_4x4
     codebook_size_4x2 = args.codebook_4x2
-    coverage_radius = args.coverage_radius
+    coverage_radius_8x4 = args.coverage_radius_8x4
+    coverage_radius_4x4 = args.coverage_radius_4x4
 
     cap = cv2.VideoCapture(args.input)
     if not cap.isOpened():
@@ -730,9 +1118,9 @@ def main():
             break
         if idx % every == 0:
             frm = cv2.resize(frm, (WIDTH, HEIGHT), cv2.INTER_AREA)
-            # 提取4x4块用于主要编码
-            blocks_4x4 = extract_yuv444_blocks_4x4(frm)
-            all_frame_blocks.append(blocks_4x4)
+            # 提取8x4块用于主要编码
+            blocks_8x4 = extract_yuv444_blocks_8x4(frm)
+            all_frame_blocks.append(blocks_8x4)
         idx += 1
     cap.release()
 
@@ -752,10 +1140,11 @@ def main():
     
     # 统计信息
     total_stats = {
+        'blocks_8x4_used': 0,
         'blocks_4x4_used': 0,
         'blocks_4x2_used': 0,
-        'i_frame_stats': {'blocks_4x4_used': 0, 'blocks_4x2_used': 0},
-        'p_frame_stats': {'blocks_4x4_used': 0, 'blocks_4x2_used': 0}
+        'i_frame_stats': {'blocks_8x4_used': 0, 'blocks_4x4_used': 0, 'blocks_4x2_used': 0},
+        'p_frame_stats': {'blocks_8x4_used': 0, 'blocks_4x4_used': 0, 'blocks_4x2_used': 0}
     }
 
     for gop_idx in range(gop_count):
@@ -767,55 +1156,55 @@ def main():
         gop_frames = all_frame_blocks[start_frame:end_frame]
         
         # 第一帧是I帧
-        i_frame_blocks_4x4 = gop_frames[0]
+        i_frame_blocks_8x4 = gop_frames[0]
         
-        # 分析P帧的变化4x4块
-        p_frame_blocks_4x4_list = []
+        # 分析P帧的变化8x4块
+        p_frame_blocks_8x4_list = []
         for frame_idx in range(1, len(gop_frames)):
             current_blocks = gop_frames[frame_idx]
             previous_blocks = gop_frames[frame_idx - 1]
-            
-            # 使用numba函数找出变化的4x4块
-            changed_indices = find_changed_blocks_4x4(current_blocks, previous_blocks, diff_threshold)
+            changed_indices = find_changed_blocks_8x4(current_blocks, previous_blocks, diff_threshold)
             if len(changed_indices) > 0:
                 changed_blocks = current_blocks[changed_indices]
-                p_frame_blocks_4x4_list.append((frame_idx, changed_blocks))
-            else:
-                p_frame_blocks_4x4_list.append((frame_idx, np.array([], dtype=np.uint8).reshape(0, 48)))
+                p_frame_blocks_8x4_list.append((frame_idx, changed_blocks))
         
-        # 为当前GOP生成多级码表
-        codebook_4x4, codebook_4x2 = generate_multi_level_codebooks_for_gop(
-            i_frame_blocks_4x4, p_frame_blocks_4x4_list, i_frame_weight, 
-            coverage_radius, codebook_size_4x4, codebook_size_4x2
+        # 为当前GOP生成三级码表
+        codebook_8x4, codebook_4x4, codebook_4x2 = generate_multi_level_codebooks_for_gop(
+            i_frame_blocks_8x4, p_frame_blocks_8x4_list, i_frame_weight, 
+            coverage_radius_8x4, coverage_radius_4x4, codebook_size_8x4, codebook_size_4x4, codebook_size_4x2
         )
-        gop_codebooks.append((codebook_4x4, codebook_4x2))
         
         # 编码当前GOP的所有帧
-        for frame_idx, frame_blocks_4x4 in enumerate(gop_frames):
+        for frame_idx, frame_blocks_8x4 in enumerate(gop_frames):
             global_frame_idx = start_frame + frame_idx
             
             if frame_idx == 0:  # I帧
-                frame_data, frame_stats = encode_i_frame_multi_level(frame_blocks_4x4, codebook_4x4, codebook_4x2, coverage_radius)
+                frame_data, frame_stats = encode_i_frame_multi_level_8x4(frame_blocks_8x4, codebook_8x4, codebook_4x4, codebook_4x2, coverage_radius_8x4, coverage_radius_4x4)
                 frame_types.append(0)  # I帧
-                print(f"  I帧 {global_frame_idx}: {BLOCKS_4x4_PER_FRAME} 个4x4块 (4x4码表: {frame_stats['blocks_4x4_used']}, 4x2码表: {frame_stats['blocks_4x2_used']})")
+                print(f"  I帧 {global_frame_idx}: {BLOCKS_8x4_PER_FRAME} 个8x4块 (8x4码表: {frame_stats['blocks_8x4_used']}, 4x4码表: {frame_stats['blocks_4x4_used']}, 4x2码表: {frame_stats['blocks_4x2_used']})")
                 
                 # 更新统计
+                total_stats['blocks_8x4_used'] += frame_stats['blocks_8x4_used']
                 total_stats['blocks_4x4_used'] += frame_stats['blocks_4x4_used']
                 total_stats['blocks_4x2_used'] += frame_stats['blocks_4x2_used']
+                total_stats['i_frame_stats']['blocks_8x4_used'] += frame_stats['blocks_8x4_used']
                 total_stats['i_frame_stats']['blocks_4x4_used'] += frame_stats['blocks_4x4_used']
                 total_stats['i_frame_stats']['blocks_4x2_used'] += frame_stats['blocks_4x2_used']
             else:  # P帧
                 # P帧只编码变化的块
                 previous_blocks = gop_frames[frame_idx - 1]
                 frame_data, frame_stats = encode_p_frame_multi_level(
-                    frame_blocks_4x4, previous_blocks, codebook_4x4, codebook_4x2, diff_threshold, coverage_radius
+                    frame_blocks_8x4, previous_blocks, codebook_8x4, codebook_4x4, codebook_4x2, 
+                    diff_threshold, coverage_radius_8x4, coverage_radius_4x4
                 )
                 frame_types.append(1)  # P帧
-                # print(f"  P帧 {global_frame_idx}: 变化块 (4x4码表: {frame_stats['blocks_4x4_used']}, 4x2码表: {frame_stats['blocks_4x2_used']})")
+                # print(f"  P帧 {global_frame_idx}: 变化块 (8x4码表: {frame_stats['blocks_8x4_used']}, 4x4码表: {frame_stats['blocks_4x4_used']}, 4x2码表: {frame_stats['blocks_4x2_used']})")
                 
                 # 更新统计
+                total_stats['blocks_8x4_used'] += frame_stats['blocks_8x4_used']
                 total_stats['blocks_4x4_used'] += frame_stats['blocks_4x4_used']
                 total_stats['blocks_4x2_used'] += frame_stats['blocks_4x2_used']
+                total_stats['p_frame_stats']['blocks_8x4_used'] += frame_stats['blocks_8x4_used']
                 total_stats['p_frame_stats']['blocks_4x4_used'] += frame_stats['blocks_4x4_used']
                 total_stats['p_frame_stats']['blocks_4x2_used'] += frame_stats['blocks_4x2_used']
             
@@ -827,8 +1216,8 @@ def main():
     frame_offsets = frame_offsets[:-1]
 
     # 写入文件
-    write_header(pathlib.Path(args.out).with_suffix(".h"), total_frames, gop_count, gop_size, codebook_size_4x4, codebook_size_4x2)
-    write_source(pathlib.Path(args.out).with_suffix(".c"), gop_codebooks, encoded_frames, frame_offsets, frame_types, codebook_size_4x4, codebook_size_4x2)
+    write_header(pathlib.Path(args.out).with_suffix(".h"), total_frames, gop_count, gop_size, codebook_size_8x4, codebook_size_4x4, codebook_size_4x2)
+    write_source(pathlib.Path(args.out).with_suffix(".c"), gop_codebooks, encoded_frames, frame_offsets, frame_types, codebook_size_8x4, codebook_size_4x4, codebook_size_4x2)
 
     # 详细统计信息
     print("\n" + "="*60)
@@ -844,35 +1233,40 @@ def main():
     print(f"  - I帧: {i_frame_count} 帧")
     print(f"  - P帧: {p_frame_count} 帧")
     print(f"GOP数量: {gop_count}, GOP大小: {gop_size}")
-    print(f"块尺寸: 4x4({BLOCKS_4x4_PER_FRAME}), 4x2({BLOCKS_4x2_PER_FRAME})")
-    print(f"码表大小: 4x4({codebook_size_4x4}), 4x2({codebook_size_4x2})")
-    print(f"覆盖半径: {coverage_radius}")
+    print(f"块尺寸: 8x4({BLOCKS_8x4_PER_FRAME}), 4x4({BLOCKS_4x4_PER_FRAME}), 4x2({BLOCKS_4x2_PER_FRAME})")
+    print(f"码表大小: 8x4({codebook_size_8x4}), 4x4({codebook_size_4x4}), 4x2({codebook_size_4x2})")
+    print(f"覆盖半径: 8x4({coverage_radius_8x4}), 4x4({coverage_radius_4x4})")
     
     # 码表使用统计
     print(f"\n📋 码表使用统计:")
     print(f"总计:")
+    print(f"  - 8x4码表使用: {total_stats['blocks_8x4_used']:,} 个8x4块")
     print(f"  - 4x4码表使用: {total_stats['blocks_4x4_used']:,} 个4x4块")
     print(f"  - 4x2码表使用: {total_stats['blocks_4x2_used']:,} 个4x2块")
     
-    total_4x4_blocks = i_frame_count * BLOCKS_4x4_PER_FRAME  # I帧中所有4x4块都需要编码
-    total_possible_4x2_blocks = total_4x4_blocks * 2  # 每个4x4块最多拆分为2个4x2块
+    total_8x4_blocks = i_frame_count * BLOCKS_8x4_PER_FRAME  # I帧中所有8x4块都需要编码
+    total_possible_4x4_blocks = total_8x4_blocks * 2  # 每个8x4块最多拆分为2个4x4块
+    total_possible_4x2_blocks = total_possible_4x4_blocks * 2  # 每个4x4块最多拆分为2个4x2块
     
     print(f"I帧统计:")
+    print(f"  - 8x4码表使用: {total_stats['i_frame_stats']['blocks_8x4_used']:,} 个8x4块")
     print(f"  - 4x4码表使用: {total_stats['i_frame_stats']['blocks_4x4_used']:,} 个4x4块")
     print(f"  - 4x2码表使用: {total_stats['i_frame_stats']['blocks_4x2_used']:,} 个4x2块")
-    if total_4x4_blocks > 0:
-        i_4x4_ratio = total_stats['i_frame_stats']['blocks_4x4_used'] / total_4x4_blocks * 100
-        print(f"  - I帧中4x4码表覆盖率: {i_4x4_ratio:.1f}%")
+    if total_8x4_blocks > 0:
+        i_8x4_ratio = total_stats['i_frame_stats']['blocks_8x4_used'] / total_8x4_blocks * 100
+        print(f"  - I帧中8x4码表覆盖率: {i_8x4_ratio:.1f}%")
     
     print(f"P帧统计:")
+    print(f"  - 8x4码表使用: {total_stats['p_frame_stats']['blocks_8x4_used']:,} 个8x4块")
     print(f"  - 4x4码表使用: {total_stats['p_frame_stats']['blocks_4x4_used']:,} 个4x4块")
     print(f"  - 4x2码表使用: {total_stats['p_frame_stats']['blocks_4x2_used']:,} 个4x2块")
     
     # 计算各部分大小
     # 1. 码表大小
+    codebook_8x4_size_bytes = gop_count * codebook_size_8x4 * 32 * 2  # 每个8x4码字32个uint16
     codebook_4x4_size_bytes = gop_count * codebook_size_4x4 * 16 * 2  # 每个4x4码字16个uint16
     codebook_4x2_size_bytes = gop_count * codebook_size_4x2 * 8 * 2   # 每个4x2码字8个uint16
-    codebook_size_bytes = codebook_4x4_size_bytes + codebook_4x2_size_bytes
+    codebook_size_bytes = codebook_8x4_size_bytes + codebook_4x4_size_bytes + codebook_4x2_size_bytes
     
     # 2. 帧数据大小
     frame_data_size_bytes = total_data_size * 2  # 每个u16是2字节
@@ -900,6 +1294,7 @@ def main():
     total_file_size = codebook_size_bytes + frame_data_size_bytes + offsets_size_bytes + frame_types_size_bytes
     
     print("\n💾 内存使用分析:")
+    print(f"8x4码表数据: {codebook_8x4_size_bytes:,} 字节 ({codebook_8x4_size_bytes/1024:.1f} KB)")
     print(f"4x4码表数据: {codebook_4x4_size_bytes:,} 字节 ({codebook_4x4_size_bytes/1024:.1f} KB)")
     print(f"4x2码表数据: {codebook_4x2_size_bytes:,} 字节 ({codebook_4x2_size_bytes/1024:.1f} KB)")
     print(f"总码表数据: {codebook_size_bytes:,} 字节 ({codebook_size_bytes/1024:.1f} KB)")
@@ -917,6 +1312,168 @@ def main():
     print(f"压缩比: {compression_ratio:.1f}:1 ({100/compression_ratio:.1f}%)")
     
     print(f"✅ 编码完成！输出文件: {args.out}.h, {args.out}.c")
+
+def encode_8x4_block_recursive(
+    block_8x4: np.ndarray,
+    codebook_8x4: np.ndarray,
+    codebook_4x4: np.ndarray, 
+    codebook_4x2: np.ndarray,
+    coverage_radius_8x4: float,
+    coverage_radius_4x4: float
+) -> tuple:
+    """
+    递归编码单个8x4块，严格按照8x4→4x4→4x2的分裂顺序
+    
+    返回: (encoding_list, stats)
+    encoding_list格式:
+    - 如果用8x4码表: [8x4_index]
+    - 如果拆分为4x4: [MARKER_8x4_BLOCK, left_4x4_encoding..., right_4x4_encoding...]
+    """
+    stats = {'blocks_8x4_used': 0, 'blocks_4x4_used': 0, 'blocks_4x2_used': 0}
+    
+    # 尝试8x4码表
+    distances_8x4 = pairwise_distances(
+        block_8x4.reshape(1, -1).astype(np.float32),
+        codebook_8x4.astype(np.float32),
+        metric="euclidean"
+    )
+    min_dist_8x4 = distances_8x4.min()
+    
+    if min_dist_8x4 <= coverage_radius_8x4:
+        # 可以用8x4码表
+        best_idx = distances_8x4.argmin()
+        stats['blocks_8x4_used'] = 1
+        return [best_idx], stats
+    else:
+        # 8x4无法覆盖，拆分为两个4x4块
+        left_4x4 = np.concatenate([
+            block_8x4[:16],      # 前16个Y值（左半4x4）
+            block_8x4[32:48],    # 前16个Cb值（左半4x4）
+            block_8x4[64:80]     # 前16个Cr值（左半4x4）
+        ])
+        right_4x4 = np.concatenate([
+            block_8x4[16:32],    # 后16个Y值（右半4x4）
+            block_8x4[48:64],    # 后16个Cb值（右半4x4）
+            block_8x4[80:96]     # 后16个Cr值（右半4x4）
+        ])
+        
+        # 递归编码左4x4和右4x4
+        left_encoding, left_stats = encode_4x4_block_recursive(
+            left_4x4, codebook_4x4, codebook_4x2, coverage_radius_4x4
+        )
+        right_encoding, right_stats = encode_4x4_block_recursive(
+            right_4x4, codebook_4x4, codebook_4x2, coverage_radius_4x4
+        )
+        
+        # 合并统计
+        for key in stats:
+            stats[key] = left_stats[key] + right_stats[key]
+        
+        # 组装编码结果
+        encoding = [MARKER_8x4_BLOCK] + left_encoding + right_encoding
+        return encoding, stats
+
+def encode_4x4_block_recursive(
+    block_4x4: np.ndarray,
+    codebook_4x4: np.ndarray,
+    codebook_4x2: np.ndarray,
+    coverage_radius_4x4: float
+) -> tuple:
+    """
+    递归编码单个4x4块，严格按照4x4→4x2的分裂顺序
+    
+    返回: (encoding_list, stats)
+    encoding_list格式:
+    - 如果用4x4码表: [4x4_index]
+    - 如果拆分为4x2: [MARKER_4x4_BLOCK, upper_4x2_index, lower_4x2_index]
+    """
+    stats = {'blocks_8x4_used': 0, 'blocks_4x4_used': 0, 'blocks_4x2_used': 0}
+    
+    # 尝试4x4码表
+    distances_4x4 = pairwise_distances(
+        block_4x4.reshape(1, -1).astype(np.float32),
+        codebook_4x4.astype(np.float32),
+        metric="euclidean"
+    )
+    min_dist_4x4 = distances_4x4.min()
+    
+    if min_dist_4x4 <= coverage_radius_4x4:
+        # 可以用4x4码表
+        best_idx = distances_4x4.argmin()
+        stats['blocks_4x4_used'] = 1
+        return [best_idx], stats
+    else:
+        # 4x4无法覆盖，拆分为两个4x2块
+        upper_4x2 = np.concatenate([
+            block_4x4[:8],      # 前8个Y值（前2行）
+            block_4x4[16:24],   # 前8个Cb值（前2行）
+            block_4x4[32:40]    # 前8个Cr值（前2行）
+        ])
+        lower_4x2 = np.concatenate([
+            block_4x4[8:16],    # 后8个Y值（后2行）
+            block_4x4[24:32],   # 后8个Cb值（后2行）
+            block_4x4[40:48]    # 后8个Cr值（后2行）
+        ])
+        
+        # 使用4x2码表编码
+        upper_indices = encode_frame_with_codebook(upper_4x2.reshape(1, -1), codebook_4x2)
+        lower_indices = encode_frame_with_codebook(lower_4x2.reshape(1, -1), codebook_4x2)
+        
+        stats['blocks_4x2_used'] = 2
+        encoding = [MARKER_4x4_BLOCK, upper_indices[0], lower_indices[0]]
+        return encoding, stats
+
+def encode_i_frame_multi_level_8x4(
+    frame_blocks_8x4: np.ndarray, 
+    codebook_8x4: np.ndarray, 
+    codebook_4x4: np.ndarray, 
+    codebook_4x2: np.ndarray, 
+    coverage_radius_8x4: float = 120.0,
+    coverage_radius_4x4: float = 80.0
+) -> tuple:
+    """
+    使用三级码表编码I帧 - 严格递归分裂：8x4→4x4→4x2
+    
+    新的编码格式：
+    - 8x4块：8x4码字索引 (直接是索引)
+    - 分裂为4x4块：MARKER_8x4_BLOCK, 左半4x4编码..., 右半4x4编码...
+    - 分裂为4x2块：MARKER_4x4_BLOCK, 上半4x2码字索引, 下半4x2码字索引
+    
+    返回格式：([总块数, 块1编码, 块2编码, ...], stats)
+    
+    stats格式：{
+        'blocks_8x4_used': 使用8x4码表的块数,
+        'blocks_4x4_used': 使用4x4码表的块数(以4x4块为单位),
+        'blocks_4x2_used': 使用4x2码表的块数(以4x2块为单位)
+    }
+    """
+    frame_data = [BLOCKS_8x4_PER_FRAME]  # 总块数
+    
+    # 统计信息
+    total_stats = {
+        'blocks_8x4_used': 0,
+        'blocks_4x4_used': 0,
+        'blocks_4x2_used': 0
+    }
+    
+    # 逐个递归编码每个8x4块
+    for block_idx in range(len(frame_blocks_8x4)):
+        block_8x4 = frame_blocks_8x4[block_idx]
+        
+        # 递归编码当前8x4块
+        encoding, stats = encode_8x4_block_recursive(
+            block_8x4, codebook_8x4, codebook_4x4, codebook_4x2,
+            coverage_radius_8x4, coverage_radius_4x4
+        )
+        
+        # 添加编码结果
+        frame_data.extend(encoding)
+        
+        # 累加统计
+        for key in total_stats:
+            total_stats[key] += stats[key]
+    
+    return frame_data, total_stats
 
 def encode_i_frame_multi_level(frame_blocks_4x4: np.ndarray, codebook_4x4: np.ndarray, codebook_4x2: np.ndarray, coverage_radius: float = 80.0) -> tuple:
     """
@@ -984,91 +1541,62 @@ def encode_i_frame_multi_level(frame_blocks_4x4: np.ndarray, codebook_4x4: np.nd
     return frame_data, stats
 
 def encode_p_frame_multi_level(
-    current_blocks_4x4: np.ndarray, 
-    previous_blocks_4x4: np.ndarray, 
+    current_blocks_8x4: np.ndarray, 
+    previous_blocks_8x4: np.ndarray, 
+    codebook_8x4: np.ndarray,
     codebook_4x4: np.ndarray, 
     codebook_4x2: np.ndarray, 
     diff_threshold: float,
-    coverage_radius: float = 80.0
+    coverage_radius_8x4: float = 120.0,
+    coverage_radius_4x4: float = 80.0
 ) -> tuple:
     """
-    使用多级码表编码P帧
-    只编码发生变化的块，分为4x4和4x2两个部分
+    使用三级码表编码P帧 - 严格递归分裂：8x4→4x4→4x2
+    只编码发生变化的块
     
-    返回格式：([4x4变化块数, 4x4块编码..., 4x2变化块数, 4x2块编码...], stats)
+    返回格式：([变化块数, 位置1, 编码1..., 位置2, 编码2..., ...], stats)
     
     stats格式：{
+        'blocks_8x4_used': 使用8x4码表的块数,
         'blocks_4x4_used': 使用4x4码表的块数,
         'blocks_4x2_used': 使用4x2码表的块数(以4x2块为单位)
     }
     """
     # 统计信息
-    stats = {
+    total_stats = {
+        'blocks_8x4_used': 0,
         'blocks_4x4_used': 0,
         'blocks_4x2_used': 0
     }
-    # 找出发生变化的4x4块
-    changed_indices_4x4 = find_changed_blocks_4x4(current_blocks_4x4, previous_blocks_4x4, diff_threshold)
     
-    if len(changed_indices_4x4) == 0:
+    # 找出发生变化的8x4块
+    changed_indices_8x4 = find_changed_blocks_8x4(current_blocks_8x4, previous_blocks_8x4, diff_threshold)
+    
+    if len(changed_indices_8x4) == 0:
         # 没有变化
-        return [0, 0], stats  # 4x4变化块数=0, 4x2变化块数=0
+        return [0], total_stats  # 变化块数=0
     
-    changed_blocks_4x4 = current_blocks_4x4[changed_indices_4x4]
+    frame_data = [len(changed_indices_8x4)]  # 变化块数
     
-    # 计算变化块到4x4码表的距离
-    distances_4x4 = pairwise_distances(
-        changed_blocks_4x4.astype(np.float32),
-        codebook_4x4.astype(np.float32),
-        metric="euclidean",
-        n_jobs=1
-    )
-    min_distances_4x4 = distances_4x4.min(axis=1)
-    best_indices_4x4 = distances_4x4.argmin(axis=1)
-    
-    # 分类：可以用4x4码表的块 vs 需要拆分为4x2的块
-    use_4x4_mask = min_distances_4x4 <= coverage_radius
-    use_4x2_mask = ~use_4x4_mask
-    
-    frame_data = []
-    
-    # 第一部分：4x4块编码
-    indices_4x4 = changed_indices_4x4[use_4x4_mask]
-    codes_4x4 = best_indices_4x4[use_4x4_mask]
-    
-    frame_data.append(len(indices_4x4))  # 4x4变化块数
-    for pos, code in zip(indices_4x4, codes_4x4):
-        frame_data.extend([pos, code])  # P帧4x4编码：位置 + 4x4码字索引（不需要MARKER）
-    stats['blocks_4x4_used'] += len(indices_4x4)
-    
-    # 第二部分：4x2块编码
-    indices_4x2_blocks = changed_indices_4x4[use_4x2_mask]
-    blocks_4x2 = changed_blocks_4x4[use_4x2_mask]
-    
-    frame_data.append(len(indices_4x2_blocks))  # 需要拆分为4x2的块数
-    
-    for i, (block_pos, block_4x4) in enumerate(zip(indices_4x2_blocks, blocks_4x2)):
-        # 拆分为4x2块
-        upper_4x2 = np.concatenate([
-            block_4x4[:8],      # 前8个Y值（前2行）
-            block_4x4[16:24],   # 前8个Cb值（前2行）
-            block_4x4[32:40]    # 前8个Cr值（前2行）
-        ])
-        lower_4x2 = np.concatenate([
-            block_4x4[8:16],    # 后8个Y值（后2行）
-            block_4x4[24:32],   # 后8个Cb值（后2行）
-            block_4x4[40:48]    # 后8个Cr值（后2行）
-        ])
+    # 逐个递归编码变化的8x4块
+    for block_pos in changed_indices_8x4:
+        block_8x4 = current_blocks_8x4[block_pos]
         
-        # 使用4x2码表编码
-        upper_indices = encode_frame_with_codebook(upper_4x2.reshape(1, -1), codebook_4x2)
-        lower_indices = encode_frame_with_codebook(lower_4x2.reshape(1, -1), codebook_4x2)
+        # 递归编码当前8x4块
+        encoding, stats = encode_8x4_block_recursive(
+            block_8x4, codebook_8x4, codebook_4x4, codebook_4x2,
+            coverage_radius_8x4, coverage_radius_4x4
+        )
         
-        # P帧4x2编码格式：[位置, FFFF分裂标志, 上半码字, 下半码字]
-        frame_data.extend([block_pos, MARKER_4x4_BLOCK, upper_indices[0], lower_indices[0]])
-        stats['blocks_4x2_used'] += 2  # 一个4x4块拆分为2个4x2块
+        # P帧格式：位置 + 编码
+        frame_data.append(block_pos)
+        frame_data.extend(encoding)
+        
+        # 累加统计
+        for key in total_stats:
+            total_stats[key] += stats[key]
     
-    return frame_data, stats
+    return frame_data, total_stats
 
 if __name__ == "__main__":
     main()
