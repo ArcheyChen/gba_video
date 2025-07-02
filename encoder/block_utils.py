@@ -1,8 +1,9 @@
- 
 from numba import jit, prange
 import numpy as np 
 
 WIDTH, HEIGHT = 240, 160
+# 块尺寸定义
+BLOCK_8x8_W, BLOCK_8x8_H = 8, 8   # 8x8块
 BLOCK_8x4_W, BLOCK_8x4_H = 8, 4
 BLOCK_4x4_W, BLOCK_4x4_H = 4, 4
 BLOCK_4x2_W, BLOCK_4x2_H = 4, 2
@@ -80,6 +81,26 @@ def extract_blocks_from_yuv_4x4(Y, Cb, Cr, height, width, block_h, block_w):
             block_idx += 1
     return blocks
 
+@jit(nopython=True, cache=True)
+def extract_blocks_from_yuv_8x8(Y, Cb, Cr, height, width, block_h, block_w):
+    num_blocks_y = height // block_h
+    num_blocks_x = width // block_w
+    total_blocks = num_blocks_y * num_blocks_x
+    blocks = np.zeros((total_blocks, 192), dtype=np.uint8)  # 8x8 = 64 pixels per channel, 64*3=192
+    block_idx = 0
+    for by in range(num_blocks_y):
+        for bx in range(num_blocks_x):
+            y_start, y_end = by * block_h, (by + 1) * block_h
+            x_start, x_end = bx * block_w, (bx + 1) * block_w
+            y_block = Y[y_start:y_end, x_start:x_end].flatten()
+            blocks[block_idx, :64] = y_block
+            cb_block = Cb[y_start:y_end, x_start:x_end].flatten()
+            blocks[block_idx, 64:128] = cb_block
+            cr_block = Cr[y_start:y_end, x_start:x_end].flatten()
+            blocks[block_idx, 128:192] = cr_block
+            block_idx += 1
+    return blocks
+
 def extract_yuv444_blocks_4x2(frame_bgr: np.ndarray) -> np.ndarray:
     B = frame_bgr[:, :, 0].astype(np.float32)
     G = frame_bgr[:, :, 1].astype(np.float32)
@@ -111,6 +132,17 @@ def extract_yuv444_blocks_4x4(frame_bgr: np.ndarray) -> np.ndarray:
     Cb = np.clip(np.round(Cb + 128), 0, 255).astype(np.uint8)
     Cr = np.clip(np.round(Cr + 128), 0, 255).astype(np.uint8)
     blocks = extract_blocks_from_yuv_4x4(Y, Cb, Cr, HEIGHT, WIDTH, BLOCK_4x4_H, BLOCK_4x4_W)
+    return blocks
+
+def extract_yuv444_blocks_8x8(frame_bgr: np.ndarray) -> np.ndarray:
+    B = frame_bgr[:, :, 0].astype(np.float32)
+    G = frame_bgr[:, :, 1].astype(np.float32)
+    R = frame_bgr[:, :, 2].astype(np.float32)
+    Y, Cb, Cr = convert_bgr_to_yuv(B, G, R)
+    Y  = np.clip(np.round(Y), 0, 255).astype(np.uint8)
+    Cb = np.clip(np.round(Cb + 128), 0, 255).astype(np.uint8)
+    Cr = np.clip(np.round(Cr + 128), 0, 255).astype(np.uint8)
+    blocks = extract_blocks_from_yuv_8x8(Y, Cb, Cr, HEIGHT, WIDTH, BLOCK_8x8_H, BLOCK_8x8_W)
     return blocks
 
 @jit(nopython=True, cache=True)
@@ -189,6 +221,31 @@ def yuv444_to_bgr555_8x4(yuv444_block: np.ndarray) -> np.ndarray:
     return yuv444_to_bgr555_8x4_jit(yuv444_block)
 
 @jit(nopython=True, cache=True)
+def yuv444_to_bgr555_8x8_jit(yuv444_block):
+    y_values = yuv444_block[:64].astype(np.float32)
+    cb_values = yuv444_block[64:128].astype(np.float32) - 128
+    cr_values = yuv444_block[128:192].astype(np.float32) - 128
+    bgr555_values = np.zeros(64, dtype=np.uint16)
+    for i in range(64):
+        y = y_values[i]
+        cb = cb_values[i]
+        cr = cr_values[i]
+        R = y + 1.402 * cr
+        G = y - 0.344136 * cb - 0.714136 * cr
+        B = y + 1.772 * cb
+        R = max(0, min(255, R))
+        G = max(0, min(255, G))
+        B = max(0, min(255, B))
+        R5 = int(R * 31 / 255)
+        G5 = int(G * 31 / 255)
+        B5 = int(B * 31 / 255)
+        bgr555_values[i] = (B5 << 10) | (G5 << 5) | R5
+    return bgr555_values
+
+def yuv444_to_bgr555_8x8(yuv444_block: np.ndarray) -> np.ndarray:
+    return yuv444_to_bgr555_8x8_jit(yuv444_block)
+
+@jit(nopython=True, cache=True)
 def calculate_block_difference(block1, block2):
     diff = 0.0
     for i in range(24):
@@ -209,6 +266,13 @@ def calculate_block_difference_4x4(block1, block2):
     for i in range(48):
         d = float(block1[i]) - float(block2[i])
         diff += d * d
+    return diff
+
+@jit(nopython=True, cache=True)
+def calculate_block_difference_8x8(block1, block2):
+    diff = 0.0
+    for i in range(192):  # 8x8块有192个值（64Y + 64Cb + 64Cr）
+        diff += (float(block1[i]) - block2[i]) ** 2
     return diff
 
 @jit(nopython=True, cache=True)
@@ -256,6 +320,21 @@ def find_changed_blocks_4x4(current_blocks, previous_blocks, threshold):
     else:
         return np.zeros(0, dtype=np.int32)
 
+@jit(nopython=True, cache=True)
+def find_changed_blocks_8x8(current_blocks, previous_blocks, threshold):
+    num_blocks = current_blocks.shape[0]
+    temp_indices = np.zeros(num_blocks, dtype=np.int32)
+    count = 0
+    for i in range(num_blocks):
+        diff = calculate_block_difference_8x8(current_blocks[i], previous_blocks[i])
+        if diff > threshold:
+            temp_indices[count] = i
+            count += 1
+    if count > 0:
+        return temp_indices[:count]
+    else:
+        return np.zeros(0, dtype=np.int32)
+
 @jit(nopython=True, cache=True, parallel=True)
 def compute_distances_jit(blocks, codebook):
     n_blocks = blocks.shape[0]
@@ -278,3 +357,4 @@ def compute_distances_jit(blocks, codebook):
 def encode_frame_with_codebook(blocks: np.ndarray, codebook: np.ndarray) -> np.ndarray:
     indices = compute_distances_jit(blocks, codebook.astype(np.float32))
     return indices
+
