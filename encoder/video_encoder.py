@@ -16,9 +16,10 @@ from numba import jit, prange
 
 WIDTH, HEIGHT = 240, 160
 
-# 多级码表配置
-CODEBOOK_SIZE_4x4 = 128     # 4x4块码表大小
-CODEBOOK_SIZE_4x2 = 512     # 4x2块码表大小
+# 多级码表配置（默认值，将被命令行参数覆盖）
+DEFAULT_CODEBOOK_SIZE_4x4 = 128     # 4x4块码表大小
+DEFAULT_CODEBOOK_SIZE_4x2 = 512     # 4x2块码表大小
+DEFAULT_COVERAGE_RADIUS = 80.0      # 4x4块覆盖半径
 
 # 块尺寸定义
 BLOCK_4x4_W, BLOCK_4x4_H = 4, 4   # 4x4块
@@ -239,7 +240,9 @@ def generate_multi_level_codebooks_for_gop(
     i_frame_blocks_4x4: np.ndarray, 
     p_frame_blocks_4x4_list: list,
     i_frame_weight: int = I_FRAME_WEIGHT,
-    coverage_radius: float = 80.0
+    coverage_radius: float = DEFAULT_COVERAGE_RADIUS,
+    codebook_size_4x4: int = DEFAULT_CODEBOOK_SIZE_4x4,
+    codebook_size_4x2: int = DEFAULT_CODEBOOK_SIZE_4x2
 ) -> tuple:
     """
     为一个GOP生成多级码表（4x4 + 4x2）
@@ -249,6 +252,8 @@ def generate_multi_level_codebooks_for_gop(
     - p_frame_blocks_4x4_list: P帧的变化4x4块列表，每个元素是 (frame_idx, changed_blocks_4x4)
     - i_frame_weight: I帧块的权重
     - coverage_radius: 4x4码表的覆盖半径
+    - codebook_size_4x4: 4x4码表大小
+    - codebook_size_4x2: 4x2码表大小
     
     返回：(codebook_4x4, codebook_4x2)
     """
@@ -279,7 +284,7 @@ def generate_multi_level_codebooks_for_gop(
     codebook_4x4 = generate_codebook_4x4_max_coverage(
         all_training_blocks_4x4, 
         radius=coverage_radius, 
-        n_neighbors=128
+        n_neighbors=codebook_size_4x4
     )
     
     # 第三步：找出4x4码表无法很好覆盖的块，拆分为4x2块
@@ -323,9 +328,9 @@ def generate_multi_level_codebooks_for_gop(
         train_data_4x2 = uncovered_blocks_4x2.astype(np.float32)
         
         # 如果数据量足够，使用完整的K-means
-        if len(train_data_4x2) >= CODEBOOK_SIZE_4x2:
+        if len(train_data_4x2) >= codebook_size_4x2:
             warm = MiniBatchKMeans(
-                n_clusters=CODEBOOK_SIZE_4x2, 
+                n_clusters=codebook_size_4x2, 
                 random_state=42, 
                 n_init=20, 
                 max_iter=300, 
@@ -333,7 +338,7 @@ def generate_multi_level_codebooks_for_gop(
             ).fit(train_data_4x2)
             print("MiniBatchKMeans预热完成")
             kmeans = KMeans(
-                n_clusters=CODEBOOK_SIZE_4x2,
+                n_clusters=codebook_size_4x2,
                 init=warm.cluster_centers_,
                 n_init=1,
                 max_iter=100
@@ -342,24 +347,22 @@ def generate_multi_level_codebooks_for_gop(
         else:
             # 数据量不够，直接使用现有数据作为码表
             print(f"数据量不足，直接使用{len(train_data_4x2)}个块作为码表")
-            if len(train_data_4x2) < CODEBOOK_SIZE_4x2:
+            if len(train_data_4x2) < codebook_size_4x2:
                 # 用重复数据填充码表
-                repeats = CODEBOOK_SIZE_4x2 // len(train_data_4x2) + 1
-                extended_data = np.tile(train_data_4x2, (repeats, 1))[:CODEBOOK_SIZE_4x2]
+                repeats = codebook_size_4x2 // len(train_data_4x2) + 1
+                extended_data = np.tile(train_data_4x2, (repeats, 1))[:codebook_size_4x2]
                 codebook_4x2 = extended_data
             else:
-                codebook_4x2 = train_data_4x2[:CODEBOOK_SIZE_4x2]
+                codebook_4x2 = train_data_4x2[:codebook_size_4x2]
         
         codebook_4x2 = np.clip(codebook_4x2, 0, 255).round().astype(np.uint8)
     else:
         # 没有需要4x2码表的块，创建空码表
         print("没有需要4x2编码的块，创建空码表")
-        codebook_4x2 = np.zeros((CODEBOOK_SIZE_4x2, 24), dtype=np.uint8)
+        codebook_4x2 = np.zeros((codebook_size_4x2, 24), dtype=np.uint8)
     
     print(f"多级码表生成完成: 4x4({len(codebook_4x4)}), 4x2({len(codebook_4x2)})")
     return codebook_4x4, codebook_4x2
-    
-    return codebook.round().astype(np.uint8)
 
 def build_sparse_similarity(X: np.ndarray, radius: float, n_neighbors: int = 128) -> csr_matrix:
     """
@@ -398,7 +401,7 @@ def generate_codebook_4x4_max_coverage(blocks_4x4: np.ndarray, radius: float = 8
     print(f"为4x4块生成最大覆盖码表...块数: {len(blocks_4x4)}")
     
     if len(blocks_4x4) == 0:
-        return np.zeros((CODEBOOK_SIZE_4x4, 48), dtype=np.uint8)
+        return np.zeros((n_neighbors, 48), dtype=np.uint8)
     
     # 转换为float32用于距离计算
     X = blocks_4x4.astype(np.float32)
@@ -412,7 +415,7 @@ def generate_codebook_4x4_max_coverage(blocks_4x4: np.ndarray, radius: float = 8
     # 使用FacilityLocationSelection进行最大覆盖选择
     print("执行最大覆盖选择...")
     selector = FacilityLocationSelection(
-        n_samples=CODEBOOK_SIZE_4x4,
+        n_samples=n_neighbors,
         metric="precomputed",
         optimizer="lazy",
         verbose=False,
@@ -463,7 +466,7 @@ def encode_frame_with_codebook(blocks: np.ndarray, codebook: np.ndarray) -> np.n
     indices = compute_distances_jit(blocks, codebook.astype(np.float32))
     return indices
 
-def write_header(path_h: pathlib.Path, total_frames: int, gop_count: int, gop_size: int):
+def write_header(path_h: pathlib.Path, total_frames: int, gop_count: int, gop_size: int, codebook_size_4x4: int, codebook_size_4x2: int):
     guard = "VIDEO_DATA_H"
     with path_h.open("w", encoding="utf-8") as f:
         f.write(textwrap.dedent(f"""\
@@ -473,8 +476,8 @@ def write_header(path_h: pathlib.Path, total_frames: int, gop_count: int, gop_si
             #define VIDEO_FRAME_COUNT     {total_frames}
             #define VIDEO_WIDTH           {WIDTH}
             #define VIDEO_HEIGHT          {HEIGHT}
-            #define VIDEO_CODEBOOK_SIZE_4x4   {CODEBOOK_SIZE_4x4}
-            #define VIDEO_CODEBOOK_SIZE_4x2   {CODEBOOK_SIZE_4x2}
+            #define VIDEO_CODEBOOK_SIZE_4x4   {codebook_size_4x4}
+            #define VIDEO_CODEBOOK_SIZE_4x2   {codebook_size_4x2}
             #define VIDEO_BLOCKS_4x4_PER_FRAME {BLOCKS_4x4_PER_FRAME}
             #define VIDEO_BLOCKS_4x2_PER_FRAME {BLOCKS_4x2_PER_FRAME}
             #define VIDEO_BLOCK_SIZE_4x4  16
@@ -501,7 +504,7 @@ def write_header(path_h: pathlib.Path, total_frames: int, gop_count: int, gop_si
             #endif /* {guard} */
             """))
 
-def write_source(path_c: pathlib.Path, gop_codebooks: list, encoded_frames: list, frame_offsets: list, frame_types: list):
+def write_source(path_c: pathlib.Path, gop_codebooks: list, encoded_frames: list, frame_offsets: list, frame_types: list, codebook_size_4x4: int, codebook_size_4x2: int):
     with path_c.open("w", encoding="utf-8") as f:
         f.write('#include "video_data.h"\n\n')
         
@@ -695,6 +698,9 @@ def main():
     pa.add_argument("--gop-size", type=int,   default=60, help="GOP大小")
     pa.add_argument("--i-weight", type=int,   default=3, help="I帧权重")
     pa.add_argument("--diff-threshold", type=float, default=100, help="P帧块差异阈值")
+    pa.add_argument("--codebook-4x4", type=int, default=DEFAULT_CODEBOOK_SIZE_4x4, help="4x4码表大小")
+    pa.add_argument("--codebook-4x2", type=int, default=DEFAULT_CODEBOOK_SIZE_4x2, help="4x2码表大小")
+    pa.add_argument("--coverage-radius", type=float, default=DEFAULT_COVERAGE_RADIUS, help="4x4块覆盖半径")
     pa.add_argument("--out", default="video_data")
     args = pa.parse_args()
 
@@ -702,6 +708,9 @@ def main():
     gop_size = args.gop_size
     i_frame_weight = args.i_weight
     diff_threshold = args.diff_threshold
+    codebook_size_4x4 = args.codebook_4x4
+    codebook_size_4x2 = args.codebook_4x2
+    coverage_radius = args.coverage_radius
 
     cap = cv2.VideoCapture(args.input)
     if not cap.isOpened():
@@ -740,6 +749,14 @@ def main():
     frame_offsets = [0]  # 第一帧从0开始
     frame_types = []
     current_offset = 0
+    
+    # 统计信息
+    total_stats = {
+        'blocks_4x4_used': 0,
+        'blocks_4x2_used': 0,
+        'i_frame_stats': {'blocks_4x4_used': 0, 'blocks_4x2_used': 0},
+        'p_frame_stats': {'blocks_4x4_used': 0, 'blocks_4x2_used': 0}
+    }
 
     for gop_idx in range(gop_count):
         print(f"\n处理GOP {gop_idx + 1}/{gop_count}")
@@ -768,7 +785,8 @@ def main():
         
         # 为当前GOP生成多级码表
         codebook_4x4, codebook_4x2 = generate_multi_level_codebooks_for_gop(
-            i_frame_blocks_4x4, p_frame_blocks_4x4_list, i_frame_weight
+            i_frame_blocks_4x4, p_frame_blocks_4x4_list, i_frame_weight, 
+            coverage_radius, codebook_size_4x4, codebook_size_4x2
         )
         gop_codebooks.append((codebook_4x4, codebook_4x2))
         
@@ -777,16 +795,29 @@ def main():
             global_frame_idx = start_frame + frame_idx
             
             if frame_idx == 0:  # I帧
-                frame_data = encode_i_frame_multi_level(frame_blocks_4x4, codebook_4x4, codebook_4x2)
+                frame_data, frame_stats = encode_i_frame_multi_level(frame_blocks_4x4, codebook_4x4, codebook_4x2, coverage_radius)
                 frame_types.append(0)  # I帧
-                print(f"  I帧 {global_frame_idx}: {BLOCKS_4x4_PER_FRAME} 个4x4块")
+                print(f"  I帧 {global_frame_idx}: {BLOCKS_4x4_PER_FRAME} 个4x4块 (4x4码表: {frame_stats['blocks_4x4_used']}, 4x2码表: {frame_stats['blocks_4x2_used']})")
+                
+                # 更新统计
+                total_stats['blocks_4x4_used'] += frame_stats['blocks_4x4_used']
+                total_stats['blocks_4x2_used'] += frame_stats['blocks_4x2_used']
+                total_stats['i_frame_stats']['blocks_4x4_used'] += frame_stats['blocks_4x4_used']
+                total_stats['i_frame_stats']['blocks_4x2_used'] += frame_stats['blocks_4x2_used']
             else:  # P帧
                 # P帧只编码变化的块
                 previous_blocks = gop_frames[frame_idx - 1]
-                frame_data = encode_p_frame_multi_level(
-                    frame_blocks_4x4, previous_blocks, codebook_4x4, codebook_4x2, diff_threshold
+                frame_data, frame_stats = encode_p_frame_multi_level(
+                    frame_blocks_4x4, previous_blocks, codebook_4x4, codebook_4x2, diff_threshold, coverage_radius
                 )
                 frame_types.append(1)  # P帧
+                # print(f"  P帧 {global_frame_idx}: 变化块 (4x4码表: {frame_stats['blocks_4x4_used']}, 4x2码表: {frame_stats['blocks_4x2_used']})")
+                
+                # 更新统计
+                total_stats['blocks_4x4_used'] += frame_stats['blocks_4x4_used']
+                total_stats['blocks_4x2_used'] += frame_stats['blocks_4x2_used']
+                total_stats['p_frame_stats']['blocks_4x4_used'] += frame_stats['blocks_4x4_used']
+                total_stats['p_frame_stats']['blocks_4x2_used'] += frame_stats['blocks_4x2_used']
             
             encoded_frames.append(frame_data)
             current_offset += len(frame_data)
@@ -796,8 +827,8 @@ def main():
     frame_offsets = frame_offsets[:-1]
 
     # 写入文件
-    write_header(pathlib.Path(args.out).with_suffix(".h"), total_frames, gop_count, gop_size)
-    write_source(pathlib.Path(args.out).with_suffix(".c"), gop_codebooks, encoded_frames, frame_offsets, frame_types)
+    write_header(pathlib.Path(args.out).with_suffix(".h"), total_frames, gop_count, gop_size, codebook_size_4x4, codebook_size_4x2)
+    write_source(pathlib.Path(args.out).with_suffix(".c"), gop_codebooks, encoded_frames, frame_offsets, frame_types, codebook_size_4x4, codebook_size_4x2)
 
     # 详细统计信息
     print("\n" + "="*60)
@@ -814,12 +845,33 @@ def main():
     print(f"  - P帧: {p_frame_count} 帧")
     print(f"GOP数量: {gop_count}, GOP大小: {gop_size}")
     print(f"块尺寸: 4x4({BLOCKS_4x4_PER_FRAME}), 4x2({BLOCKS_4x2_PER_FRAME})")
-    print(f"码表大小: 4x4({CODEBOOK_SIZE_4x4}), 4x2({CODEBOOK_SIZE_4x2})")
+    print(f"码表大小: 4x4({codebook_size_4x4}), 4x2({codebook_size_4x2})")
+    print(f"覆盖半径: {coverage_radius}")
+    
+    # 码表使用统计
+    print(f"\n📋 码表使用统计:")
+    print(f"总计:")
+    print(f"  - 4x4码表使用: {total_stats['blocks_4x4_used']:,} 个4x4块")
+    print(f"  - 4x2码表使用: {total_stats['blocks_4x2_used']:,} 个4x2块")
+    
+    total_4x4_blocks = i_frame_count * BLOCKS_4x4_PER_FRAME  # I帧中所有4x4块都需要编码
+    total_possible_4x2_blocks = total_4x4_blocks * 2  # 每个4x4块最多拆分为2个4x2块
+    
+    print(f"I帧统计:")
+    print(f"  - 4x4码表使用: {total_stats['i_frame_stats']['blocks_4x4_used']:,} 个4x4块")
+    print(f"  - 4x2码表使用: {total_stats['i_frame_stats']['blocks_4x2_used']:,} 个4x2块")
+    if total_4x4_blocks > 0:
+        i_4x4_ratio = total_stats['i_frame_stats']['blocks_4x4_used'] / total_4x4_blocks * 100
+        print(f"  - I帧中4x4码表覆盖率: {i_4x4_ratio:.1f}%")
+    
+    print(f"P帧统计:")
+    print(f"  - 4x4码表使用: {total_stats['p_frame_stats']['blocks_4x4_used']:,} 个4x4块")
+    print(f"  - 4x2码表使用: {total_stats['p_frame_stats']['blocks_4x2_used']:,} 个4x2块")
     
     # 计算各部分大小
     # 1. 码表大小
-    codebook_4x4_size_bytes = gop_count * CODEBOOK_SIZE_4x4 * 16 * 2  # 每个4x4码字16个uint16
-    codebook_4x2_size_bytes = gop_count * CODEBOOK_SIZE_4x2 * 8 * 2   # 每个4x2码字8个uint16
+    codebook_4x4_size_bytes = gop_count * codebook_size_4x4 * 16 * 2  # 每个4x4码字16个uint16
+    codebook_4x2_size_bytes = gop_count * codebook_size_4x2 * 8 * 2   # 每个4x2码字8个uint16
     codebook_size_bytes = codebook_4x4_size_bytes + codebook_4x2_size_bytes
     
     # 2. 帧数据大小
@@ -866,17 +918,28 @@ def main():
     
     print(f"✅ 编码完成！输出文件: {args.out}.h, {args.out}.c")
 
-def encode_i_frame_multi_level(frame_blocks_4x4: np.ndarray, codebook_4x4: np.ndarray, codebook_4x2: np.ndarray, coverage_radius: float = 80.0) -> list:
+def encode_i_frame_multi_level(frame_blocks_4x4: np.ndarray, codebook_4x4: np.ndarray, codebook_4x2: np.ndarray, coverage_radius: float = 80.0) -> tuple:
     """
     使用多级码表编码I帧
     先尝试用4x4码表，如果距离太远则拆分为4x2块编码
     
-    返回格式：[总块数, 块1编码, 块2编码, ...]
+    返回格式：([总块数, 块1编码, 块2编码, ...], stats)
     其中块编码为：
     - 4x4块：MARKER_4x4_BLOCK, 码字索引
     - 4x2块：上半码字索引, 下半码字索引
+    
+    stats格式：{
+        'blocks_4x4_used': 使用4x4码表的块数,
+        'blocks_4x2_used': 使用4x2码表的块数(以4x2块为单位)
+    }
     """
     frame_data = [BLOCKS_4x4_PER_FRAME]  # 总块数
+    
+    # 统计信息
+    stats = {
+        'blocks_4x4_used': 0,
+        'blocks_4x2_used': 0
+    }
     
     # 计算每个4x4块到4x4码表的最小距离
     distances_4x4 = pairwise_distances(
@@ -892,6 +955,7 @@ def encode_i_frame_multi_level(frame_blocks_4x4: np.ndarray, codebook_4x4: np.nd
         if min_distances_4x4[block_idx] <= coverage_radius:
             # 使用4x4码表
             frame_data.extend([MARKER_4x4_BLOCK, best_indices_4x4[block_idx]])
+            stats['blocks_4x4_used'] += 1
         else:
             # 拆分为4x2块编码
             block_4x4 = frame_blocks_4x4[block_idx]
@@ -914,8 +978,9 @@ def encode_i_frame_multi_level(frame_blocks_4x4: np.ndarray, codebook_4x4: np.nd
             lower_indices = encode_frame_with_codebook(lower_4x2.reshape(1, -1), codebook_4x2)
             
             frame_data.extend([upper_indices[0], lower_indices[0]])
+            stats['blocks_4x2_used'] += 2  # 一个4x4块拆分为2个4x2块
     
-    return frame_data
+    return frame_data, stats
 
 def encode_p_frame_multi_level(
     current_blocks_4x4: np.ndarray, 
@@ -924,19 +989,29 @@ def encode_p_frame_multi_level(
     codebook_4x2: np.ndarray, 
     diff_threshold: float,
     coverage_radius: float = 80.0
-) -> list:
+) -> tuple:
     """
     使用多级码表编码P帧
     只编码发生变化的块，分为4x4和4x2两个部分
     
-    返回格式：[4x4变化块数, 4x4块编码..., 4x2变化块数, 4x2块编码...]
+    返回格式：([4x4变化块数, 4x4块编码..., 4x2变化块数, 4x2块编码...], stats)
+    
+    stats格式：{
+        'blocks_4x4_used': 使用4x4码表的块数,
+        'blocks_4x2_used': 使用4x2码表的块数(以4x2块为单位)
+    }
     """
+    # 统计信息
+    stats = {
+        'blocks_4x4_used': 0,
+        'blocks_4x2_used': 0
+    }
     # 找出发生变化的4x4块
     changed_indices_4x4 = find_changed_blocks_4x4(current_blocks_4x4, previous_blocks_4x4, diff_threshold)
     
     if len(changed_indices_4x4) == 0:
         # 没有变化
-        return [0, 0]  # 4x4变化块数=0, 4x2变化块数=0
+        return [0, 0], stats  # 4x4变化块数=0, 4x2变化块数=0
     
     changed_blocks_4x4 = current_blocks_4x4[changed_indices_4x4]
     
@@ -963,6 +1038,7 @@ def encode_p_frame_multi_level(
     frame_data.append(len(indices_4x4))  # 4x4变化块数
     for pos, code in zip(indices_4x4, codes_4x4):
         frame_data.extend([pos, MARKER_4x4_BLOCK, code])
+    stats['blocks_4x4_used'] += len(indices_4x4)
     
     # 第二部分：4x2块编码
     indices_4x2_blocks = changed_indices_4x4[use_4x2_mask]
@@ -989,8 +1065,9 @@ def encode_p_frame_multi_level(
         
         # P帧4x2编码格式：[位置, 上半码字, 下半码字]
         frame_data.extend([block_pos, upper_indices[0], lower_indices[0]])
+        stats['blocks_4x2_used'] += 2  # 一个4x4块拆分为2个4x2块
     
-    return frame_data
+    return frame_data, stats
 
 if __name__ == "__main__":
     main()
