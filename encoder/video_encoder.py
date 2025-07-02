@@ -1173,6 +1173,8 @@ def main():
             i_frame_blocks_8x4, p_frame_blocks_8x4_list, i_frame_weight, 
             coverage_radius_8x4, coverage_radius_4x4, codebook_size_8x4, codebook_size_4x4, codebook_size_4x2
         )
+
+        gop_codebooks.append((codebook_8x4, codebook_4x4, codebook_4x2))
         
         # 编码当前GOP的所有帧
         for frame_idx, frame_blocks_8x4 in enumerate(gop_frames):
