@@ -920,13 +920,13 @@ def main():
 
 def encode_i_frame_multi_level(frame_blocks_4x4: np.ndarray, codebook_4x4: np.ndarray, codebook_4x2: np.ndarray, coverage_radius: float = 80.0) -> tuple:
     """
-    使用多级码表编码I帧
-    先尝试用4x4码表，如果距离太远则拆分为4x2块编码
+    使用多级码表编码I帧 - 4x4块优先，FFFF作为分裂标志
+    
+    新的编码格式：
+    - 4x4块：4x4码字索引 (直接是索引，不需要MARKER)
+    - 分裂为4x2块：MARKER_4x4_BLOCK, 上半4x2码字索引, 下半4x2码字索引
     
     返回格式：([总块数, 块1编码, 块2编码, ...], stats)
-    其中块编码为：
-    - 4x4块：MARKER_4x4_BLOCK, 码字索引
-    - 4x2块：上半码字索引, 下半码字索引
     
     stats格式：{
         'blocks_4x4_used': 使用4x4码表的块数,
@@ -953,11 +953,11 @@ def encode_i_frame_multi_level(frame_blocks_4x4: np.ndarray, codebook_4x4: np.nd
     
     for block_idx in range(len(frame_blocks_4x4)):
         if min_distances_4x4[block_idx] <= coverage_radius:
-            # 使用4x4码表
-            frame_data.extend([MARKER_4x4_BLOCK, best_indices_4x4[block_idx]])
+            # 使用4x4码表 - 直接输出索引
+            frame_data.append(best_indices_4x4[block_idx])
             stats['blocks_4x4_used'] += 1
         else:
-            # 拆分为4x2块编码
+            # 需要分裂为4x2块编码 - 输出FFFF分裂标志 + 两个4x2索引
             block_4x4 = frame_blocks_4x4[block_idx]
             
             # 上半部分：前2行
@@ -977,7 +977,8 @@ def encode_i_frame_multi_level(frame_blocks_4x4: np.ndarray, codebook_4x4: np.nd
             upper_indices = encode_frame_with_codebook(upper_4x2.reshape(1, -1), codebook_4x2)
             lower_indices = encode_frame_with_codebook(lower_4x2.reshape(1, -1), codebook_4x2)
             
-            frame_data.extend([upper_indices[0], lower_indices[0]])
+            # 输出：分裂标志 + 上半4x2索引 + 下半4x2索引
+            frame_data.extend([MARKER_4x4_BLOCK, upper_indices[0], lower_indices[0]])
             stats['blocks_4x2_used'] += 2  # 一个4x4块拆分为2个4x2块
     
     return frame_data, stats
@@ -1037,7 +1038,7 @@ def encode_p_frame_multi_level(
     
     frame_data.append(len(indices_4x4))  # 4x4变化块数
     for pos, code in zip(indices_4x4, codes_4x4):
-        frame_data.extend([pos, MARKER_4x4_BLOCK, code])
+        frame_data.extend([pos, code])  # P帧4x4编码：位置 + 4x4码字索引（不需要MARKER）
     stats['blocks_4x4_used'] += len(indices_4x4)
     
     # 第二部分：4x2块编码
@@ -1063,8 +1064,8 @@ def encode_p_frame_multi_level(
         upper_indices = encode_frame_with_codebook(upper_4x2.reshape(1, -1), codebook_4x2)
         lower_indices = encode_frame_with_codebook(lower_4x2.reshape(1, -1), codebook_4x2)
         
-        # P帧4x2编码格式：[位置, 上半码字, 下半码字]
-        frame_data.extend([block_pos, upper_indices[0], lower_indices[0]])
+        # P帧4x2编码格式：[位置, FFFF分裂标志, 上半码字, 下半码字]
+        frame_data.extend([block_pos, MARKER_4x4_BLOCK, upper_indices[0], lower_indices[0]])
         stats['blocks_4x2_used'] += 2  # 一个4x4块拆分为2个4x2块
     
     return frame_data, stats

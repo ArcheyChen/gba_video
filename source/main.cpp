@@ -119,10 +119,10 @@ IWRAM_CODE void decode_4x2_block_from_bgr555_buffer(u16 codeword_idx, u16* dst, 
 
 IWRAM_CODE void decode_i_frame_multi_level(const u16* frame_data, u16* dst)
 {
-    // I帧格式：[总块数, 块1编码, 块2编码, ...]
+    // I帧新格式：[总块数, 块1编码, 块2编码, ...]
     // 其中块编码为：
-    // - 4x4块：MARKER_4x4_BLOCK, 码字索引
-    // - 4x2块：上半码字索引, 下半码字索引
+    // - 4x4块：4x4码字索引 (直接是索引)
+    // - 分裂为4x2块：MARKER_4x4_BLOCK, 上半4x2码字索引, 下半4x2码字索引
     
     u16 total_blocks = frame_data[0];
     const u16* data = frame_data + 1;
@@ -133,14 +133,9 @@ IWRAM_CODE void decode_i_frame_multi_level(const u16* frame_data, u16* dst)
         u16* block_4x4_dst = dst + block_4x4_offset_table[block_4x4_pos];
         
         if (data[data_idx] == VIDEO_MARKER_4x4) {
-            // 使用4x4码表
-            u16 codeword_idx = data[data_idx + 1];
-            decode_4x4_block_from_bgr555_buffer(codeword_idx, block_4x4_dst, SCREEN_WIDTH);
-            data_idx += 2;
-        } else {
-            // 拆分为两个4x2块
-            u16 upper_codeword = data[data_idx];
-            u16 lower_codeword = data[data_idx + 1];
+            // 分裂标志：需要拆分为两个4x2块
+            u16 upper_codeword = data[data_idx + 1]; // 上半4x2码字索引
+            u16 lower_codeword = data[data_idx + 2]; // 下半4x2码字索引
             
             // 解码上半部分 (前2行)
             decode_4x2_block_from_bgr555_buffer(upper_codeword, block_4x4_dst, SCREEN_WIDTH);
@@ -149,7 +144,12 @@ IWRAM_CODE void decode_i_frame_multi_level(const u16* frame_data, u16* dst)
             u16* lower_dst = block_4x4_dst + 2 * SCREEN_WIDTH;
             decode_4x2_block_from_bgr555_buffer(lower_codeword, lower_dst, SCREEN_WIDTH);
             
-            data_idx += 2;
+            data_idx += 3; // 跳过 MARKER + 两个4x2索引
+        } else {
+            // 使用4x4码表：直接是4x4码字索引
+            u16 codeword_idx = data[data_idx];
+            decode_4x4_block_from_bgr555_buffer(codeword_idx, block_4x4_dst, SCREEN_WIDTH);
+            data_idx += 1; // 跳过1个4x4索引
         }
     }
 }
@@ -161,25 +161,25 @@ IWRAM_CODE void decode_p_frame_multi_level(const u16* frame_data, u16* dst)
     const u16* data = frame_data;
     int data_idx = 0;
     
-    // 第一部分：解码4x4块
+    // 第一部分：解码4x4块（直接使用4x4码表的块）
     u16 changed_4x4_count = data[data_idx++];
     
     for (int i = 0; i < changed_4x4_count; i++)
     {
         u16 block_4x4_pos = data[data_idx++];     // 4x4块位置
-        u16 marker = data[data_idx++];            // 应该是MARKER_4x4_BLOCK
-        u16 codeword_idx = data[data_idx++];      // 4x4码字索引
+        u16 codeword_idx = data[data_idx++];      // 4x4码字索引（无MARKER）
         
         u16* block_4x4_dst = dst + block_4x4_offset_table[block_4x4_pos];
         decode_4x4_block_from_bgr555_buffer(codeword_idx, block_4x4_dst, SCREEN_WIDTH);
     }
     
-    // 第二部分：解码需要拆分为4x2的块
+    // 第二部分：解码需要分裂为4x2的块
     u16 changed_4x2_blocks_count = data[data_idx++];
     
     for (int i = 0; i < changed_4x2_blocks_count; i++)
     {
         u16 block_4x4_pos = data[data_idx++];     // 原4x4块位置
+        u16 marker = data[data_idx++];            // 应该是MARKER_4x4_BLOCK (分裂标志)
         u16 upper_codeword = data[data_idx++];    // 上半4x2码字索引
         u16 lower_codeword = data[data_idx++];    // 下半4x2码字索引
         
