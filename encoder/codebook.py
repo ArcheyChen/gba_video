@@ -6,6 +6,17 @@ from scipy.sparse import csr_matrix
 from apricot import FacilityLocationSelection
 
 # 码本生成相关函数
+def split_8x4_to_4x4(block_8x4):
+    y  = block_8x4[:32].reshape(4, 8)
+    cb = block_8x4[32:64].reshape(4, 8)
+    cr = block_8x4[64:96].reshape(4, 8)
+    left  = np.concatenate([y[:, :4].flatten(),
+                            cb[:, :4].flatten(),
+                            cr[:, :4].flatten()])
+    right = np.concatenate([y[:, 4:].flatten(),
+                            cb[:, 4:].flatten(),
+                            cr[:, 4:].flatten()])
+    return left, right
 
 def generate_multi_level_codebooks_for_gop(
     i_frame_blocks_8x4: np.ndarray, 
@@ -49,17 +60,7 @@ def generate_multi_level_codebooks_for_gop(
     print(f"8x4无法覆盖的块数: {len(uncovered_blocks_8x4)} / {len(all_training_blocks_8x4)}")
     uncovered_blocks_4x4 = []
     for block_8x4 in uncovered_blocks_8x4:
-        y_8x4 = block_8x4[:32].reshape(4, 8)
-        left_y_4x4 = y_8x4[:, :4].flatten()
-        right_y_4x4 = y_8x4[:, 4:].flatten()
-        cb_8x4 = block_8x4[32:64].reshape(4, 8)
-        left_cb_4x4 = cb_8x4[:, :4].flatten()
-        right_cb_4x4 = cb_8x4[:, 4:].flatten()
-        cr_8x4 = block_8x4[64:96].reshape(4, 8)
-        left_cr_4x4 = cr_8x4[:, :4].flatten()
-        right_cr_4x4 = cr_8x4[:, 4:].flatten()
-        left_4x4 = np.concatenate([left_y_4x4, left_cb_4x4, left_cr_4x4])
-        right_4x4 = np.concatenate([right_y_4x4, right_cb_4x4, right_cr_4x4])
+        left_4x4, right_4x4 = split_8x4_to_4x4(block_8x4)
         uncovered_blocks_4x4.extend([left_4x4, right_4x4])
     uncovered_blocks_4x4 = np.array(uncovered_blocks_4x4) if uncovered_blocks_4x4 else np.zeros((0, 48), dtype=np.uint8)
     print(f"拆分得到的4x4块数: {len(uncovered_blocks_4x4)}")
@@ -301,16 +302,7 @@ def generate_multi_level_codebooks_for_gop_8x8(
         uncovered_blocks_4x4 = []
         for block_8x4 in uncovered_8x4_blocks:
             # 拆分8x4为左右两个4x4
-            left_4x4 = np.concatenate([
-                block_8x4[:16],    # 左半Y
-                block_8x4[32:48],  # 左半Cb
-                block_8x4[64:80]   # 左半Cr
-            ])
-            right_4x4 = np.concatenate([
-                block_8x4[16:32],  # 右半Y
-                block_8x4[48:64],  # 右半Cb
-                block_8x4[80:96]   # 右半Cr
-            ])
+            left_4x4, right_4x4 = split_8x4_to_4x4(block_8x4)
             uncovered_blocks_4x4.extend([left_4x4, right_4x4])
     else:
         # 如果没有8x4块，创建空的8x4码表
