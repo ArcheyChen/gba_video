@@ -385,18 +385,30 @@ def generate_multi_level_codebooks_for_gop(
     uncovered_blocks_4x4 = []
     for block_8x4 in uncovered_blocks_8x4:
         # 将96维的8x4块拆分为两个48维的4x4块
-        # 左半部分：前4列
-        left_4x4 = np.concatenate([
-            block_8x4[:16],      # 前16个Y值（左半4x4）
-            block_8x4[32:48],    # 前16个Cb值（左半4x4）
-            block_8x4[64:80]     # 前16个Cr值（左半4x4）
-        ])
-        # 右半部分：后4列
-        right_4x4 = np.concatenate([
-            block_8x4[16:32],    # 后16个Y值（右半4x4）
-            block_8x4[48:64],    # 后16个Cb值（右半4x4）
-            block_8x4[80:96]     # 后16个Cr值（右半4x4）
-        ])
+        # 8x4块的数据布局：32Y + 32Cb + 32Cr，每个分量都是4行8列的flatten结果
+        
+        # 提取Y分量（4行8列，按行存储）
+        y_8x4 = block_8x4[:32].reshape(4, 8)  # 重塑为4x8矩阵
+        # 左半4x4：前4列
+        left_y_4x4 = y_8x4[:, :4].flatten()   # 每行前4个像素
+        # 右半4x4：后4列  
+        right_y_4x4 = y_8x4[:, 4:].flatten()  # 每行后4个像素
+        
+        # 提取Cb分量（4行8列，按行存储）
+        cb_8x4 = block_8x4[32:64].reshape(4, 8)
+        left_cb_4x4 = cb_8x4[:, :4].flatten()
+        right_cb_4x4 = cb_8x4[:, 4:].flatten()
+        
+        # 提取Cr分量（4行8列，按行存储）
+        cr_8x4 = block_8x4[64:96].reshape(4, 8)
+        left_cr_4x4 = cr_8x4[:, :4].flatten()
+        right_cr_4x4 = cr_8x4[:, 4:].flatten()
+        
+        # 组装左半4x4块（16Y + 16Cb + 16Cr）
+        left_4x4 = np.concatenate([left_y_4x4, left_cb_4x4, left_cr_4x4])
+        # 组装右半4x4块（16Y + 16Cb + 16Cr）
+        right_4x4 = np.concatenate([right_y_4x4, right_cb_4x4, right_cr_4x4])
+        
         uncovered_blocks_4x4.extend([left_4x4, right_4x4])
     
     uncovered_blocks_4x4 = np.array(uncovered_blocks_4x4) if uncovered_blocks_4x4 else np.zeros((0, 48), dtype=np.uint8)
@@ -1348,16 +1360,29 @@ def encode_8x4_block_recursive(
         return [best_idx], stats
     else:
         # 8x4无法覆盖，拆分为两个4x4块
-        left_4x4 = np.concatenate([
-            block_8x4[:16],      # 前16个Y值（左半4x4）
-            block_8x4[32:48],    # 前16个Cb值（左半4x4）
-            block_8x4[64:80]     # 前16个Cr值（左半4x4）
-        ])
-        right_4x4 = np.concatenate([
-            block_8x4[16:32],    # 后16个Y值（右半4x4）
-            block_8x4[48:64],    # 后16个Cb值（右半4x4）
-            block_8x4[80:96]     # 后16个Cr值（右半4x4）
-        ])
+        # 正确的8x4→4x4拆分：左右分割，而不是前后分割
+        
+        # 提取Y分量（4行8列，按行存储）
+        y_8x4 = block_8x4[:32].reshape(4, 8)  # 重塑为4x8矩阵
+        # 左半4x4：前4列
+        left_y_4x4 = y_8x4[:, :4].flatten()   # 每行前4个像素
+        # 右半4x4：后4列  
+        right_y_4x4 = y_8x4[:, 4:].flatten()  # 每行后4个像素
+        
+        # 提取Cb分量（4行8列，按行存储）
+        cb_8x4 = block_8x4[32:64].reshape(4, 8)
+        left_cb_4x4 = cb_8x4[:, :4].flatten()
+        right_cb_4x4 = cb_8x4[:, 4:].flatten()
+        
+        # 提取Cr分量（4行8列，按行存储）
+        cr_8x4 = block_8x4[64:96].reshape(4, 8)
+        left_cr_4x4 = cr_8x4[:, :4].flatten()
+        right_cr_4x4 = cr_8x4[:, 4:].flatten()
+        
+        # 组装左半4x4块（16Y + 16Cb + 16Cr）
+        left_4x4 = np.concatenate([left_y_4x4, left_cb_4x4, left_cr_4x4])
+        # 组装右半4x4块（16Y + 16Cb + 16Cr）
+        right_4x4 = np.concatenate([right_y_4x4, right_cb_4x4, right_cr_4x4])
         
         # 递归编码左4x4和右4x4
         left_encoding, left_stats = encode_4x4_block_recursive(
