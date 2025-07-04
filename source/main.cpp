@@ -404,7 +404,19 @@ IWRAM_CODE void decode_p_frame_multi_level_separate(const u16* frame_data, u16* 
 }
 
 static volatile u32 vbl = 0;
-void isr_vbl() { ++vbl; REG_IF = IRQ_VBLANK; }
+static volatile u32 played_frames = 0;
+static volatile u32 FPS = 0;
+u16 FPS_DISPLAY_LEN = 0;
+void isr_vbl() { 
+    ++vbl; 
+    if(vbl >= 60){
+        vbl = 0;
+        FPS = played_frames;
+        played_frames = 0;
+        FPS_DISPLAY_LEN = SCREEN_WIDTH/30 * FPS;
+    }
+    REG_IF = IRQ_VBLANK; 
+}
 
 int main()
 {
@@ -449,7 +461,12 @@ int main()
         }
 
         // 复制到VRAM
+        played_frames++;
+        u16 FPS_DISPLAY_COLOR = RGB5(31, 31, 31); // 白色
+        // 在屏幕上显示FPS,条状显示，节省资源
         DMA3COPY(ewramBuffer, VRAM, PIXELS_PER_FRAME | DMA16);
+        if(FPS_DISPLAY_LEN > 0)
+            DMA3COPY(&FPS_DISPLAY_COLOR, VRAM, FPS_DISPLAY_LEN | DMA16 | DMA_SRC_FIXED);
 
         frame++;
         if(frame >= frames_total) // 循环播放
