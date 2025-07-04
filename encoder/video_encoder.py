@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
 import argparse, cv2, numpy as np, pathlib, textwrap
+import multiprocessing as mp
+import time
 from sklearn.cluster import KMeans,MiniBatchKMeans
 from sklearn.neighbors import NearestNeighbors
 from sklearn.metrics import pairwise_distances
@@ -298,7 +300,7 @@ def main():
     gop_count = (total_frames + gop_size - 1) // gop_size
     print(f"总帧数: {total_frames}, GOP数量: {gop_count}, GOP大小: {gop_size}")
 
-    # 为每个GOP生成编码数据
+    # 为每个GOP生成编码数据（多进程并行）
     gop_codebooks = []
     encoded_frames = []
     frame_offsets = [0]  # 第一帧从0开始
@@ -315,77 +317,74 @@ def main():
         'p_frame_stats': {'blocks_8x8_used': 0, 'blocks_8x4_used': 0, 'blocks_4x4_used': 0, 'blocks_4x2_used': 0}
     }
 
+    # 准备多进程参数
+    gop_args = []
     for gop_idx in range(gop_count):
-        print(f"\n处理GOP {gop_idx + 1}/{gop_count}")
-        
         # 确定当前GOP的帧范围
         start_frame = gop_idx * gop_size
         end_frame = min((gop_idx + 1) * gop_size, total_frames)
         gop_frames = all_frame_blocks[start_frame:end_frame]
         
-        # 第一帧是I帧
-        i_frame_blocks_8x8 = gop_frames[0]
-        
-        # 分析P帧的变化8x8块
-        p_frame_blocks_8x8_list = []
-        for frame_idx in range(1, len(gop_frames)):
-            current_blocks = gop_frames[frame_idx]
-            previous_blocks = gop_frames[frame_idx - 1]
-            changed_indices = find_changed_blocks_8x8(current_blocks, previous_blocks, diff_threshold)
-            if len(changed_indices) > 0:
-                changed_blocks = current_blocks[changed_indices]
-                p_frame_blocks_8x8_list.append((frame_idx, changed_blocks))
-        
-        # 为当前GOP生成四级码表
-        codebook_8x8, codebook_8x4, codebook_4x4, codebook_4x2 = generate_multi_level_codebooks_for_gop_8x8(
-            i_frame_blocks_8x8, p_frame_blocks_8x8_list, i_frame_weight, 
-            coverage_radius_8x8, coverage_radius_8x4, coverage_radius_4x4, 
-            codebook_size_8x8, codebook_size_8x4, codebook_size_4x4, codebook_size_4x2
+        # 准备参数元组
+        args_tuple = (
+            gop_idx, gop_frames, gop_size, i_frame_weight, diff_threshold,
+            codebook_size_8x8, codebook_size_8x4, codebook_size_4x4, codebook_size_4x2,
+            coverage_radius_8x8, coverage_radius_8x4, coverage_radius_4x4
         )
-
-        gop_codebooks.append((codebook_8x8, codebook_8x4, codebook_4x4, codebook_4x2))
+        gop_args.append(args_tuple)
+    
+    # 使用多进程并行处理GOP
+    print(f"\n🚀 启动多进程处理 {gop_count} 个GOP...")
+    cpu_count = mp.cpu_count()
+    process_count = min(cpu_count, gop_count)  # 不要启动比GOP数量更多的进程
+    print(f"CPU核心数: {cpu_count}, 使用进程数: {process_count}")
+    
+    start_time = time.time()
+    
+    with mp.Pool(processes=process_count) as pool:
+        # 提交所有GOP处理任务
+        results = pool.map(process_single_gop, gop_args)
+    
+    parallel_time = time.time() - start_time
+    print(f"✅ 多进程处理完成！总耗时: {parallel_time:.1f}s")
+    
+    # 按GOP索引排序结果（确保顺序正确）
+    results.sort(key=lambda x: x[0])
+    
+    # 重新组装结果
+    print("\n📦 重新组装编码结果...")
+    gop_codebooks = [None] * gop_count
+    
+    for gop_idx, codebooks, gop_encoded_frames, gop_frame_stats_list in results:
+        # 存储码表
+        gop_codebooks[gop_idx] = codebooks
         
-        # 编码当前GOP的所有帧
-        for frame_idx, frame_blocks_8x8 in enumerate(gop_frames):
-            global_frame_idx = start_frame + frame_idx
+        # 处理每一帧的编码数据
+        for frame_idx, ((frame_data, frame_type), frame_stats) in enumerate(zip(gop_encoded_frames, gop_frame_stats_list)):
+            global_frame_idx = gop_idx * gop_size + frame_idx
             
-            if frame_idx == 0:  # I帧
-                frame_data, frame_stats = encode_i_frame_multi_level_8x8(frame_blocks_8x8, codebook_8x8, codebook_8x4, codebook_4x4, codebook_4x2, coverage_radius_8x8, coverage_radius_8x4, coverage_radius_4x4)
-                frame_types.append(0)  # I帧
-                print(f"  I帧 {global_frame_idx}: {BLOCKS_8x8_PER_FRAME} 个8x8块 (8x8码表: {frame_stats['blocks_8x8_used']}, 8x4码表: {frame_stats['blocks_8x4_used']}, 4x4码表: {frame_stats['blocks_4x4_used']}, 4x2码表: {frame_stats['blocks_4x2_used']})")
-                
-                # 更新统计
-                total_stats['blocks_8x8_used'] += frame_stats['blocks_8x8_used']
-                total_stats['blocks_8x4_used'] += frame_stats['blocks_8x4_used']
-                total_stats['blocks_4x4_used'] += frame_stats['blocks_4x4_used']
-                total_stats['blocks_4x2_used'] += frame_stats['blocks_4x2_used']
+            encoded_frames.append(frame_data)
+            frame_types.append(frame_type)
+            current_offset += len(frame_data)
+            frame_offsets.append(current_offset)
+            
+            # 更新统计
+            total_stats['blocks_8x8_used'] += frame_stats['blocks_8x8_used']
+            total_stats['blocks_8x4_used'] += frame_stats['blocks_8x4_used']
+            total_stats['blocks_4x4_used'] += frame_stats['blocks_4x4_used']
+            total_stats['blocks_4x2_used'] += frame_stats['blocks_4x2_used']
+            
+            if frame_type == 0:  # I帧
                 total_stats['i_frame_stats']['blocks_8x8_used'] += frame_stats['blocks_8x8_used']
                 total_stats['i_frame_stats']['blocks_8x4_used'] += frame_stats['blocks_8x4_used']
                 total_stats['i_frame_stats']['blocks_4x4_used'] += frame_stats['blocks_4x4_used']
                 total_stats['i_frame_stats']['blocks_4x2_used'] += frame_stats['blocks_4x2_used']
+                print(f"  I帧 {global_frame_idx}: {BLOCKS_8x8_PER_FRAME} 个8x8块 (8x8码表: {frame_stats['blocks_8x8_used']}, 8x4码表: {frame_stats['blocks_8x4_used']}, 4x4码表: {frame_stats['blocks_4x4_used']}, 4x2码表: {frame_stats['blocks_4x2_used']})")
             else:  # P帧
-                # P帧只编码变化的块（使用新的分层编码）
-                previous_blocks = gop_frames[frame_idx - 1]
-                frame_data, frame_stats = encode_p_frame_multi_level_separate(
-                    frame_blocks_8x8, previous_blocks, codebook_8x8, codebook_8x4, codebook_4x4, codebook_4x2, 
-                    diff_threshold, coverage_radius_8x8, coverage_radius_8x4, coverage_radius_4x4
-                )
-                frame_types.append(1)  # P帧
-                # print(f"  P帧 {global_frame_idx}: 变化块 (8x8码表: {frame_stats['blocks_8x8_used']}, 8x4码表: {frame_stats['blocks_8x4_used']}, 4x4码表: {frame_stats['blocks_4x4_used']}, 4x2码表: {frame_stats['blocks_4x2_used']})")
-                
-                # 更新统计
-                total_stats['blocks_8x8_used'] += frame_stats['blocks_8x8_used']
-                total_stats['blocks_8x4_used'] += frame_stats['blocks_8x4_used']
-                total_stats['blocks_4x4_used'] += frame_stats['blocks_4x4_used']
-                total_stats['blocks_4x2_used'] += frame_stats['blocks_4x2_used']
                 total_stats['p_frame_stats']['blocks_8x8_used'] += frame_stats['blocks_8x8_used']
                 total_stats['p_frame_stats']['blocks_8x4_used'] += frame_stats['blocks_8x4_used']
                 total_stats['p_frame_stats']['blocks_4x4_used'] += frame_stats['blocks_4x4_used']
                 total_stats['p_frame_stats']['blocks_4x2_used'] += frame_stats['blocks_4x2_used']
-            
-            encoded_frames.append(frame_data)
-            current_offset += len(frame_data)
-            frame_offsets.append(current_offset)
 
     # 移除最后一个多余的偏移
     frame_offsets = frame_offsets[:-1]
@@ -934,6 +933,74 @@ def encode_8x8_block_recursive(
         # 组装编码结果
         encoding = [MARKER_8x8_BLOCK] + upper_encoding + lower_encoding
         return encoding, stats
+
+def process_single_gop(args):
+    """
+    处理单个GOP的函数 - 用于多进程
+    
+    Args:
+        args: 包含处理GOP所需的所有参数的元组
+        
+    Returns:
+        tuple: (gop_idx, codebooks, encoded_frames, frame_stats)
+    """
+    (gop_idx, gop_frames, gop_size, i_frame_weight, diff_threshold,
+     codebook_size_8x8, codebook_size_8x4, codebook_size_4x4, codebook_size_4x2,
+     coverage_radius_8x8, coverage_radius_8x4, coverage_radius_4x4) = args
+    
+    print(f"🔄 进程处理GOP {gop_idx + 1}...")
+    start_time = time.time()
+    
+    # 第一帧是I帧
+    i_frame_blocks_8x8 = gop_frames[0]
+    
+    # 分析P帧的变化8x8块
+    p_frame_blocks_8x8_list = []
+    for frame_idx in range(1, len(gop_frames)):
+        current_blocks = gop_frames[frame_idx]
+        previous_blocks = gop_frames[frame_idx - 1]
+        changed_indices = find_changed_blocks_8x8(current_blocks, previous_blocks, diff_threshold)
+        if len(changed_indices) > 0:
+            changed_blocks = current_blocks[changed_indices]
+            p_frame_blocks_8x8_list.append((frame_idx, changed_blocks))
+    
+    # 为当前GOP生成四级码表
+    codebook_8x8, codebook_8x4, codebook_4x4, codebook_4x2 = generate_multi_level_codebooks_for_gop_8x8(
+        i_frame_blocks_8x8, p_frame_blocks_8x8_list, i_frame_weight, 
+        coverage_radius_8x8, coverage_radius_8x4, coverage_radius_4x4, 
+        codebook_size_8x8, codebook_size_8x4, codebook_size_4x4, codebook_size_4x2
+    )
+    
+    codebooks = (codebook_8x8, codebook_8x4, codebook_4x4, codebook_4x2)
+    
+    # 编码当前GOP的所有帧
+    encoded_frames = []
+    frame_stats_list = []
+    
+    for frame_idx, frame_blocks_8x8 in enumerate(gop_frames):
+        if frame_idx == 0:  # I帧
+            frame_data, frame_stats = encode_i_frame_multi_level_8x8(
+                frame_blocks_8x8, codebook_8x8, codebook_8x4, codebook_4x4, codebook_4x2, 
+                coverage_radius_8x8, coverage_radius_8x4, coverage_radius_4x4
+            )
+            frame_type = 0  # I帧
+        else:  # P帧
+            # P帧只编码变化的块（使用新的分层编码）
+            previous_blocks = gop_frames[frame_idx - 1]
+            frame_data, frame_stats = encode_p_frame_multi_level_separate(
+                frame_blocks_8x8, previous_blocks, codebook_8x8, codebook_8x4, codebook_4x4, codebook_4x2, 
+                diff_threshold, coverage_radius_8x8, coverage_radius_8x4, coverage_radius_4x4
+            )
+            frame_type = 1  # P帧
+        
+        encoded_frames.append((frame_data, frame_type))
+        frame_stats_list.append(frame_stats)
+    
+    elapsed_time = time.time() - start_time
+    print(f"✅ GOP {gop_idx + 1} 处理完成 ({elapsed_time:.1f}s)")
+    
+    return (gop_idx, codebooks, encoded_frames, frame_stats_list)
+
 def encode_p_frame_multi_level_separate(
     current_blocks_8x8: np.ndarray, 
     previous_blocks_8x8: np.ndarray, 
