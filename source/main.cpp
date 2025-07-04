@@ -349,6 +349,60 @@ IWRAM_CODE void decode_p_frame_multi_level(const u16* frame_data, u16* dst)
     }
 }
 
+IWRAM_CODE void decode_p_frame_multi_level_separate(const u16* frame_data, u16* dst)
+{
+    // P帧新分层格式：[8x8块数, 位置1, 码表项1, 位置2, 码表项2, ..., 
+    //                8x4块数, 位置1, 码表项1, ..., 
+    //                4x4块数, 位置1, 码表项1, ..., 
+    //                4x2块数, 位置1, 码表项1, ...]
+    
+    int data_idx = 0;
+    
+    // 1. 解码8x8块
+    u16 count_8x8 = frame_data[data_idx++];
+    for (int i = 0; i < count_8x8; i++)
+    {
+        u16 block_pos = frame_data[data_idx++];     // 8x8块位置 (0-599)
+        u16 code_idx = frame_data[data_idx++];      // 8x8码表索引
+        
+        u16* block_dst = dst + block_8x8_offset_table[block_pos];
+        decode_8x8_block_from_bgr555_buffer(code_idx, block_dst, SCREEN_WIDTH);
+    }
+    
+    // 2. 解码8x4块
+    u16 count_8x4 = frame_data[data_idx++];
+    for (int i = 0; i < count_8x4; i++)
+    {
+        u16 block_pos = frame_data[data_idx++];     // 8x4块位置 (0-1199)
+        u16 code_idx = frame_data[data_idx++];      // 8x4码表索引
+        
+        u16* block_dst = dst + block_8x4_offset_table[block_pos];
+        decode_8x4_block_from_bgr555_buffer(code_idx, block_dst, SCREEN_WIDTH);
+    }
+    
+    // 3. 解码4x4块
+    u16 count_4x4 = frame_data[data_idx++];
+    for (int i = 0; i < count_4x4; i++)
+    {
+        u16 block_pos = frame_data[data_idx++];     // 4x4块位置 (0-2399)
+        u16 code_idx = frame_data[data_idx++];      // 4x4码表索引
+        
+        u16* block_dst = dst + block_4x4_offset_table[block_pos];
+        decode_4x4_block_from_bgr555_buffer(code_idx, block_dst, SCREEN_WIDTH);
+    }
+    
+    // 4. 解码4x2块
+    u16 count_4x2 = frame_data[data_idx++];
+    for (int i = 0; i < count_4x2; i++)
+    {
+        u16 block_pos = frame_data[data_idx++];     // 4x2块位置 (0-4799)
+        u16 code_idx = frame_data[data_idx++];      // 4x2码表索引
+        
+        u16* block_dst = dst + block_4x2_offset_table[block_pos];
+        decode_4x2_block_from_bgr555_buffer(code_idx, block_dst, SCREEN_WIDTH);
+    }
+}
+
 static volatile u32 vbl = 0;
 void isr_vbl() { ++vbl; REG_IF = IRQ_VBLANK; }
 
@@ -390,8 +444,8 @@ int main()
             // I帧：完全重绘
             decode_i_frame_multi_level(frame_data, ewramBuffer);
         } else {
-            // P帧：增量更新
-            decode_p_frame_multi_level(frame_data, ewramBuffer);
+            // P帧：增量更新（使用新的分层解码）
+            decode_p_frame_multi_level_separate(frame_data, ewramBuffer);
         }
 
         // 复制到VRAM

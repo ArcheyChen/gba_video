@@ -364,9 +364,9 @@ def main():
                 total_stats['i_frame_stats']['blocks_4x4_used'] += frame_stats['blocks_4x4_used']
                 total_stats['i_frame_stats']['blocks_4x2_used'] += frame_stats['blocks_4x2_used']
             else:  # P帧
-                # P帧只编码变化的块
+                # P帧只编码变化的块（使用新的分层编码）
                 previous_blocks = gop_frames[frame_idx - 1]
-                frame_data, frame_stats = encode_p_frame_multi_level_8x8(
+                frame_data, frame_stats = encode_p_frame_multi_level_separate(
                     frame_blocks_8x8, previous_blocks, codebook_8x8, codebook_8x4, codebook_4x4, codebook_4x2, 
                     diff_threshold, coverage_radius_8x8, coverage_radius_8x4, coverage_radius_4x4
                 )
@@ -934,5 +934,251 @@ def encode_8x8_block_recursive(
         # 组装编码结果
         encoding = [MARKER_8x8_BLOCK] + upper_encoding + lower_encoding
         return encoding, stats
+def encode_p_frame_multi_level_separate(
+    current_blocks_8x8: np.ndarray, 
+    previous_blocks_8x8: np.ndarray, 
+    codebook_8x8: np.ndarray,
+    codebook_8x4: np.ndarray,
+    codebook_4x4: np.ndarray, 
+    codebook_4x2: np.ndarray, 
+    diff_threshold: float,
+    coverage_radius_8x8: float = 150.0,
+    coverage_radius_8x4: float = 120.0,
+    coverage_radius_4x4: float = 80.0
+) -> tuple:
+    """
+    使用分层编码P帧 - 每种码表单独处理
+    
+    返回格式：[8x8块数, 位置1, 码表项1, 位置2, 码表项2, ..., 
+              8x4块数, 位置1, 码表项1, ..., 
+              4x4块数, 位置1, 码表项1, ..., 
+              4x2块数, 位置1, 码表项1, ...]
+    
+    位置编码：
+    - 8x8块：屏幕240x160分为30x20=600个8x8块，位置0-599
+    - 8x4块：屏幕240x160分为30x40=1200个8x4块，位置0-1199  
+    - 4x4块：屏幕240x160分为60x40=2400个4x4块，位置0-2399
+    - 4x2块：屏幕240x160分为60x80=4800个4x2块，位置0-4799
+    """
+    # 统计信息
+    total_stats = {
+        'blocks_8x8_used': 0,
+        'blocks_8x4_used': 0,
+        'blocks_4x4_used': 0,
+        'blocks_4x2_used': 0
+    }
+    
+    # 找出发生变化的8x8块
+    changed_indices_8x8 = find_changed_blocks_8x8(current_blocks_8x8, previous_blocks_8x8, diff_threshold)
+    
+    if len(changed_indices_8x8) == 0:
+        # 没有变化，返回全0
+        return [0, 0, 0, 0], total_stats
+    
+    # 需要编码的块列表
+    blocks_to_encode_8x8 = []
+    blocks_to_encode_8x4 = []
+    blocks_to_encode_4x4 = []
+    blocks_to_encode_4x2 = []
+    
+    # 1. 处理8x8块
+    for block_pos_8x8 in changed_indices_8x8:
+        block_8x8 = current_blocks_8x8[block_pos_8x8]
+        
+        # 尝试8x8码表
+        distances_8x8 = pairwise_distances(
+            block_8x8.reshape(1, -1).astype(np.float32),
+            codebook_8x8.astype(np.float32),
+            metric="euclidean"
+        )
+        min_dist_8x8 = distances_8x8.min()
+        
+        if min_dist_8x8 <= coverage_radius_8x8:
+            # 可以用8x8码表
+            best_idx = distances_8x8.argmin()
+            blocks_to_encode_8x8.append((block_pos_8x8, best_idx))
+            total_stats['blocks_8x8_used'] += 1
+        else:
+            # 8x8无法覆盖，拆分为两个8x4块
+            # 计算对应的8x4块位置
+            # 8x8块位置 = (by_8x8, bx_8x8) 其中by_8x8 ∈ [0,19], bx_8x8 ∈ [0,29]
+            by_8x8 = block_pos_8x8 // 30  # 8x8块的行索引
+            bx_8x8 = block_pos_8x8 % 30   # 8x8块的列索引
+            
+            # 上半8x4块位置：(by_8x8*2, bx_8x8)
+            upper_block_pos_8x4 = (by_8x8 * 2) * 30 + bx_8x8
+            # 下半8x4块位置：(by_8x8*2+1, bx_8x8)
+            lower_block_pos_8x4 = (by_8x8 * 2 + 1) * 30 + bx_8x8
+            
+            # 拆分8x8块为两个8x4块
+            # 提取Y分量（8行8列，按行存储）
+            y_8x8 = block_8x8[:64].reshape(8, 8)
+            upper_y_8x4 = y_8x8[:4, :].flatten()
+            lower_y_8x4 = y_8x8[4:, :].flatten()
+            
+            # 提取Cb分量
+            cb_8x8 = block_8x8[64:128].reshape(8, 8)
+            upper_cb_8x4 = cb_8x8[:4, :].flatten()
+            lower_cb_8x4 = cb_8x8[4:, :].flatten()
+            
+            # 提取Cr分量
+            cr_8x8 = block_8x8[128:192].reshape(8, 8)
+            upper_cr_8x4 = cr_8x8[:4, :].flatten()
+            lower_cr_8x4 = cr_8x8[4:, :].flatten()
+            
+            # 组装8x4块
+            upper_8x4 = np.concatenate([upper_y_8x4, upper_cb_8x4, upper_cr_8x4])
+            lower_8x4 = np.concatenate([lower_y_8x4, lower_cb_8x4, lower_cr_8x4])
+            
+            # 添加到8x4待编码列表
+            blocks_to_encode_8x4.append((upper_block_pos_8x4, upper_8x4))
+            blocks_to_encode_8x4.append((lower_block_pos_8x4, lower_8x4))
+    
+    # 2. 处理8x4块
+    final_blocks_8x4 = []
+    for block_pos_8x4, block_8x4 in blocks_to_encode_8x4:
+        # 尝试8x4码表
+        distances_8x4 = pairwise_distances(
+            block_8x4.reshape(1, -1).astype(np.float32),
+            codebook_8x4.astype(np.float32),
+            metric="euclidean"
+        )
+        min_dist_8x4 = distances_8x4.min()
+        
+        if min_dist_8x4 <= coverage_radius_8x4:
+            # 可以用8x4码表
+            best_idx = distances_8x4.argmin()
+            final_blocks_8x4.append((block_pos_8x4, best_idx))
+            total_stats['blocks_8x4_used'] += 1
+        else:
+            # 8x4无法覆盖，拆分为两个4x4块
+            # 计算对应的4x4块位置
+            # 8x4块位置 = (by_8x4, bx_8x4) 其中by_8x4 ∈ [0,39], bx_8x4 ∈ [0,29]
+            by_8x4 = block_pos_8x4 // 30  # 8x4块的行索引
+            bx_8x4 = block_pos_8x4 % 30   # 8x4块的列索引
+            
+            # 左半4x4块位置：(by_8x4, bx_8x4*2)
+            left_block_pos_4x4 = by_8x4 * 60 + (bx_8x4 * 2)
+            # 右半4x4块位置：(by_8x4, bx_8x4*2+1)
+            right_block_pos_4x4 = by_8x4 * 60 + (bx_8x4 * 2 + 1)
+            
+            # 拆分8x4块为两个4x4块
+            # 提取Y分量（4行8列，按行存储）
+            y_8x4 = block_8x4[:32].reshape(4, 8)
+            left_y_4x4 = y_8x4[:, :4].flatten()
+            right_y_4x4 = y_8x4[:, 4:].flatten()
+            
+            # 提取Cb分量
+            cb_8x4 = block_8x4[32:64].reshape(4, 8)
+            left_cb_4x4 = cb_8x4[:, :4].flatten()
+            right_cb_4x4 = cb_8x4[:, 4:].flatten()
+            
+            # 提取Cr分量
+            cr_8x4 = block_8x4[64:96].reshape(4, 8)
+            left_cr_4x4 = cr_8x4[:, :4].flatten()
+            right_cr_4x4 = cr_8x4[:, 4:].flatten()
+            
+            # 组装4x4块
+            left_4x4 = np.concatenate([left_y_4x4, left_cb_4x4, left_cr_4x4])
+            right_4x4 = np.concatenate([right_y_4x4, right_cb_4x4, right_cr_4x4])
+            
+            # 添加到4x4待编码列表
+            blocks_to_encode_4x4.append((left_block_pos_4x4, left_4x4))
+            blocks_to_encode_4x4.append((right_block_pos_4x4, right_4x4))
+    
+    # 3. 处理4x4块
+    final_blocks_4x4 = []
+    for block_pos_4x4, block_4x4 in blocks_to_encode_4x4:
+        # 尝试4x4码表
+        distances_4x4 = pairwise_distances(
+            block_4x4.reshape(1, -1).astype(np.float32),
+            codebook_4x4.astype(np.float32),
+            metric="euclidean"
+        )
+        min_dist_4x4 = distances_4x4.min()
+        
+        if min_dist_4x4 <= coverage_radius_4x4:
+            # 可以用4x4码表
+            best_idx = distances_4x4.argmin()
+            final_blocks_4x4.append((block_pos_4x4, best_idx))
+            total_stats['blocks_4x4_used'] += 1
+        else:
+            # 4x4无法覆盖，拆分为两个4x2块
+            # 计算对应的4x2块位置
+            # 4x4块位置 = (by_4x4, bx_4x4) 其中by_4x4 ∈ [0,39], bx_4x4 ∈ [0,59]
+            by_4x4 = block_pos_4x4 // 60  # 4x4块的行索引
+            bx_4x4 = block_pos_4x4 % 60   # 4x4块的列索引
+            
+            # 上半4x2块位置：(by_4x4*2, bx_4x4)
+            upper_block_pos_4x2 = (by_4x4 * 2) * 60 + bx_4x4
+            # 下半4x2块位置：(by_4x4*2+1, bx_4x4)
+            lower_block_pos_4x2 = (by_4x4 * 2 + 1) * 60 + bx_4x4
+            
+            # 拆分4x4块为两个4x2块
+            # 提取Y分量（4行4列，按行存储）
+            y_4x4 = block_4x4[:16].reshape(4, 4)
+            upper_y_4x2 = y_4x4[:2, :].flatten()
+            lower_y_4x2 = y_4x4[2:, :].flatten()
+            
+            # 提取Cb分量
+            cb_4x4 = block_4x4[16:32].reshape(4, 4)
+            upper_cb_4x2 = cb_4x4[:2, :].flatten()
+            lower_cb_4x2 = cb_4x4[2:, :].flatten()
+            
+            # 提取Cr分量
+            cr_4x4 = block_4x4[32:48].reshape(4, 4)
+            upper_cr_4x2 = cr_4x4[:2, :].flatten()
+            lower_cr_4x2 = cr_4x4[2:, :].flatten()
+            
+            # 组装4x2块
+            upper_4x2 = np.concatenate([upper_y_4x2, upper_cb_4x2, upper_cr_4x2])
+            lower_4x2 = np.concatenate([lower_y_4x2, lower_cb_4x2, lower_cr_4x2])
+            
+            # 添加到4x2待编码列表
+            blocks_to_encode_4x2.append((upper_block_pos_4x2, upper_4x2))
+            blocks_to_encode_4x2.append((lower_block_pos_4x2, lower_4x2))
+    
+    # 4. 处理4x2块（最终级别，必须编码）
+    final_blocks_4x2 = []
+    for block_pos_4x2, block_4x2 in blocks_to_encode_4x2:
+        # 4x2块必须用4x2码表编码
+        distances_4x2 = pairwise_distances(
+            block_4x2.reshape(1, -1).astype(np.float32),
+            codebook_4x2.astype(np.float32),
+            metric="euclidean"
+        )
+        best_idx = distances_4x2.argmin()
+        final_blocks_4x2.append((block_pos_4x2, best_idx))
+        total_stats['blocks_4x2_used'] += 1
+    
+    # 5. 组装最终帧数据
+    frame_data = []
+    
+    # 8x8块数据
+    frame_data.append(len(blocks_to_encode_8x8))
+    for block_pos, code_idx in blocks_to_encode_8x8:
+        frame_data.append(block_pos)
+        frame_data.append(code_idx)
+    
+    # 8x4块数据
+    frame_data.append(len(final_blocks_8x4))
+    for block_pos, code_idx in final_blocks_8x4:
+        frame_data.append(block_pos)
+        frame_data.append(code_idx)
+    
+    # 4x4块数据
+    frame_data.append(len(final_blocks_4x4))
+    for block_pos, code_idx in final_blocks_4x4:
+        frame_data.append(block_pos)
+        frame_data.append(code_idx)
+    
+    # 4x2块数据
+    frame_data.append(len(final_blocks_4x2))
+    for block_pos, code_idx in final_blocks_4x2:
+        frame_data.append(block_pos)
+        frame_data.append(code_idx)
+    
+    return frame_data, total_stats
+
 if __name__ == "__main__":
     main()
