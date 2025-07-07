@@ -132,15 +132,15 @@ def generate_multi_level_codebooks_for_gop(
     return codebook_8x4, codebook_4x4, codebook_4x2
 
 def generate_codebook_8x4_max_coverage(blocks_8x4: np.ndarray, radius: float = 120.0, n_neighbors: int = 512) -> np.ndarray:
-    print(f"为8x4块生成最大覆盖码表...块数: {len(blocks_8x4)}")
+    # print(f"为8x4块生成最大覆盖码表...块数: {len(blocks_8x4)}")
     if len(blocks_8x4) == 0:
         return np.zeros((n_neighbors, 96), dtype=np.uint8)
     X = blocks_8x4.astype(np.float32)
-    print("构建稀疏相似度矩阵...")
+    # print("构建稀疏相似度矩阵...")
     S = build_sparse_similarity(X, radius=radius, n_neighbors=n_neighbors)
     density = 100 * S.nnz / (len(X) ** 2)
-    print(f"稀疏矩阵密度: {density:.4f}% (nnz={S.nnz:,})")
-    print("执行最大覆盖选择...")
+    # print(f"稀疏矩阵密度: {density:.4f}% (nnz={S.nnz:,})")
+    # print("执行最大覆盖选择...")
     selector = FacilityLocationSelection(
         n_samples=n_neighbors,
         metric="precomputed",
@@ -153,7 +153,7 @@ def generate_codebook_8x4_max_coverage(blocks_8x4: np.ndarray, radius: float = 1
     dists = pairwise_distances(X, codebook_8x4, metric="euclidean", n_jobs=1)
     covered = (dists.min(axis=1) <= radius)
     covered_ratio = covered.mean()
-    print(f"8x4码表覆盖率: {covered.sum():,} / {len(X):,} ({covered_ratio*100:.2f}%)")
+    # print(f"8x4码表覆盖率: {covered.sum():,} / {len(X):,} ({covered_ratio*100:.2f}%)")
     return np.clip(codebook_8x4, 0, 255).round().astype(np.uint8)
 
 def build_sparse_similarity(X: np.ndarray, radius: float, n_neighbors: int = 128) -> csr_matrix:
@@ -180,15 +180,15 @@ def build_sparse_similarity(X: np.ndarray, radius: float, n_neighbors: int = 128
     return S
 
 def generate_codebook_4x4_max_coverage(blocks_4x4: np.ndarray, radius: float = 80.0, n_neighbors: int = 256) -> np.ndarray:
-    print(f"为4x4块生成最大覆盖码表...块数: {len(blocks_4x4)}")
+    # print(f"为4x4块生成最大覆盖码表...块数: {len(blocks_4x4)}")
     if len(blocks_4x4) == 0:
         return np.zeros((n_neighbors, 48), dtype=np.uint8)
     X = blocks_4x4.astype(np.float32)
-    print("构建稀疏相似度矩阵...")
+    # print("构建稀疏相似度矩阵...")
     S = build_sparse_similarity(X, radius=radius, n_neighbors=n_neighbors)
     density = 100 * S.nnz / (len(X) ** 2)
-    print(f"稀疏矩阵密度: {density:.4f}% (nnz={S.nnz:,})")
-    print("执行最大覆盖选择...")
+    # print(f"稀疏矩阵密度: {density:.4f}% (nnz={S.nnz:,})")
+    # print("执行最大覆盖选择...")
     selector = FacilityLocationSelection(
         n_samples=n_neighbors,
         metric="precomputed",
@@ -201,7 +201,7 @@ def generate_codebook_4x4_max_coverage(blocks_4x4: np.ndarray, radius: float = 8
     dists = pairwise_distances(X, codebook_4x4, metric="euclidean", n_jobs=1)
     covered = (dists.min(axis=1) <= radius)
     covered_ratio = covered.mean()
-    print(f"4x4码表覆盖率: {covered.sum():,} / {len(X):,} ({covered_ratio*100:.2f}%)")
+    # print(f"4x4码表覆盖率: {covered.sum():,} / {len(X):,} ({covered_ratio*100:.2f}%)")
     return np.clip(codebook_4x4, 0, 255).round().astype(np.uint8)
 
 def generate_multi_level_codebooks_for_gop_8x8(
@@ -246,7 +246,7 @@ def generate_multi_level_codebooks_for_gop_8x8(
     )
     
     # 3. 找出8x8码表无法覆盖的块，拆分为8x4块
-    print("寻找8x8码表无法覆盖的块...")
+    # print("寻找8x8码表无法覆盖的块...")
     distances_8x8 = pairwise_distances(
         all_training_blocks_8x8.astype(np.float32), 
         codebook_8x8.astype(np.float32), 
@@ -256,7 +256,7 @@ def generate_multi_level_codebooks_for_gop_8x8(
     min_distances_8x8 = distances_8x8.min(axis=1)
     uncovered_8x8_mask = min_distances_8x8 > coverage_radius_8x8
     uncovered_blocks_8x8 = all_training_blocks_8x8[uncovered_8x8_mask]
-    print(f"8x8无法覆盖的块数: {len(uncovered_blocks_8x8)} / {len(all_training_blocks_8x8)}")
+    # print(f"8x8无法覆盖的块数: {len(uncovered_blocks_8x8)} / {len(all_training_blocks_8x8)}")
     
     # 4. 将无法覆盖的8x8块拆分为8x4块
     uncovered_blocks_8x4 = []
@@ -275,11 +275,11 @@ def generate_multi_level_codebooks_for_gop_8x8(
         uncovered_blocks_8x4.extend([upper_8x4, lower_8x4])
     
     uncovered_blocks_8x4 = np.array(uncovered_blocks_8x4) if uncovered_blocks_8x4 else np.empty((0, 96))
-    print(f"拆分后的8x4块数: {len(uncovered_blocks_8x4)}")
+    # print(f"拆分后的8x4块数: {len(uncovered_blocks_8x4)}")
     
     # 5. 生成8x4码表
     if len(uncovered_blocks_8x4) > 0:
-        print("生成8x4码表...")
+        # print("生成8x4码表...")
         codebook_8x4 = generate_codebook_8x4_max_coverage(
             uncovered_blocks_8x4, 
             radius=coverage_radius_8x4, 
@@ -296,7 +296,7 @@ def generate_multi_level_codebooks_for_gop_8x8(
         min_distances_8x4 = distances_8x4.min(axis=1)
         uncovered_8x4_mask = min_distances_8x4 > coverage_radius_8x4
         uncovered_8x4_blocks = uncovered_blocks_8x4[uncovered_8x4_mask]
-        print(f"8x4无法覆盖的块数: {len(uncovered_8x4_blocks)}")
+        # print(f"8x4无法覆盖的块数: {len(uncovered_8x4_blocks)}")
         
         # 7. 将无法覆盖的8x4块拆分为4x4块
         uncovered_blocks_4x4 = []
@@ -310,11 +310,11 @@ def generate_multi_level_codebooks_for_gop_8x8(
         uncovered_blocks_4x4 = []
     
     uncovered_blocks_4x4 = np.array(uncovered_blocks_4x4) if uncovered_blocks_4x4 else np.empty((0, 48))
-    print(f"拆分后的4x4块数: {len(uncovered_blocks_4x4)}")
+    # print(f"拆分后的4x4块数: {len(uncovered_blocks_4x4)}")
     
     # 8. 生成4x4码表
     if len(uncovered_blocks_4x4) > 0:
-        print("生成4x4码表...")
+        # print("生成4x4码表...")
         codebook_4x4 = generate_codebook_4x4_max_coverage(
             uncovered_blocks_4x4, 
             radius=coverage_radius_4x4, 
@@ -331,7 +331,7 @@ def generate_multi_level_codebooks_for_gop_8x8(
         min_distances_4x4 = distances_4x4.min(axis=1)
         uncovered_4x4_mask = min_distances_4x4 > coverage_radius_4x4
         uncovered_4x4_blocks = uncovered_blocks_4x4[uncovered_4x4_mask]
-        print(f"4x4无法覆盖的块数: {len(uncovered_4x4_blocks)}")
+        # print(f"4x4无法覆盖的块数: {len(uncovered_4x4_blocks)}")
         
         # 10. 将无法覆盖的4x4块拆分为4x2块
         uncovered_blocks_4x2 = []
@@ -354,11 +354,11 @@ def generate_multi_level_codebooks_for_gop_8x8(
         uncovered_blocks_4x2 = []
     
     uncovered_blocks_4x2 = np.array(uncovered_blocks_4x2) if uncovered_blocks_4x2 else np.empty((0, 24))
-    print(f"拆分后的4x2块数: {len(uncovered_blocks_4x2)}")
+    # print(f"拆分后的4x2块数: {len(uncovered_blocks_4x2)}")
     
     # 11. 生成4x2码表（使用K-means，因为必须覆盖所有剩余块）
     if len(uncovered_blocks_4x2) > 0:
-        print("生成4x2码表（使用K-means）...")
+        # print("生成4x2码表（使用K-means）...")
         codebook_4x2 = generate_codebook_4x2_kmeans(
             uncovered_blocks_4x2, 
             n_clusters=codebook_size_4x2
@@ -367,11 +367,11 @@ def generate_multi_level_codebooks_for_gop_8x8(
         # 如果没有4x2块，创建空的4x2码表
         codebook_4x2 = np.empty((0, 24))
     
-    print(f"✅ 四级码表生成完成")
-    print(f"   8x8码表: {len(codebook_8x8)} 个码字")
-    print(f"   8x4码表: {len(codebook_8x4)} 个码字")
-    print(f"   4x4码表: {len(codebook_4x4)} 个码字")
-    print(f"   4x2码表: {len(codebook_4x2)} 个码字")
+    # print(f"✅ 四级码表生成完成")
+    # print(f"   8x8码表: {len(codebook_8x8)} 个码字")
+    # print(f"   8x4码表: {len(codebook_8x4)} 个码字")
+    # print(f"   4x4码表: {len(codebook_4x4)} 个码字")
+    # print(f"   4x2码表: {len(codebook_4x2)} 个码字")
     
     return codebook_8x8, codebook_8x4, codebook_4x4, codebook_4x2
 
@@ -474,11 +474,11 @@ def generate_codebook_4x2_kmeans(blocks_4x2: np.ndarray, n_clusters: int = 512) 
         print(f"4x2块数量({len(blocks_4x2)}) <= 码表大小({n_clusters})，直接返回所有块")
         return blocks_4x2.astype(np.uint8)
     
-    print(f"4x2块生成K-means码表...块数: {len(blocks_4x2)}")
+    # print(f"4x2块生成K-means码表...块数: {len(blocks_4x2)}")
     
     # 如果数据量很大，先用MiniBatchKMeans预热
     if len(blocks_4x2) > 50000:
-        print("数据量大，使用MiniBatchKMeans预热...")
+        # print("数据量大，使用MiniBatchKMeans预热...")
         train_data_4x2 = blocks_4x2.astype(np.float32)
         
         warm = MiniBatchKMeans(
@@ -488,7 +488,7 @@ def generate_codebook_4x2_kmeans(blocks_4x2: np.ndarray, n_clusters: int = 512) 
             n_init=3
         )
         warm.fit(train_data_4x2)
-        print("MiniBatchKMeans预热完成")
+        # print("MiniBatchKMeans预热完成")
         
         # 使用预热结果作为初始中心
         kmeans = KMeans(
@@ -501,7 +501,7 @@ def generate_codebook_4x2_kmeans(blocks_4x2: np.ndarray, n_clusters: int = 512) 
         codebook_4x2 = kmeans.cluster_centers_
     else:
         # 数据量不大，直接使用KMeans
-        print("使用标准KMeans...")
+        # print("使用标准KMeans...")
         train_data_4x2 = blocks_4x2.astype(np.float32)
         
         kmeans = KMeans(
@@ -512,5 +512,5 @@ def generate_codebook_4x2_kmeans(blocks_4x2: np.ndarray, n_clusters: int = 512) 
         kmeans.fit(train_data_4x2)
         codebook_4x2 = kmeans.cluster_centers_
     
-    print(f"✅ 4x2 K-means码表生成完成：{len(codebook_4x2)} 个码字")
+    # print(f"✅ 4x2 K-means码表生成完成：{len(codebook_4x2)} 个码字")
     return codebook_4x2.astype(np.uint8)
