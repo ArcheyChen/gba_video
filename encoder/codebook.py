@@ -219,9 +219,9 @@ def generate_multi_level_codebooks_for_gop_8x8(
     """
     为GOP生成四级码表：8x8 -> 8x4 -> 4x4 -> 4x2
     """
-    print(f"为GOP生成四级码表...")
-    print(f"I帧8x8块数: {len(i_frame_blocks_8x8)}")
-    print(f"P帧变化8x8块总数: {sum(len(blocks) for _, blocks in p_frame_blocks_8x8_list)}")
+    # print(f"为GOP生成四级码表...")
+    # print(f"I帧8x8块数: {len(i_frame_blocks_8x8)}")
+    # print(f"P帧变化8x8块总数: {sum(len(blocks) for _, blocks in p_frame_blocks_8x8_list)}")
     
     # 1. 准备8x8训练数据
     training_blocks_8x8 = []
@@ -235,10 +235,10 @@ def generate_multi_level_codebooks_for_gop_8x8(
         raise ValueError("没有足够的8x8块用于生成码表")
     
     all_training_blocks_8x8 = np.vstack(training_blocks_8x8)
-    print(f"总8x8训练块数: {len(all_training_blocks_8x8)} (I帧权重x{i_frame_weight})")
+    # print(f"总8x8训练块数: {len(all_training_blocks_8x8)} (I帧权重x{i_frame_weight})")
     
     # 2. 生成8x8码表
-    print("生成8x8码表（最大覆盖方法）...")
+    # print("生成8x8码表（最大覆盖方法）...")
     codebook_8x8 = generate_codebook_8x8_max_coverage(
         all_training_blocks_8x8, 
         radius=coverage_radius_8x8, 
@@ -379,17 +379,17 @@ def generate_codebook_8x8_max_coverage(blocks_8x8: np.ndarray, radius: float = 1
     """
     为8x8块生成最大覆盖码表
     """
-    print(f"为8x8块生成最大覆盖码表...块数: {len(blocks_8x8)}")
+    # print(f"为8x8块生成最大覆盖码表...块数: {len(blocks_8x8)}")
     if len(blocks_8x8) == 0:
         return np.zeros((n_neighbors, 192), dtype=np.uint8)  # 8x8块有192个值
     
     X = blocks_8x8.astype(np.float32)
-    print("构建稀疏相似度矩阵...")
+    # print("构建稀疏相似度矩阵...")
     S = build_sparse_similarity(X, radius=radius, n_neighbors=n_neighbors)
     density = 100 * S.nnz / (len(X) ** 2)
-    print(f"稀疏矩阵密度: {density:.4f}% (nnz={S.nnz:,})")
+    # print(f"稀疏矩阵密度: {density:.4f}% (nnz={S.nnz:,})")
     
-    print("执行最大覆盖选择...")
+    # print("执行最大覆盖选择...")
     selector = FacilityLocationSelection(
         n_samples=n_neighbors,
         metric="precomputed",
@@ -399,14 +399,14 @@ def generate_codebook_8x8_max_coverage(blocks_8x8: np.ndarray, radius: float = 1
     selector.fit(S)
     centres_idx = selector.ranking
     centres = X[centres_idx]
-    print(f"✅ 8x8码表生成完成：{len(centres)} 个码字")
+    # print(f"✅ 8x8码表生成完成：{len(centres)} 个码字")
     return centres.astype(np.uint8)
 
 def generate_codebook_4x2_max_coverage(blocks_4x2: np.ndarray, radius: float = float('inf'), n_neighbors: int = 512) -> np.ndarray:
     """
     为4x2块生成最大覆盖码表 - 优化版本
     """
-    print(f"为4x2块生成最大覆盖码表...块数: {len(blocks_4x2)}")
+    # print(f"为4x2块生成最大覆盖码表...块数: {len(blocks_4x2)}")
     if len(blocks_4x2) == 0:
         return np.zeros((n_neighbors, 24), dtype=np.uint8)  # 4x2块有24个值
     
@@ -421,12 +421,12 @@ def generate_codebook_4x2_max_coverage(blocks_4x2: np.ndarray, radius: float = f
         sample_indices = np.random.choice(len(X), max_samples_for_coverage, replace=False)
         X_sampled = X[sample_indices]
         
-        print("构建稀疏相似度矩阵...")
+        # print("构建稀疏相似度矩阵...")
         S = build_sparse_similarity(X_sampled, radius=radius, n_neighbors=n_neighbors)
         density = 100 * S.nnz / (len(X_sampled) ** 2)
-        print(f"稀疏矩阵密度: {density:.4f}% (nnz={S.nnz:,})")
+        # print(f"稀疏矩阵密度: {density:.4f}% (nnz={S.nnz:,})")
         
-        print("执行最大覆盖选择...")
+        # print("执行最大覆盖选择...")
         selector = FacilityLocationSelection(
             n_samples=n_neighbors,
             metric="precomputed",
@@ -437,12 +437,12 @@ def generate_codebook_4x2_max_coverage(blocks_4x2: np.ndarray, radius: float = f
         centres_idx = selector.ranking
         centres = X_sampled[centres_idx]
     else:
-        print("构建稀疏相似度矩阵...")
+        # print("构建稀疏相似度矩阵...")
         S = build_sparse_similarity(X, radius=radius, n_neighbors=n_neighbors)
         density = 100 * S.nnz / (len(X) ** 2)
-        print(f"稀疏矩阵密度: {density:.4f}% (nnz={S.nnz:,})")
+        # print(f"稀疏矩阵密度: {density:.4f}% (nnz={S.nnz:,})")
         
-        print("执行最大覆盖选择...")
+        # print("执行最大覆盖选择...")
         selector = FacilityLocationSelection(
             n_samples=n_neighbors,
             metric="precomputed",
@@ -453,7 +453,7 @@ def generate_codebook_4x2_max_coverage(blocks_4x2: np.ndarray, radius: float = f
         centres_idx = selector.ranking
         centres = X[centres_idx]
     
-    print(f"✅ 4x2码表生成完成：{len(centres)} 个码字")
+    # print(f"✅ 4x2码表生成完成：{len(centres)} 个码字")
     return centres.astype(np.uint8)
 
 def generate_codebook_4x2_kmeans(blocks_4x2: np.ndarray, n_clusters: int = 512) -> np.ndarray:

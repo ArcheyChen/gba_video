@@ -948,7 +948,7 @@ def process_single_gop(args):
      codebook_size_8x8, codebook_size_8x4, codebook_size_4x4, codebook_size_4x2,
      coverage_radius_8x8, coverage_radius_8x4, coverage_radius_4x4) = args
     
-    print(f"🔄 进程处理GOP {gop_idx + 1}...")
+    print(f"🔄 进程 {mp.current_process().name} 正在处理 GOP {gop_idx + 1}/{gop_size}...")
     start_time = time.time()
     
     # 第一帧是I帧
