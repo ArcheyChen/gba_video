@@ -20,10 +20,11 @@ from codebook import *
 WIDTH, HEIGHT = 240, 160
 
 # 多级码表配置（默认值，将被命令行参数覆盖）
+# 所有码表大小限制为255，使用U8索引，0xFF保留作为分裂标志
 DEFAULT_CODEBOOK_SIZE_8x8 = 32     # 8x8块码表大小
 DEFAULT_CODEBOOK_SIZE_8x4 = 64     # 8x4块码表大小
 DEFAULT_CODEBOOK_SIZE_4x4 = 128     # 4x4块码表大小
-DEFAULT_CODEBOOK_SIZE_4x2 = 256     # 4x2块码表大小
+DEFAULT_CODEBOOK_SIZE_4x2 = 255     # 4x2块码表大小（最大254，0xFF留作分裂标志）
 DEFAULT_COVERAGE_RADIUS_8x8 = 60.0  # 8x8块覆盖半径
 DEFAULT_COVERAGE_RADIUS_8x4 = 42.0 # 8x4块覆盖半径
 DEFAULT_COVERAGE_RADIUS_4x4 = 30.0  # 4x4块覆盖半径
@@ -48,10 +49,8 @@ BLOCKS_4x4_PER_FRAME = (WIDTH // BLOCK_4x4_W) * (HEIGHT // BLOCK_4x4_H)  # 60 * 
 # 4x2块数量（用于细分编码）
 BLOCKS_4x2_PER_FRAME = (WIDTH // BLOCK_4x2_W) * (HEIGHT // BLOCK_4x2_H)  # 60 * 80 = 4800
 
-# 特殊标记
-MARKER_8x8_BLOCK = 0xFFFD  # 标记这是8x8块的分裂
-MARKER_8x4_BLOCK = 0xFFFE  # 标记这是8x4块的分裂
-MARKER_4x4_BLOCK = 0xFFFF  # 标记这是4x4块的分裂
+# 特殊标记 - 统一使用0xFF作为分裂标志
+MARKER_SPLIT = 0xFF  # 统一分裂标志，表示需要分裂到下一级
 
 # IP帧编码参数
 GOP_SIZE = 30  # GOP大小，每30帧一个I帧
@@ -87,9 +86,7 @@ def write_header(path_h: pathlib.Path, total_frames: int, gop_count: int, gop_si
             #define VIDEO_BLOCK_SIZE_4x2  8
             #define VIDEO_GOP_SIZE        {gop_size}
             #define VIDEO_GOP_COUNT       {gop_count}
-            #define VIDEO_MARKER_8x8      0xFFFD
-            #define VIDEO_MARKER_8x4      0xFFFE
-            #define VIDEO_MARKER_4x4      0xFFFF
+            #define VIDEO_MARKER_SPLIT    0xFF
 
             /* 每个GOP的8x8码表：GOP_COUNT * CODEBOOK_SIZE_8x8 * BLOCK_SIZE_8x8 个uint16 */
             extern const unsigned short video_codebooks_8x8[VIDEO_GOP_COUNT][VIDEO_CODEBOOK_SIZE_8x8][VIDEO_BLOCK_SIZE_8x8];
@@ -103,8 +100,8 @@ def write_header(path_h: pathlib.Path, total_frames: int, gop_count: int, gop_si
             /* 每个GOP的4x2码表：GOP_COUNT * CODEBOOK_SIZE_4x2 * BLOCK_SIZE_4x2 个uint16 */
             extern const unsigned short video_codebooks_4x2[VIDEO_GOP_COUNT][VIDEO_CODEBOOK_SIZE_4x2][VIDEO_BLOCK_SIZE_4x2];
 
-            /* 帧数据：变长编码的块索引 */
-            extern const unsigned short video_frame_data[];
+            /* 帧数据：变长编码的块索引，使用U8索引 */
+            extern const unsigned char video_frame_data[];
 
             /* 帧起始位置：每帧在frame_data中的起始偏移 */
             extern const unsigned int video_frame_offsets[VIDEO_FRAME_COUNT + 1];
@@ -211,15 +208,15 @@ def write_source(path_c: pathlib.Path, gop_codebooks: list, encoded_frames: list
             f.write("\n")
         f.write("};\n\n")
         
-        # 写入帧数据（变长编码）
-        f.write("const unsigned short video_frame_data[] = {\n")
+        # 写入帧数据（变长编码）- 使用U8格式
+        f.write("const unsigned char video_frame_data[] = {\n")
         all_data = []
         for frame_data in encoded_frames:
             all_data.extend(frame_data)
         
         per_line = 16
         for i in range(0, len(all_data), per_line):
-            chunk = ', '.join(f"{val:5d}" for val in all_data[i:i+per_line])
+            chunk = ', '.join(f"{val:3d}" for val in all_data[i:i+per_line])
             f.write("    " + chunk + ",\n")
         f.write("};\n\n")
         
@@ -268,6 +265,16 @@ def main():
     coverage_radius_8x8 = args.coverage_radius_8x8
     coverage_radius_8x4 = args.coverage_radius_8x4
     coverage_radius_4x4 = args.coverage_radius_4x4
+
+    # 验证码表大小不超过255（预留0xFF作为分裂标志）
+    if codebook_size_8x8 > 255:
+        raise SystemExit(f"❌ 8x8码表大小 ({codebook_size_8x8}) 不能超过255")
+    if codebook_size_8x4 > 255:
+        raise SystemExit(f"❌ 8x4码表大小 ({codebook_size_8x4}) 不能超过255")
+    if codebook_size_4x4 > 255:
+        raise SystemExit(f"❌ 4x4码表大小 ({codebook_size_4x4}) 不能超过255")
+    if codebook_size_4x2 > 255:  # 4x2特别限制为254，因为需要保留0xFF
+        raise SystemExit(f"❌ 4x2码表大小 ({codebook_size_4x2}) 不能超过254（0xFF保留作为分裂标志）")
 
     cap = cv2.VideoCapture(args.input)
     if not cap.isOpened():
@@ -507,7 +514,7 @@ def encode_8x4_block_recursive(
     返回: (encoding_list, stats)
     encoding_list格式:
     - 如果用8x4码表: [8x4_index]
-    - 如果拆分为4x4: [MARKER_8x4_BLOCK, left_4x4_encoding..., right_4x4_encoding...]
+    - 如果拆分为4x4: [MARKER_SPLIT, left_4x4_encoding..., right_4x4_encoding...]
     """
     stats = {'blocks_8x8_used': 0, 'blocks_8x4_used': 0, 'blocks_4x4_used': 0, 'blocks_4x2_used': 0}
     
@@ -563,7 +570,7 @@ def encode_8x4_block_recursive(
             stats[key] = left_stats[key] + right_stats[key]
         
         # 组装编码结果
-        encoding = [MARKER_8x4_BLOCK] + left_encoding + right_encoding
+        encoding = [MARKER_SPLIT] + left_encoding + right_encoding
         return encoding, stats
 
 def encode_4x4_block_recursive(
@@ -578,7 +585,7 @@ def encode_4x4_block_recursive(
     返回: (encoding_list, stats)
     encoding_list格式:
     - 如果用4x4码表: [4x4_index]
-    - 如果拆分为4x2: [MARKER_4x4_BLOCK, upper_4x2_index, lower_4x2_index]
+    - 如果拆分为4x2: [MARKER_SPLIT, upper_4x2_index, lower_4x2_index]
     """
     stats = {'blocks_8x8_used': 0, 'blocks_8x4_used': 0, 'blocks_4x4_used': 0, 'blocks_4x2_used': 0}
     
@@ -613,7 +620,7 @@ def encode_4x4_block_recursive(
         lower_indices = encode_frame_with_codebook(lower_4x2.reshape(1, -1), codebook_4x2)
         
         stats['blocks_4x2_used'] = 2
-        encoding = [MARKER_4x4_BLOCK, upper_indices[0], lower_indices[0]]
+        encoding = [MARKER_SPLIT, upper_indices[0], lower_indices[0]]
         return encoding, stats
 
 def encode_i_frame_multi_level_8x8(
@@ -631,9 +638,9 @@ def encode_i_frame_multi_level_8x8(
     
     新的编码格式：
     - 8x8块：8x8码字索引 (直接是索引)
-    - 分裂为8x4块：MARKER_8x8_BLOCK, 上半8x4编码..., 下半8x4编码...
-    - 分裂为4x4块：MARKER_8x4_BLOCK, 左半4x4编码..., 右半4x4编码...
-    - 分裂为4x2块：MARKER_4x4_BLOCK, 上半4x2码字索引, 下半4x2码字索引
+    - 分裂为8x4块：MARKER_SPLIT, 上半8x4编码..., 下半8x4编码...
+    - 分裂为4x4块：MARKER_SPLIT, 左半4x4编码..., 右半4x4编码...
+    - 分裂为4x2块：MARKER_SPLIT, 上半4x2码字索引, 下半4x2码字索引
     
     返回格式：([总块数, 块1编码, 块2编码, ...], stats)
     
@@ -644,7 +651,7 @@ def encode_i_frame_multi_level_8x8(
         'blocks_4x2_used': 使用4x2码表的块数(以4x2块为单位)
     }
     """
-    frame_data = [BLOCKS_8x8_PER_FRAME]  # 总块数
+    frame_data = [BLOCKS_8x8_PER_FRAME & 0xFF, (BLOCKS_8x8_PER_FRAME >> 8) & 0xFF]  # 总块数（低字节，高字节）
     
     # 统计信息
     total_stats = {
@@ -679,7 +686,7 @@ def encode_i_frame_multi_level(frame_blocks_4x4: np.ndarray, codebook_4x4: np.nd
     
     新的编码格式：
     - 4x4块：4x4码字索引 (直接是索引，不需要MARKER)
-    - 分裂为4x2块：MARKER_4x4_BLOCK, 上半4x2码字索引, 下半4x2码字索引
+    - 分裂为4x2块：MARKER_SPLIT, 上半4x2码字索引, 下半4x2码字索引
     
     返回格式：([总块数, 块1编码, 块2编码, ...], stats)
     
@@ -688,7 +695,7 @@ def encode_i_frame_multi_level(frame_blocks_4x4: np.ndarray, codebook_4x4: np.nd
         'blocks_4x2_used': 使用4x2码表的块数(以4x2块为单位)
     }
     """
-    frame_data = [BLOCKS_4x4_PER_FRAME]  # 总块数
+    frame_data = [BLOCKS_4x4_PER_FRAME & 0xFF, (BLOCKS_4x4_PER_FRAME >> 8) & 0xFF]  # 总块数（低字节，高字节）
     
     # 统计信息
     stats = {
@@ -733,7 +740,7 @@ def encode_i_frame_multi_level(frame_blocks_4x4: np.ndarray, codebook_4x4: np.nd
             lower_indices = encode_frame_with_codebook(lower_4x2.reshape(1, -1), codebook_4x2)
             
             # 输出：分裂标志 + 上半4x2索引 + 下半4x2索引
-            frame_data.extend([MARKER_4x4_BLOCK, upper_indices[0], lower_indices[0]])
+            frame_data.extend([MARKER_SPLIT, upper_indices[0], lower_indices[0]])
             stats['blocks_4x2_used'] += 2  # 一个4x4块拆分为2个4x2块
     
     return frame_data, stats
@@ -772,9 +779,9 @@ def encode_p_frame_multi_level(
     
     if len(changed_indices_8x4) == 0:
         # 没有变化
-        return [0], total_stats  # 变化块数=0
+        return [0, 0], total_stats  # 变化块数=0（低字节，高字节）
     
-    frame_data = [len(changed_indices_8x4)]  # 变化块数
+    frame_data = [len(changed_indices_8x4) & 0xFF, (len(changed_indices_8x4) >> 8) & 0xFF]  # 变化块数（低字节，高字节）
     
     # 逐个递归编码变化的8x4块
     for block_pos in changed_indices_8x4:
@@ -786,8 +793,8 @@ def encode_p_frame_multi_level(
             coverage_radius_8x4, coverage_radius_4x4
         )
         
-        # P帧格式：位置 + 编码
-        frame_data.append(block_pos)
+        # P帧格式：位置（2字节） + 编码
+        frame_data.extend([block_pos & 0xFF, (block_pos >> 8) & 0xFF])  # 位置（低字节，高字节）
         frame_data.extend(encoding)
         
         # 累加统计
@@ -834,9 +841,9 @@ def encode_p_frame_multi_level_8x8(
     
     if len(changed_indices_8x8) == 0:
         # 没有变化
-        return [0], total_stats  # 变化块数=0
+        return [0, 0], total_stats  # 变化块数=0（低字节，高字节）
     
-    frame_data = [len(changed_indices_8x8)]  # 变化块数
+    frame_data = [len(changed_indices_8x8) & 0xFF, (len(changed_indices_8x8) >> 8) & 0xFF]  # 变化块数（低字节，高字节）
     
     # 逐个递归编码变化的8x8块
     for block_pos in changed_indices_8x8:
@@ -848,8 +855,8 @@ def encode_p_frame_multi_level_8x8(
             coverage_radius_8x8, coverage_radius_8x4, coverage_radius_4x4
         )
         
-        # P帧格式：位置 + 编码
-        frame_data.append(block_pos)
+        # P帧格式：位置（2字节） + 编码
+        frame_data.extend([block_pos & 0xFF, (block_pos >> 8) & 0xFF])  # 位置（低字节，高字节）
         frame_data.extend(encoding)
         
         # 累加统计
@@ -874,7 +881,7 @@ def encode_8x8_block_recursive(
     返回: (encoding_list, stats)
     encoding_list格式:
     - 如果用8x8码表: [8x8_index]
-    - 如果拆分为8x4: [MARKER_8x8_BLOCK, upper_8x4_encoding..., lower_8x4_encoding...]
+    - 如果拆分为8x4: [MARKER_SPLIT, upper_8x4_encoding..., lower_8x4_encoding...]
     """
     stats = {'blocks_8x8_used': 0, 'blocks_8x4_used': 0, 'blocks_4x4_used': 0, 'blocks_4x2_used': 0}
     
@@ -931,7 +938,7 @@ def encode_8x8_block_recursive(
             stats[key] = upper_stats[key] + lower_stats[key]
         
         # 组装编码结果
-        encoding = [MARKER_8x8_BLOCK] + upper_encoding + lower_encoding
+        encoding = [MARKER_SPLIT] + upper_encoding + lower_encoding
         return encoding, stats
 
 def process_single_gop(args):
@@ -1001,6 +1008,58 @@ def process_single_gop(args):
     
     return (gop_idx, codebooks, encoded_frames, frame_stats_list)
 
+def encode_blocks_with_run_length(blocks_list):
+    """
+    将块列表编码为连续块格式：位置+连续数量+码表索引序列
+    
+    输入: [(pos, code_idx), (pos, code_idx), ...]
+    输出: [总组数(2字节), 位置1(2字节), 连续数1(2字节), 码表索引1, 码表索引2, ..., 位置2(2字节), 连续数2(2字节), ...]
+    """
+    if not blocks_list:
+        return [0, 0]  # 总组数为0（2字节）
+    
+    # 按位置排序
+    sorted_blocks = sorted(blocks_list, key=lambda x: x[0])
+    
+    groups = []
+    current_start = sorted_blocks[0][0]
+    current_codes = [sorted_blocks[0][1]]
+    
+    for i in range(1, len(sorted_blocks)):
+        pos, code_idx = sorted_blocks[i]
+        
+        # 检查是否连续
+        if pos == current_start + len(current_codes):
+            # 连续块，添加到当前组
+            current_codes.append(code_idx)
+        else:
+            # 不连续，结束当前组，开始新组
+            groups.append((current_start, current_codes))
+            current_start = pos
+            current_codes = [code_idx]
+    
+    # 添加最后一组
+    groups.append((current_start, current_codes))
+    
+    # 编码为字节数组
+    frame_data = []
+    
+    # 总组数（2字节）
+    group_count = len(groups)
+    frame_data.extend([group_count & 0xFF, (group_count >> 8) & 0xFF])
+    
+    # 每组数据
+    for start_pos, codes in groups:
+        # 起始位置（2字节）
+        frame_data.extend([start_pos & 0xFF, (start_pos >> 8) & 0xFF])
+        # 连续块数量（2字节）
+        count = len(codes)
+        frame_data.extend([count & 0xFF, (count >> 8) & 0xFF])
+        # 码表索引序列（每个1字节）
+        frame_data.extend(codes)
+    
+    return frame_data
+
 def encode_p_frame_multi_level_separate(
     current_blocks_8x8: np.ndarray, 
     previous_blocks_8x8: np.ndarray, 
@@ -1040,7 +1099,7 @@ def encode_p_frame_multi_level_separate(
     
     if len(changed_indices_8x8) == 0:
         # 没有变化，返回全0
-        return [0, 0, 0, 0], total_stats
+        return [0, 0, 0, 0, 0, 0, 0, 0], total_stats  # 各级块数均为0（每个2字节）
     
     # 需要编码的块列表
     blocks_to_encode_8x8 = []
@@ -1221,29 +1280,17 @@ def encode_p_frame_multi_level_separate(
     # 5. 组装最终帧数据
     frame_data = []
     
-    # 8x8块数据
-    frame_data.append(len(blocks_to_encode_8x8))
-    for block_pos, code_idx in blocks_to_encode_8x8:
-        frame_data.append(block_pos)
-        frame_data.append(code_idx)
+    # 8x8块数据（使用连续块编码）
+    frame_data.extend(encode_blocks_with_run_length(blocks_to_encode_8x8))
     
-    # 8x4块数据
-    frame_data.append(len(final_blocks_8x4))
-    for block_pos, code_idx in final_blocks_8x4:
-        frame_data.append(block_pos)
-        frame_data.append(code_idx)
+    # 8x4块数据（使用连续块编码）
+    frame_data.extend(encode_blocks_with_run_length(final_blocks_8x4))
     
-    # 4x4块数据
-    frame_data.append(len(final_blocks_4x4))
-    for block_pos, code_idx in final_blocks_4x4:
-        frame_data.append(block_pos)
-        frame_data.append(code_idx)
+    # 4x4块数据（使用连续块编码）
+    frame_data.extend(encode_blocks_with_run_length(final_blocks_4x4))
     
-    # 4x2块数据
-    frame_data.append(len(final_blocks_4x2))
-    for block_pos, code_idx in final_blocks_4x2:
-        frame_data.append(block_pos)
-        frame_data.append(code_idx)
+    # 4x2块数据（使用连续块编码）
+    frame_data.extend(encode_blocks_with_run_length(final_blocks_4x2))
     
     return frame_data, total_stats
 

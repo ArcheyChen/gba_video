@@ -6,12 +6,18 @@
 #include <gba_dma.h>
 #include <gba_interrupt.h>
 #include <gba_input.h>
+#include <string.h>
 
 #include "video_data.h"
 
 constexpr int PIXELS_PER_FRAME = SCREEN_WIDTH * SCREEN_HEIGHT;
 
-IWRAM_CODE int decode_8x4_recursive(const u16* data, int data_idx, u16* dst, int dst_stride);
+IWRAM_CODE int decode_8x4_recursive(const u8* data, int data_idx, u16* dst, int dst_stride);
+
+// 从 u8 数组中读取 u16 值（小端序）
+IWRAM_CODE inline u16 read_u16_from_u8(const u8* data, int idx) {
+    return data[idx] | (data[idx + 1] << 8);
+}
 // EWRAM 单缓冲
 EWRAM_BSS u16 ewramBuffer[PIXELS_PER_FRAME];
 
@@ -114,8 +120,8 @@ IWRAM_CODE void load_bgr555_codebooks(int gop_index)
         const u16* src = codebook_8x8 + codeword_idx * 64;
         BGR555_8x8_Struct* dst = bgr555_buffer_8x8 + codeword_idx;
         
-        // 使用DMA快速复制
-        DMA3COPY(src, dst->bgr_array, 64 | DMA16);
+        // 使用 memcpy 复制数据
+        memcpy(dst->bgr_array, src, 64 * sizeof(u16));
     }
     
     // 加载8x4码表
@@ -126,8 +132,8 @@ IWRAM_CODE void load_bgr555_codebooks(int gop_index)
         const u16* src = codebook_8x4 + codeword_idx * 32;
         BGR555_8x4_Struct* dst = bgr555_buffer_8x4 + codeword_idx;
         
-        // 使用DMA快速复制
-        DMA3COPY(src, dst->bgr_array, 32 | DMA16);
+        // 使用 memcpy 复制数据
+        memcpy(dst->bgr_array, src, 32 * sizeof(u16));
     }
     
     // 加载4x4码表
@@ -138,8 +144,8 @@ IWRAM_CODE void load_bgr555_codebooks(int gop_index)
         const u16* src = codebook_4x4 + codeword_idx * 16;
         BGR555_4x4_Struct* dst = bgr555_buffer_4x4 + codeword_idx;
         
-        // 使用DMA快速复制
-        DMA3COPY(src, dst->bgr_array, 16 | DMA16);
+        // 使用 memcpy 复制数据
+        memcpy(dst->bgr_array, src, 16 * sizeof(u16));
     }
     
     // 加载4x2码表
@@ -150,8 +156,8 @@ IWRAM_CODE void load_bgr555_codebooks(int gop_index)
         const u16* src = codebook_4x2 + codeword_idx * 8;
         BGR555_4x2_Struct* dst = bgr555_buffer_4x2 + codeword_idx;
         
-        // 使用DMA快速复制
-        DMA3COPY(src, dst->bgr_array, 8 | DMA16);
+        // 使用 memcpy 复制数据
+        memcpy(dst->bgr_array, src, 8 * sizeof(u16));
     }
 }
 
@@ -217,13 +223,13 @@ IWRAM_CODE void decode_4x2_block_from_bgr555_buffer(u16 codeword_idx, u16* dst, 
 
 
 // 递归解码8x8块编码数据
-IWRAM_CODE int decode_8x8_recursive(const u16* data, int data_idx, u16* dst, int dst_stride)
+IWRAM_CODE int decode_8x8_recursive(const u8* data, int data_idx, u16* dst, int dst_stride)
 {
-    u16 first_element = data[data_idx];
+    u8 first_element = data[data_idx];
     
-    if (first_element == VIDEO_MARKER_8x8) {
+    if (first_element == VIDEO_MARKER_SPLIT) {
         // 8x8分裂：需要拆分为两个8x4块
-        data_idx++; // 跳过MARKER_8x8
+        data_idx++; // 跳过MARKER_SPLIT
         
         // 递归解码上半8x4块 (前4行)
         int upper_consumed = decode_8x4_recursive(data, data_idx, dst, dst_stride);
@@ -237,29 +243,29 @@ IWRAM_CODE int decode_8x8_recursive(const u16* data, int data_idx, u16* dst, int
         return 1 + upper_consumed + lower_consumed; // MARKER + 上编码 + 下编码
     } else {
         // 直接8x8码字：使用8x8码表
-        u16 codeword_idx = first_element;
+        u8 codeword_idx = first_element;
         decode_8x8_block_from_bgr555_buffer(codeword_idx, dst, dst_stride);
-        return 1; // 消耗1个u16
+        return 1; // 消耗1个u8
     }
 }
 
 // 递归解码4x2块编码数据（最小块，不再分裂）
-IWRAM_CODE int decode_4x2_recursive(const u16* data, int data_idx, u16* dst, int dst_stride)
+IWRAM_CODE int decode_4x2_recursive(const u8* data, int data_idx, u16* dst, int dst_stride)
 {
     // 4x2是最小块，不会再分裂，直接使用4x2码表解码
-    u16 codeword_idx = data[data_idx];
+    u8 codeword_idx = data[data_idx];
     decode_4x2_block_from_bgr555_buffer(codeword_idx, dst, dst_stride);
-    return 1; // 消耗1个u16
+    return 1; // 消耗1个u8
 }
 
 // 递归解码4x4块编码数据
-IWRAM_CODE int decode_4x4_recursive(const u16* data, int data_idx, u16* dst, int dst_stride)
+IWRAM_CODE int decode_4x4_recursive(const u8* data, int data_idx, u16* dst, int dst_stride)
 {
-    u16 first_element = data[data_idx];
+    u8 first_element = data[data_idx];
     
-    if (first_element == VIDEO_MARKER_4x4) {
+    if (first_element == VIDEO_MARKER_SPLIT) {
         // 4x4分裂：需要拆分为两个4x2块
-        data_idx++; // 跳过MARKER_4x4
+        data_idx++; // 跳过MARKER_SPLIT
         
         // 递归解码上半4x2块 (前2行)
         int upper_consumed = decode_4x2_recursive(data, data_idx, dst, dst_stride);
@@ -273,20 +279,20 @@ IWRAM_CODE int decode_4x4_recursive(const u16* data, int data_idx, u16* dst, int
         return 1 + upper_consumed + lower_consumed; // MARKER + 上编码 + 下编码
     } else {
         // 直接4x4码字：使用4x4码表
-        u16 codeword_idx = first_element;
+        u8 codeword_idx = first_element;
         decode_4x4_block_from_bgr555_buffer(codeword_idx, dst, dst_stride);
-        return 1; // 消耗1个u16
+        return 1; // 消耗1个u8
     }
 }
 
 // 递归解码8x4块编码数据
-IWRAM_CODE int decode_8x4_recursive(const u16* data, int data_idx, u16* dst, int dst_stride)
+IWRAM_CODE int decode_8x4_recursive(const u8* data, int data_idx, u16* dst, int dst_stride)
 {
-    u16 first_element = data[data_idx];
+    u8 first_element = data[data_idx];
     
-    if (first_element == VIDEO_MARKER_8x4) {
+    if (first_element == VIDEO_MARKER_SPLIT) {
         // 8x4分裂：需要拆分为两个4x4块
-        data_idx++; // 跳过MARKER_8x4
+        data_idx++; // 跳过MARKER_SPLIT
         
         // 递归解码左半4x4块
         int left_consumed = decode_4x4_recursive(data, data_idx, dst, dst_stride);
@@ -300,23 +306,24 @@ IWRAM_CODE int decode_8x4_recursive(const u16* data, int data_idx, u16* dst, int
         return 1 + left_consumed + right_consumed; // MARKER + 左编码 + 右编码
     } else {
         // 直接8x4码字：使用8x4码表
-        u16 codeword_idx = first_element;
+        u8 codeword_idx = first_element;
         decode_8x4_block_from_bgr555_buffer(codeword_idx, dst, dst_stride);
-        return 1; // 消耗1个u16
+        return 1; // 消耗1个u8
     }
 }
 
-IWRAM_CODE void decode_i_frame_multi_level(const u16* frame_data, u16* dst)
+IWRAM_CODE void decode_i_frame_multi_level(const u8* frame_data, u16* dst)
 {
-    // I帧新递归格式：[总块数, 块1编码..., 块2编码..., ...]
+    // I帧新递归格式：[总块数(2字节), 块1编码..., 块2编码..., ...]
     // 其中每个块编码是递归的：
     // - 8x8块：8x8码字索引 (直接是索引)
-    // - 分裂为8x4块：MARKER_8x8, 上半8x4编码..., 下半8x4编码...
-    // - 分裂为4x4块：MARKER_8x4, 左半4x4编码..., 右半4x4编码...
-    // - 分裂为4x2块：MARKER_4x4, 上半4x2码字索引, 下半4x2码字索引
+    // - 分裂为8x4块：MARKER_SPLIT, 上半8x4编码..., 下半8x4编码...
+    // - 分裂为4x4块：MARKER_SPLIT, 左半4x4编码..., 右半4x4编码...
+    // - 分裂为4x2块：MARKER_SPLIT, 上半4x2码字索引, 下半4x2码字索引
     
-    // u16 total_blocks = frame_data[0]; // 暂时未使用
-    int data_idx = 1;
+    // 读取总块数（2字节，小端序）
+    u16 total_blocks = read_u16_from_u8(frame_data, 0);
+    int data_idx = 2;  // 跳过2字节的总块数
     
     for (int block_8x8_pos = 0; block_8x8_pos < VIDEO_BLOCKS_8x8_PER_FRAME; block_8x8_pos++)
     {
@@ -328,19 +335,21 @@ IWRAM_CODE void decode_i_frame_multi_level(const u16* frame_data, u16* dst)
     }
 }
 
-IWRAM_CODE void decode_p_frame_multi_level(const u16* frame_data, u16* dst)
+IWRAM_CODE void decode_p_frame_multi_level(const u8* frame_data, u16* dst)
 {
-    // P帧新递归格式：[变化块数, 位置1, 块1编码..., 位置2, 块2编码..., ...]
+    // P帧新递归格式：[变化块数(2字节), 位置1(2字节), 块1编码..., 位置2(2字节), 块2编码..., ...]
     // 其中每个块编码是递归的，与I帧相同
     
     int data_idx = 0;
     
-    // 读取变化块数
-    u16 changed_count = frame_data[data_idx++];
+    // 读取变化块数（2字节，小端序）
+    u16 changed_count = read_u16_from_u8(frame_data, data_idx);
+    data_idx += 2;
     
     for (int i = 0; i < changed_count; i++)
     {
-        u16 block_8x8_pos = frame_data[data_idx++];     // 8x8块位置
+        u16 block_8x8_pos = read_u16_from_u8(frame_data, data_idx);     // 8x8块位置
+        data_idx += 2;
         u16* block_8x8_dst = dst + block_8x8_offset_table[block_8x8_pos];
         
         // 递归解码当前8x8块
@@ -349,57 +358,91 @@ IWRAM_CODE void decode_p_frame_multi_level(const u16* frame_data, u16* dst)
     }
 }
 
-IWRAM_CODE void decode_p_frame_multi_level_separate(const u16* frame_data, u16* dst)
+IWRAM_CODE void decode_p_frame_multi_level_separate(const u8* frame_data, u16* dst)
 {
-    // P帧新分层格式：[8x8块数, 位置1, 码表项1, 位置2, 码表项2, ..., 
-    //                8x4块数, 位置1, 码表项1, ..., 
-    //                4x4块数, 位置1, 码表项1, ..., 
-    //                4x2块数, 位置1, 码表项1, ...]
+    // P帧新连续块格式：每种块类型的格式为：
+    // [组数(2字节), 位置1(2字节), 连续数1(2字节), 码表索引1, 码表索引2, ..., 位置2(2字节), 连续数2(2字节), ...]
     
     int data_idx = 0;
     
     // 1. 解码8x8块
-    u16 count_8x8 = frame_data[data_idx++];
-    for (int i = 0; i < count_8x8; i++)
+    u16 group_count_8x8 = read_u16_from_u8(frame_data, data_idx);
+    data_idx += 2;
+    for (int g = 0; g < group_count_8x8; g++)
     {
-        u16 block_pos = frame_data[data_idx++];     // 8x8块位置 (0-599)
-        u16 code_idx = frame_data[data_idx++];      // 8x8码表索引
+        u16 start_pos = read_u16_from_u8(frame_data, data_idx);     // 起始位置
+        data_idx += 2;
+        u16 count = read_u16_from_u8(frame_data, data_idx);         // 连续块数量
+        data_idx += 2;
         
-        u16* block_dst = dst + block_8x8_offset_table[block_pos];
-        decode_8x8_block_from_bgr555_buffer(code_idx, block_dst, SCREEN_WIDTH);
+        for (int i = 0; i < count; i++)
+        {
+            u8 code_idx = frame_data[data_idx++];      // 8x8码表索引
+            u16 block_pos = start_pos + i;             // 当前块位置
+            
+            u16* block_dst = dst + block_8x8_offset_table[block_pos];
+            decode_8x8_block_from_bgr555_buffer(code_idx, block_dst, SCREEN_WIDTH);
+        }
     }
     
     // 2. 解码8x4块
-    u16 count_8x4 = frame_data[data_idx++];
-    for (int i = 0; i < count_8x4; i++)
+    u16 group_count_8x4 = read_u16_from_u8(frame_data, data_idx);
+    data_idx += 2;
+    for (int g = 0; g < group_count_8x4; g++)
     {
-        u16 block_pos = frame_data[data_idx++];     // 8x4块位置 (0-1199)
-        u16 code_idx = frame_data[data_idx++];      // 8x4码表索引
+        u16 start_pos = read_u16_from_u8(frame_data, data_idx);     // 起始位置
+        data_idx += 2;
+        u16 count = read_u16_from_u8(frame_data, data_idx);         // 连续块数量
+        data_idx += 2;
         
-        u16* block_dst = dst + block_8x4_offset_table[block_pos];
-        decode_8x4_block_from_bgr555_buffer(code_idx, block_dst, SCREEN_WIDTH);
+        for (int i = 0; i < count; i++)
+        {
+            u8 code_idx = frame_data[data_idx++];      // 8x4码表索引
+            u16 block_pos = start_pos + i;             // 当前块位置
+            
+            u16* block_dst = dst + block_8x4_offset_table[block_pos];
+            decode_8x4_block_from_bgr555_buffer(code_idx, block_dst, SCREEN_WIDTH);
+        }
     }
     
     // 3. 解码4x4块
-    u16 count_4x4 = frame_data[data_idx++];
-    for (int i = 0; i < count_4x4; i++)
+    u16 group_count_4x4 = read_u16_from_u8(frame_data, data_idx);
+    data_idx += 2;
+    for (int g = 0; g < group_count_4x4; g++)
     {
-        u16 block_pos = frame_data[data_idx++];     // 4x4块位置 (0-2399)
-        u16 code_idx = frame_data[data_idx++];      // 4x4码表索引
+        u16 start_pos = read_u16_from_u8(frame_data, data_idx);     // 起始位置
+        data_idx += 2;
+        u16 count = read_u16_from_u8(frame_data, data_idx);         // 连续块数量
+        data_idx += 2;
         
-        u16* block_dst = dst + block_4x4_offset_table[block_pos];
-        decode_4x4_block_from_bgr555_buffer(code_idx, block_dst, SCREEN_WIDTH);
+        for (int i = 0; i < count; i++)
+        {
+            u8 code_idx = frame_data[data_idx++];      // 4x4码表索引
+            u16 block_pos = start_pos + i;             // 当前块位置
+            
+            u16* block_dst = dst + block_4x4_offset_table[block_pos];
+            decode_4x4_block_from_bgr555_buffer(code_idx, block_dst, SCREEN_WIDTH);
+        }
     }
     
     // 4. 解码4x2块
-    u16 count_4x2 = frame_data[data_idx++];
-    for (int i = 0; i < count_4x2; i++)
+    u16 group_count_4x2 = read_u16_from_u8(frame_data, data_idx);
+    data_idx += 2;
+    for (int g = 0; g < group_count_4x2; g++)
     {
-        u16 block_pos = frame_data[data_idx++];     // 4x2块位置 (0-4799)
-        u16 code_idx = frame_data[data_idx++];      // 4x2码表索引
+        u16 start_pos = read_u16_from_u8(frame_data, data_idx);     // 起始位置
+        data_idx += 2;
+        u16 count = read_u16_from_u8(frame_data, data_idx);         // 连续块数量
+        data_idx += 2;
         
-        u16* block_dst = dst + block_4x2_offset_table[block_pos];
-        decode_4x2_block_from_bgr555_buffer(code_idx, block_dst, SCREEN_WIDTH);
+        for (int i = 0; i < count; i++)
+        {
+            u8 code_idx = frame_data[data_idx++];      // 4x2码表索引
+            u16 block_pos = start_pos + i;             // 当前块位置
+            
+            u16* block_dst = dst + block_4x2_offset_table[block_pos];
+            decode_4x2_block_from_bgr555_buffer(code_idx, block_dst, SCREEN_WIDTH);
+        }
     }
 }
 
@@ -448,7 +491,7 @@ int main()
         
         // 获取当前帧的数据
         u32 frame_offset = video_frame_offsets[frame];
-        const u16* frame_data = video_frame_data + frame_offset;
+        const u8* frame_data = video_frame_data + frame_offset;
         u8 frame_type = video_frame_types[frame];
         
         // 根据帧类型解码
