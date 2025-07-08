@@ -8,9 +8,9 @@ from numba import jit, prange
 
 WIDTH, HEIGHT = 240, 160
 CODEBOOK_SIZE = 1024
-BLOCK_W, BLOCK_H = 4, 2
-PIXELS_PER_BLOCK = BLOCK_W * BLOCK_H  # 8
-BLOCKS_PER_FRAME = (WIDTH // BLOCK_W) * (HEIGHT // BLOCK_H)  # 60 * 80 = 4800
+BLOCK_W, BLOCK_H = 4, 4
+PIXELS_PER_BLOCK = BLOCK_W * BLOCK_H  # 16
+BLOCKS_PER_FRAME = (WIDTH // BLOCK_W) * (HEIGHT // BLOCK_H)  # 60 * 40 = 2400
 
 # IP帧编码参数
 GOP_SIZE = 30  # GOP大小，每30帧一个I帧
@@ -42,8 +42,8 @@ def extract_blocks_from_yuv(Y, Cb, Cr, height, width, block_h, block_w):
     num_blocks_x = width // block_w
     total_blocks = num_blocks_y * num_blocks_x
     
-    # 24 = 8Y + 8Cb + 8Cr，全部使用uint8
-    blocks = np.zeros((total_blocks, 24), dtype=np.uint8)
+    # 48 = 16Y + 16Cb + 16Cr，全部使用uint8
+    blocks = np.zeros((total_blocks, 48), dtype=np.uint8)
     
     block_idx = 0
     for by in range(num_blocks_y):
@@ -51,20 +51,20 @@ def extract_blocks_from_yuv(Y, Cb, Cr, height, width, block_h, block_w):
             y_start = by * block_h
             x_start = bx * block_w
             
-            # 提取8个Y值
+            # 提取16个Y值
             for py in range(block_h):
                 for px in range(block_w):
                     blocks[block_idx, py * block_w + px] = Y[y_start + py, x_start + px]
             
-            # 提取8个Cb值 (已加128偏移，范围0-255)
+            # 提取16个Cb值 (已加128偏移，范围0-255)
             for py in range(block_h):
                 for px in range(block_w):
-                    blocks[block_idx, 8 + py * block_w + px] = Cb[y_start + py, x_start + px]
+                    blocks[block_idx, 16 + py * block_w + px] = Cb[y_start + py, x_start + px]
             
-            # 提取8个Cr值 (已加128偏移，范围0-255)
+            # 提取16个Cr值 (已加128偏移，范围0-255)
             for py in range(block_h):
                 for px in range(block_w):
-                    blocks[block_idx, 16 + py * block_w + px] = Cr[y_start + py, x_start + px]
+                    blocks[block_idx, 32 + py * block_w + px] = Cr[y_start + py, x_start + px]
             
             block_idx += 1
     
@@ -72,8 +72,8 @@ def extract_blocks_from_yuv(Y, Cb, Cr, height, width, block_h, block_w):
 
 def extract_yuv444_blocks(frame_bgr: np.ndarray) -> np.ndarray:
     """
-    把 240×160×3 BGR 转换为 YUV444 4×2 块
-    返回 (num_blocks, 24) 的数组，每行是一个块的数据：8Y + 8Cb + 8Cr
+    把 240×160×3 BGR 转换为 YUV444 4×4 块
+    返回 (num_blocks, 48) 的数组，每行是一个块的数据：16Y + 16Cb + 16Cr
     内部统一使用uint8格式：Y: 0-255, Cb/Cr: 0-255 (已加128偏移)
     """
     B = frame_bgr[:, :, 0].astype(np.float32)
@@ -101,9 +101,9 @@ def yuv444_to_yuv9_jit(yuv444_block):
     输出：YUV9格式，Y: 0-255, Cb/Cr: -128~127 (已减去128偏移)
     """
     # 提取YUV444数据
-    y_values = yuv444_block[:8]  # 8个Y值保持不变
-    cb_values = yuv444_block[8:16].astype(np.float32)  # 8个Cb值 (0-255)
-    cr_values = yuv444_block[16:24].astype(np.float32)  # 8个Cr值 (0-255)
+    y_values = yuv444_block[:16]  # 16个Y值保持不变
+    cb_values = yuv444_block[16:32].astype(np.float32)  # 16个Cb值 (0-255)
+    cr_values = yuv444_block[32:48].astype(np.float32)  # 16个Cr值 (0-255)
     
     # 计算Cb和Cr的平均值，然后减去128偏移
     cb_avg = np.round(np.mean(cb_values)) - 128  # 转回 -128~127 范围
@@ -120,17 +120,17 @@ def yuv444_to_yuv9_jit(yuv444_block):
     elif cr_avg > 127:
         cr_avg = 127
     
-    # 返回YUV9格式：8Y + 1Cb + 1Cr
-    result = np.zeros(10, dtype=np.int16)
+    # 返回YUV9格式：16Y + 1Cb + 1Cr
+    result = np.zeros(18, dtype=np.int16)
     result[0] = np.int16(cb_avg)            # Cb已减去128偏移
     result[1] = np.int16(cr_avg)            # Cr已减去128偏移
-    result[2:10] = y_values.astype(np.int16)  # Y值直接复制
+    result[2:18] = y_values.astype(np.int16)  # Y值直接复制
     
     return result
 
 def yuv444_to_yuv9(yuv444_block: np.ndarray) -> np.ndarray:
     """
-    将YUV444块(8Y + 8Cb + 8Cr = 24字节)转换为YUV9格式(8Y + 1Cb + 1Cr = 10字节)
+    将YUV444块(16Y + 16Cb + 16Cr = 48字节)转换为YUV9格式(16Y + 1Cb + 1Cr = 18字节)
     输入：YUV444块，所有分量都是uint8 (Cb/Cr含128偏移: 0-255)
     输出：YUV9格式，Y: 0-255, Cb/Cr: -128~127 (已减去128偏移)
     """
@@ -140,7 +140,7 @@ def generate_codebook_for_gop(i_frame_blocks: np.ndarray, p_frame_blocks_list: l
     """
     为一个GOP生成码表，I帧块有额外权重
     输入：
-    - i_frame_blocks: I帧的所有块 (BLOCKS_PER_FRAME, 24)
+    - i_frame_blocks: I帧的所有块 (BLOCKS_PER_FRAME, 48)
     - p_frame_blocks_list: P帧的变化块列表，每个元素是 (frame_idx, changed_blocks)
     - i_frame_weight: I帧块的权重
     """
@@ -201,7 +201,7 @@ def compute_distances_jit(blocks, codebook):
         
         for j in range(num_codewords):
             dist = 0.0
-            for k in range(24):  # YUV444块有24个元素
+            for k in range(48):  # YUV444块有48个元素
                 diff = float(blocks[i, k]) - float(codebook[j, k])
                 dist += diff * diff
             
@@ -233,7 +233,7 @@ def write_header(path_h: pathlib.Path, total_frames: int, gop_count: int, gop_si
             #define VIDEO_HEIGHT          {HEIGHT}
             #define VIDEO_CODEBOOK_SIZE   {CODEBOOK_SIZE}
             #define VIDEO_BLOCKS_PER_FRAME {BLOCKS_PER_FRAME}
-            #define VIDEO_BLOCK_SIZE      10
+            #define VIDEO_BLOCK_SIZE      18
             #define VIDEO_GOP_SIZE        {gop_size}
             #define VIDEO_GOP_COUNT       {gop_count}
 
@@ -319,7 +319,7 @@ def calculate_block_difference(block1, block2):
     使用平方差之和作为差异度量
     """
     diff = 0.0
-    for i in range(24):  # YUV444块有24个元素
+    for i in range(48):  # YUV444块有48个元素
         d = float(block1[i]) - float(block2[i])
         diff += d * d
     return diff
@@ -352,7 +352,7 @@ def main():
     pa.add_argument("input")
     pa.add_argument("--duration", type=float, default=5.0)
     pa.add_argument("--fps",      type=int,   default=30)
-    pa.add_argument("--gop-size", type=int,   default=30, help="GOP大小")
+    pa.add_argument("--gop-size", type=int,   default=120, help="GOP大小")
     pa.add_argument("--i-weight", type=int,   default=3, help="I帧权重")
     pa.add_argument("--diff-threshold", type=float, default=100, help="P帧块差异阈值")
     pa.add_argument("--out", default="video_data")
@@ -424,7 +424,7 @@ def main():
                 p_frame_blocks_list.append((frame_idx, changed_blocks))
                 # print(f"  P帧 {frame_idx}: {len(changed_indices)} 个块发生变化")
             else:
-                p_frame_blocks_list.append((frame_idx, np.array([], dtype=np.uint8).reshape(0, 24)))
+                p_frame_blocks_list.append((frame_idx, np.array([], dtype=np.uint8).reshape(0, 48)))
                 # print(f"  P帧 {frame_idx}: 无变化")
         
         # 为当前GOP生成码表
@@ -491,7 +491,7 @@ def main():
     
     # 计算各部分大小
     # 1. 码表大小
-    codebook_size_bytes = gop_count * CODEBOOK_SIZE * 10  # 每个码字10字节
+    codebook_size_bytes = gop_count * CODEBOOK_SIZE * 18  # 每个码字18字节
     
     # 2. 帧数据大小
     frame_data_size_bytes = total_data_size * 2  # 每个u16是2字节
@@ -520,7 +520,7 @@ def main():
     
     print("\n💾 内存使用分析:")
     print(f"码表数据: {codebook_size_bytes:,} 字节 ({codebook_size_bytes/1024:.1f} KB)")
-    print(f"  - {gop_count} 个GOP × {CODEBOOK_SIZE} 码字 × 10 字节")
+    print(f"  - {gop_count} 个GOP × {CODEBOOK_SIZE} 码字 × 18 字节")
     print(f"帧数据: {frame_data_size_bytes:,} 字节 ({frame_data_size_bytes/1024:.1f} KB)")
     print(f"  - I帧数据: {i_frame_data_bytes:,} 字节 ({i_frame_data_bytes/1024:.1f} KB)")
     print(f"  - P帧数据: {p_frame_data_bytes:,} 字节 ({p_frame_data_bytes/1024:.1f} KB)")
