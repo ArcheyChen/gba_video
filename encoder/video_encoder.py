@@ -21,10 +21,10 @@ WIDTH, HEIGHT = 240, 160
 
 # 多级码表配置（默认值，将被命令行参数覆盖）
 # 所有码表大小限制为255，使用U8索引，0xFF保留作为分裂标志
-DEFAULT_CODEBOOK_SIZE_8x8 = 32     # 8x8块码表大小
+DEFAULT_CODEBOOK_SIZE_8x8 = 64     # 8x8块码表大小
 DEFAULT_CODEBOOK_SIZE_8x4 = 64     # 8x4块码表大小
 DEFAULT_CODEBOOK_SIZE_4x4 = 128     # 4x4块码表大小
-DEFAULT_CODEBOOK_SIZE_4x2 = 255     # 4x2块码表大小（最大254，0xFF留作分裂标志）
+DEFAULT_CODEBOOK_SIZE_4x2 = 255     # 4x2块码表大小（最大255，0xFF留作分裂标志）
 DEFAULT_COVERAGE_RADIUS_8x8 = 60.0  # 8x8块覆盖半径
 DEFAULT_COVERAGE_RADIUS_8x4 = 42.0 # 8x4块覆盖半径
 DEFAULT_COVERAGE_RADIUS_4x4 = 30.0  # 4x4块覆盖半径
@@ -267,7 +267,7 @@ def main():
     pa.add_argument("input")
     pa.add_argument("--duration", type=float, default=5.0)
     pa.add_argument("--fps",      type=int,   default=30)
-    pa.add_argument("--gop-size", type=int,   default=60, help="GOP大小")
+    pa.add_argument("--gop-size", type=int,   default=120, help="GOP大小")
     pa.add_argument("--i-weight", type=int,   default=3, help="I帧权重")
     pa.add_argument("--diff-threshold", type=float, default=100, help="P帧块差异阈值")
     pa.add_argument("--codebook-8x8", type=int, default=DEFAULT_CODEBOOK_SIZE_8x8, help="8x8码表大小")
@@ -299,8 +299,8 @@ def main():
         raise SystemExit(f"❌ 8x4码表大小 ({codebook_size_8x4}) 不能超过255")
     if codebook_size_4x4 > 255:
         raise SystemExit(f"❌ 4x4码表大小 ({codebook_size_4x4}) 不能超过255")
-    if codebook_size_4x2 > 255:  # 4x2特别限制为254，因为需要保留0xFF
-        raise SystemExit(f"❌ 4x2码表大小 ({codebook_size_4x2}) 不能超过254（0xFF保留作为分裂标志）")
+    if codebook_size_4x2 > 255:  # 4x2特别限制为255，因为需要保留0xFF
+        raise SystemExit(f"❌ 4x2码表大小 ({codebook_size_4x2}) 不能超过255（0xFF保留作为分裂标志）")
 
     cap = cv2.VideoCapture(args.input)
     if not cap.isOpened():
