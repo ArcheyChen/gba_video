@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
 import argparse, cv2, numpy as np, pathlib, textwrap
+import multiprocessing as mp
+from functools import partial
 from sklearn.cluster import KMeans,MiniBatchKMeans
 from sklearnex import patch_sklearn
 patch_sklearn()         # 只有这一句是新的
@@ -355,6 +357,7 @@ def main():
     pa.add_argument("--gop-size", type=int,   default=120, help="GOP大小")
     pa.add_argument("--i-weight", type=int,   default=3, help="I帧权重")
     pa.add_argument("--diff-threshold", type=float, default=100, help="P帧块差异阈值")
+    pa.add_argument("--processes", type=int, default=mp.cpu_count(), help="并行进程数量")
     pa.add_argument("--out", default="video_data")
     args = pa.parse_args()
 
@@ -393,78 +396,43 @@ def main():
     gop_count = (total_frames + gop_size - 1) // gop_size
     print(f"总帧数: {total_frames}, GOP数量: {gop_count}, GOP大小: {gop_size}")
 
-    # 为每个GOP生成编码数据
-    gop_codebooks = []
-    encoded_frames = []
-    frame_offsets = [0]  # 第一帧从0开始
-    frame_types = []
-    current_offset = 0
-
+    # 准备GOP数据用于并行处理
+    gop_data_list = []
     for gop_idx in range(gop_count):
-        print(f"\n处理GOP {gop_idx + 1}/{gop_count}")
-        
-        # 确定当前GOP的帧范围
         start_frame = gop_idx * gop_size
         end_frame = min((gop_idx + 1) * gop_size, total_frames)
         gop_frames = all_frame_blocks[start_frame:end_frame]
-        
-        # 第一帧是I帧
-        i_frame_blocks = gop_frames[0]
-        
-        # 分析P帧的变化块
-        p_frame_blocks_list = []
-        for frame_idx in range(1, len(gop_frames)):
-            current_blocks = gop_frames[frame_idx]
-            previous_blocks = gop_frames[frame_idx - 1]
-            
-            # 使用numba函数找出变化的块
-            changed_indices = find_changed_blocks(current_blocks, previous_blocks, diff_threshold)
-            if len(changed_indices) > 0:
-                changed_blocks = current_blocks[changed_indices]
-                p_frame_blocks_list.append((frame_idx, changed_blocks))
-                # print(f"  P帧 {frame_idx}: {len(changed_indices)} 个块发生变化")
-            else:
-                p_frame_blocks_list.append((frame_idx, np.array([], dtype=np.uint8).reshape(0, 48)))
-                # print(f"  P帧 {frame_idx}: 无变化")
-        
-        # 为当前GOP生成码表
-        gop_codebook = generate_codebook_for_gop(i_frame_blocks, p_frame_blocks_list, i_frame_weight)
+        gop_data_list.append((gop_idx, gop_frames, gop_size, i_frame_weight, diff_threshold))
+    
+    # 使用多进程并行处理GOP
+    processes = min(args.processes, gop_count)  # 进程数不能超过GOP数量
+    print(f"\n开始并行处理 {gop_count} 个GOP，使用 {processes} 个进程")
+    
+    # 创建进程池
+    with mp.Pool(processes=processes) as pool:
+        # 并行处理所有GOP
+        results = pool.map(process_single_gop, gop_data_list)
+    
+    # 按GOP索引排序结果
+    results.sort(key=lambda x: x[0])
+    
+    # 收集结果
+    gop_codebooks = []
+    encoded_frames = []
+    frame_types = []
+    
+    for gop_idx, gop_codebook, gop_encoded_frames, gop_frame_types in results:
         gop_codebooks.append(gop_codebook)
-        
-        # 编码当前GOP的所有帧
-        for frame_idx, frame_blocks in enumerate(gop_frames):
-            global_frame_idx = start_frame + frame_idx
-            
-            if frame_idx == 0:  # I帧
-                # I帧编码所有块
-                indices = encode_frame_with_codebook(frame_blocks, gop_codebook)
-                frame_data = [BLOCKS_PER_FRAME] + indices.tolist()  # 前缀块数量
-                frame_types.append(0)  # I帧
-                print(f"  I帧 {global_frame_idx}: {BLOCKS_PER_FRAME} 个块")
-            else:  # P帧
-                # P帧只编码变化的块
-                previous_blocks = gop_frames[frame_idx - 1]
-                changed_indices = find_changed_blocks(frame_blocks, previous_blocks, diff_threshold)
-                
-                if len(changed_indices) > 0:
-                    changed_blocks = frame_blocks[changed_indices]
-                    block_indices = encode_frame_with_codebook(changed_blocks, gop_codebook)
-                    
-                    # P帧格式: [块数量, 位置1, 码字1, 位置2, 码字2, ...]
-                    frame_data = [len(changed_indices)]
-                    for pos, code in zip(changed_indices, block_indices):
-                        frame_data.extend([pos, code])
-                else:
-                    # 无变化的P帧
-                    frame_data = [0]
-                
-                frame_types.append(1)  # P帧
-                # print(f"  P帧 {global_frame_idx}: {len(changed_indices) if len(changed_indices) > 0 else 0} 个块变化")
-            
-            encoded_frames.append(frame_data)
-            current_offset += len(frame_data)
-            frame_offsets.append(current_offset)
-
+        encoded_frames.extend(gop_encoded_frames)
+        frame_types.extend(gop_frame_types)
+    
+    # 重新计算帧偏移
+    frame_offsets = [0]  # 第一帧从0开始
+    current_offset = 0
+    for frame_data in encoded_frames:
+        current_offset += len(frame_data)
+        frame_offsets.append(current_offset)
+    
     # 移除最后一个多余的偏移
     frame_offsets = frame_offsets[:-1]
 
@@ -580,8 +548,72 @@ def main():
         print(f"最小变化块数: {min_changed_blocks if min_changed_blocks != float('inf') else 0}")
         print(f"平均变化率: {avg_changed_blocks/BLOCKS_PER_FRAME*100:.1f}%")
     
-    print(f"\n参数设置: I帧权重={i_frame_weight}, 差异阈值={diff_threshold}")
+    print(f"\n参数设置: I帧权重={i_frame_weight}, 差异阈值={diff_threshold}, 并行进程数={processes}")
     print("="*60)
 
+def process_single_gop(gop_data):
+    """
+    处理单个GOP的函数，用于多进程并行
+    """
+    gop_idx, gop_frames, gop_size, i_frame_weight, diff_threshold = gop_data
+    
+    print(f"\n处理GOP {gop_idx + 1} (进程 {mp.current_process().pid})")
+    
+    # 第一帧是I帧
+    i_frame_blocks = gop_frames[0]
+    
+    # 分析P帧的变化块
+    p_frame_blocks_list = []
+    for frame_idx in range(1, len(gop_frames)):
+        current_blocks = gop_frames[frame_idx]
+        previous_blocks = gop_frames[frame_idx - 1]
+        
+        # 使用numba函数找出变化的块
+        changed_indices = find_changed_blocks(current_blocks, previous_blocks, diff_threshold)
+        if len(changed_indices) > 0:
+            changed_blocks = current_blocks[changed_indices]
+            p_frame_blocks_list.append((frame_idx, changed_blocks))
+        else:
+            p_frame_blocks_list.append((frame_idx, np.array([], dtype=np.uint8).reshape(0, 48)))
+    
+    # 为当前GOP生成码表
+    gop_codebook = generate_codebook_for_gop(i_frame_blocks, p_frame_blocks_list, i_frame_weight)
+    
+    # 编码当前GOP的所有帧
+    gop_encoded_frames = []
+    gop_frame_types = []
+    
+    for frame_idx, frame_blocks in enumerate(gop_frames):
+        if frame_idx == 0:  # I帧
+            # I帧编码所有块
+            indices = encode_frame_with_codebook(frame_blocks, gop_codebook)
+            frame_data = [BLOCKS_PER_FRAME] + indices.tolist()  # 前缀块数量
+            gop_frame_types.append(0)  # I帧
+            print(f"  I帧 {gop_idx * gop_size + frame_idx}: {BLOCKS_PER_FRAME} 个块")
+        else:  # P帧
+            # P帧只编码变化的块
+            previous_blocks = gop_frames[frame_idx - 1]
+            changed_indices = find_changed_blocks(frame_blocks, previous_blocks, diff_threshold)
+            
+            if len(changed_indices) > 0:
+                changed_blocks = frame_blocks[changed_indices]
+                block_indices = encode_frame_with_codebook(changed_blocks, gop_codebook)
+                
+                # P帧格式: [块数量, 位置1, 码字1, 位置2, 码字2, ...]
+                frame_data = [len(changed_indices)]
+                for pos, code in zip(changed_indices, block_indices):
+                    frame_data.extend([pos, code])
+            else:
+                # 无变化的P帧
+                frame_data = [0]
+            
+            gop_frame_types.append(1)  # P帧
+        
+        gop_encoded_frames.append(frame_data)
+    
+    return gop_idx, gop_codebook, gop_encoded_frames, gop_frame_types
+
 if __name__ == "__main__":
+    # 设置多进程启动方法（对于跨平台兼容性）
+    mp.set_start_method('spawn', force=True)
     main()
