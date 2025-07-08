@@ -9,7 +9,7 @@ patch_sklearn()         # 只有这一句是新的
 from numba import jit, prange
 
 WIDTH, HEIGHT = 240, 160
-CODEBOOK_SIZE = 1024
+CODEBOOK_SIZE = 2048
 BLOCK_W, BLOCK_H = 4, 4
 PIXELS_PER_BLOCK = BLOCK_W * BLOCK_H  # 16
 BLOCKS_PER_FRAME = (WIDTH // BLOCK_W) * (HEIGHT // BLOCK_H)  # 60 * 40 = 2400
@@ -614,31 +614,46 @@ def process_single_gop(gop_data):
     
     print(f"\n处理GOP {gop_idx + 1} (进程 {mp.current_process().pid})")
     
-    # 第一帧是I帧
-    i_frame_blocks = gop_frames[0]
+    # 创建GOP帧的副本，用于累积误差修正
+    corrected_frames = [frame.copy() for frame in gop_frames]
     
-    # 分析P帧的变化块
+    # 第一帧是I帧
+    i_frame_blocks = corrected_frames[0]
+    
+    # 分析P帧的变化块，使用修正后的帧进行比较
     p_frame_blocks_list = []
-    for frame_idx in range(1, len(gop_frames)):
-        current_blocks = gop_frames[frame_idx]
-        previous_blocks = gop_frames[frame_idx - 1]
+    for frame_idx in range(1, len(corrected_frames)):
+        current_blocks = corrected_frames[frame_idx]
+        reference_blocks = corrected_frames[frame_idx - 1]  # 使用修正后的前一帧作为参考
         
         # 使用numba函数找出变化的块
-        changed_indices = find_changed_blocks(current_blocks, previous_blocks, diff_threshold)
+        changed_indices = find_changed_blocks(current_blocks, reference_blocks, diff_threshold)
         if len(changed_indices) > 0:
             changed_blocks = current_blocks[changed_indices]
             p_frame_blocks_list.append((frame_idx, changed_blocks))
+            
+            # 关键：对于没有更新的块，用前一帧的对应块替换当前帧的块
+            # 这样可以避免累积误差
+            unchanged_mask = np.ones(len(current_blocks), dtype=bool)
+            unchanged_mask[changed_indices] = False
+            unchanged_indices = np.where(unchanged_mask)[0]
+            
+            if len(unchanged_indices) > 0:
+                # 将未更新的块替换为参考帧的对应块
+                corrected_frames[frame_idx][unchanged_indices] = reference_blocks[unchanged_indices]
         else:
             p_frame_blocks_list.append((frame_idx, np.array([], dtype=np.uint8).reshape(0, 48)))
+            # 如果没有任何块发生变化，整帧都用前一帧替换
+            corrected_frames[frame_idx] = reference_blocks.copy()
     
     # 为当前GOP生成码表
     gop_codebook = generate_codebook_for_gop(i_frame_blocks, p_frame_blocks_list, i_frame_weight)
     
-    # 编码当前GOP的所有帧
+    # 编码当前GOP的所有帧，使用修正后的帧
     gop_encoded_frames = []
     gop_frame_types = []
     
-    for frame_idx, frame_blocks in enumerate(gop_frames):
+    for frame_idx, frame_blocks in enumerate(corrected_frames):
         if frame_idx == 0:  # I帧
             # I帧编码所有块
             indices = encode_frame_with_codebook(frame_blocks, gop_codebook)
@@ -646,9 +661,9 @@ def process_single_gop(gop_data):
             gop_frame_types.append(0)  # I帧
             print(f"  I帧 {gop_idx * gop_size + frame_idx}: {BLOCKS_PER_FRAME} 个块")
         else:  # P帧
-            # P帧只编码变化的块
-            previous_blocks = gop_frames[frame_idx - 1]
-            changed_indices = find_changed_blocks(frame_blocks, previous_blocks, diff_threshold)
+            # P帧只编码变化的块（基于修正后的帧比较）
+            reference_blocks = corrected_frames[frame_idx - 1]
+            changed_indices = find_changed_blocks(frame_blocks, reference_blocks, diff_threshold)
             
             if len(changed_indices) > 0:
                 # 对变化的块索引进行排序（连续段算法需要排序）
@@ -671,9 +686,12 @@ def process_single_gop(gop_data):
                     for i in range(seg_count):
                         frame_data.append(block_codes[code_idx])
                         code_idx += 1
+                        
+                # print(f"  P帧 {gop_idx * gop_size + frame_idx}: {len(changed_indices)} 个块变化，{len(segments)} 个连续段")
             else:
                 # 无变化的P帧
                 frame_data = [0]
+                # print(f"  P帧 {gop_idx * gop_size + frame_idx}: 无变化")
             
             gop_frame_types.append(1)  # P帧
         

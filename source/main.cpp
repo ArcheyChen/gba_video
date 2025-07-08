@@ -125,6 +125,12 @@ IWRAM_CODE void decode_p_frame(const u16* frame_data, u16* dst)
 {
     // P帧新格式：[段数量, 段1_起始位置, 段1_块数量, 段1_码字1, 段1_码字2, ..., 段2_起始位置, ...]
     u16 segment_count = frame_data[0];
+    
+    if (segment_count == 0) {
+        // 无变化的P帧，什么都不做
+        return;
+    }
+    
     const u16* data = frame_data + 1;
     
     u16 data_offset = 0;
