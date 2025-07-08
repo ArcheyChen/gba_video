@@ -21,13 +21,13 @@ WIDTH, HEIGHT = 240, 160
 
 # 多级码表配置（默认值，将被命令行参数覆盖）
 # 所有码表大小限制为255，使用U8索引，0xFF保留作为分裂标志
-DEFAULT_CODEBOOK_SIZE_8x8 = 64     # 8x8块码表大小
-DEFAULT_CODEBOOK_SIZE_8x4 = 64     # 8x4块码表大小
-DEFAULT_CODEBOOK_SIZE_4x4 = 128     # 4x4块码表大小
+DEFAULT_CODEBOOK_SIZE_8x8 = 255     # 8x8块码表大小
+DEFAULT_CODEBOOK_SIZE_8x4 = 255     # 8x4块码表大小
+DEFAULT_CODEBOOK_SIZE_4x4 = 255     # 4x4块码表大小
 DEFAULT_CODEBOOK_SIZE_4x2 = 255     # 4x2块码表大小（最大255，0xFF留作分裂标志）
-DEFAULT_COVERAGE_RADIUS_8x8 = 60.0  # 8x8块覆盖半径
-DEFAULT_COVERAGE_RADIUS_8x4 = 42.0 # 8x4块覆盖半径
-DEFAULT_COVERAGE_RADIUS_4x4 = 30.0  # 4x4块覆盖半径
+DEFAULT_COVERAGE_RADIUS_8x8 = 80.0  # 8x8块覆盖半径
+DEFAULT_COVERAGE_RADIUS_8x4 = 80.0 # 8x4块覆盖半径
+DEFAULT_COVERAGE_RADIUS_4x4 = 80.0  # 4x4块覆盖半径
 
 # 块尺寸定义
 BLOCK_8x8_W, BLOCK_8x8_H = 8, 8   # 8x8块
@@ -320,6 +320,7 @@ def main():
             break
         if idx % every == 0:
             frm = cv2.resize(frm, (WIDTH, HEIGHT), cv2.INTER_AREA)
+            frm = cv2.blur(frm, (2, 2))  
             # 提取8x8块用于主要编码
             blocks_8x8 = extract_yuv444_blocks_8x8(frm)
             all_frame_blocks.append(blocks_8x8)
@@ -346,8 +347,29 @@ def main():
         'blocks_8x4_used': 0,
         'blocks_4x4_used': 0,
         'blocks_4x2_used': 0,
-        'i_frame_stats': {'blocks_8x8_used': 0, 'blocks_8x4_used': 0, 'blocks_4x4_used': 0, 'blocks_4x2_used': 0},
-        'p_frame_stats': {'blocks_8x8_used': 0, 'blocks_8x4_used': 0, 'blocks_4x4_used': 0, 'blocks_4x2_used': 0}
+        'i_frame_stats': {
+            'blocks_8x8_used': 0, 'blocks_8x4_used': 0, 'blocks_4x4_used': 0, 'blocks_4x2_used': 0,
+            'frame_count': 0, 'total_blocks_encoded': 0,
+            'avg_blocks_per_frame': 0.0, 'codec_efficiency': 0.0,
+            'total_frame_size': 0, 'avg_frame_size_kb': 0.0,
+            'total_codebook_size': 0, 'avg_codebook_size_kb': 0.0
+        },
+        'p_frame_stats': {
+            'blocks_8x8_used': 0, 'blocks_8x4_used': 0, 'blocks_4x4_used': 0, 'blocks_4x2_used': 0,
+            'frame_count': 0, 'total_changed_blocks': 0, 'total_segments': 0,
+            'avg_changed_blocks_per_frame': 0.0, 'avg_segments_per_frame': 0.0,
+            'segment_efficiency': 0.0, 'total_frame_size': 0, 'avg_frame_size_kb': 0.0,
+            'block_type_sizes': {
+                '8x8': 0, '8x4': 0, '4x4': 0, '4x2': 0, 'headers': 0
+            },
+            'zone_stats': {
+                '8x8': {'zones_used': 0, 'segments_total': 0, 'blocks_total': 0, 'avg_segments_per_zone': 0.0},
+                '8x4': {'zones_used': 0, 'segments_total': 0, 'blocks_total': 0, 'avg_segments_per_zone': 0.0},
+                '4x4': {'zones_used': 0, 'segments_total': 0, 'blocks_total': 0, 'avg_segments_per_zone': 0.0},
+                '4x2': {'zones_used': 0, 'segments_total': 0, 'blocks_total': 0, 'avg_segments_per_zone': 0.0}
+            }
+        },
+        'frame_detailed_stats': []  # 存储每一帧的详细统计
     }
 
     # 准备多进程参数
@@ -408,27 +430,197 @@ def main():
             total_stats['blocks_4x2_used'] += frame_stats['blocks_4x2_used']
             
             if frame_type == 0:  # I帧
+                total_stats['i_frame_stats']['frame_count'] += 1
                 total_stats['i_frame_stats']['blocks_8x8_used'] += frame_stats['blocks_8x8_used']
                 total_stats['i_frame_stats']['blocks_8x4_used'] += frame_stats['blocks_8x4_used']
                 total_stats['i_frame_stats']['blocks_4x4_used'] += frame_stats['blocks_4x4_used']
                 total_stats['i_frame_stats']['blocks_4x2_used'] += frame_stats['blocks_4x2_used']
-                print(f"  I帧 {global_frame_idx}: {BLOCKS_8x8_PER_FRAME} 个8x8块 (8x8码表: {frame_stats['blocks_8x8_used']}, 8x4码表: {frame_stats['blocks_8x4_used']}, 4x4码表: {frame_stats['blocks_4x4_used']}, 4x2码表: {frame_stats['blocks_4x2_used']})")
+                
+                total_blocks = (frame_stats['blocks_8x8_used'] + frame_stats['blocks_8x4_used'] + 
+                               frame_stats['blocks_4x4_used'] + frame_stats['blocks_4x2_used'])
+                total_stats['i_frame_stats']['total_blocks_encoded'] += total_blocks
+                
+                # I帧大小统计（帧数据大小，不包括码表）
+                total_stats['i_frame_stats']['total_frame_size'] += len(frame_data)
+                
+                # I帧对应的码表大小（每个I帧分摊GOP码表大小）
+                # 每个GOP有一套码表，每个I帧分摊相同的码表大小
+                codebook_size_bytes = (
+                    codebook_size_8x8 * 64 * 2 +   # 8x8码表：每个码字64个uint16
+                    codebook_size_8x4 * 32 * 2 +   # 8x4码表：每个码字32个uint16  
+                    codebook_size_4x4 * 16 * 2 +   # 4x4码表：每个码字16个uint16
+                    codebook_size_4x2 * 8 * 2      # 4x2码表：每个码字8个uint16
+                )
+                total_stats['i_frame_stats']['total_codebook_size'] += codebook_size_bytes
+                
+                print(f"  I帧 {global_frame_idx}: {BLOCKS_8x8_PER_FRAME} 个8x8块 (8x8码表: {frame_stats['blocks_8x8_used']}, 8x4码表: {frame_stats['blocks_8x4_used']}, 4x4码表: {frame_stats['blocks_4x4_used']}, 4x2码表: {frame_stats['blocks_4x2_used']}) - 大小: {len(frame_data)} 字节")
             else:  # P帧
+                total_stats['p_frame_stats']['frame_count'] += 1
                 total_stats['p_frame_stats']['blocks_8x8_used'] += frame_stats['blocks_8x8_used']
                 total_stats['p_frame_stats']['blocks_8x4_used'] += frame_stats['blocks_8x4_used']
                 total_stats['p_frame_stats']['blocks_4x4_used'] += frame_stats['blocks_4x4_used']
                 total_stats['p_frame_stats']['blocks_4x2_used'] += frame_stats['blocks_4x2_used']
+                
+                # P帧特有统计
+                if 'total_changed_blocks' in frame_stats:
+                    total_stats['p_frame_stats']['total_changed_blocks'] += frame_stats['total_changed_blocks']
+                if 'total_segments' in frame_stats:
+                    total_stats['p_frame_stats']['total_segments'] += frame_stats['total_segments']
+                if 'zone_stats' in frame_stats:
+                    for block_type, zone_data in frame_stats['zone_stats'].items():
+                        if 'zones_used' in zone_data:
+                            total_stats['p_frame_stats']['zone_stats'][block_type]['zones_used'] += zone_data['zones_used']
+                        if 'segments_total' in zone_data:
+                            total_stats['p_frame_stats']['zone_stats'][block_type]['segments_total'] += zone_data['segments_total']
+                        if 'blocks_total' in zone_data:
+                            total_stats['p_frame_stats']['zone_stats'][block_type]['blocks_total'] += zone_data['blocks_total']
+                
+                # P帧大小统计
+                total_stats['p_frame_stats']['total_frame_size'] += len(frame_data)
+                
+                # P帧各级码块大小统计（简化估算）
+                if 'block_type_sizes' in frame_stats:
+                    for block_type, size in frame_stats['block_type_sizes'].items():
+                        total_stats['p_frame_stats']['block_type_sizes'][block_type] += size
+                else:
+                    # 如果没有详细的大小统计，使用简化估算
+                    # 每个8x8块索引 + bitmap + overhead ≈ 1字节
+                    # 每个8x4块索引 + bitmap + overhead ≈ 1字节  
+                    # 每个4x4块索引 + bitmap + overhead ≈ 1字节
+                    # 每个4x2块索引 + bitmap + overhead ≈ 1字节
+                    estimated_8x8_size = frame_stats['blocks_8x8_used'] * 1
+                    estimated_8x4_size = frame_stats['blocks_8x4_used'] * 1
+                    estimated_4x4_size = frame_stats['blocks_4x4_used'] * 1  
+                    estimated_4x2_size = frame_stats['blocks_4x2_used'] * 1
+                    estimated_header_size = len(frame_data) - (estimated_8x8_size + estimated_8x4_size + estimated_4x4_size + estimated_4x2_size)
+                    
+                    total_stats['p_frame_stats']['block_type_sizes']['8x8'] += estimated_8x8_size
+                    total_stats['p_frame_stats']['block_type_sizes']['8x4'] += estimated_8x4_size
+                    total_stats['p_frame_stats']['block_type_sizes']['4x4'] += estimated_4x4_size
+                    total_stats['p_frame_stats']['block_type_sizes']['4x2'] += estimated_4x2_size
+                    total_stats['p_frame_stats']['block_type_sizes']['headers'] += max(0, estimated_header_size)
+                
+                changed_blocks = (frame_stats['blocks_8x8_used'] + frame_stats['blocks_8x4_used'] + 
+                                 frame_stats['blocks_4x4_used'] + frame_stats['blocks_4x2_used'])
+                print(f"  P帧 {global_frame_idx}: {changed_blocks} 个变化块 (8x8码表: {frame_stats['blocks_8x8_used']}, 8x4码表: {frame_stats['blocks_8x4_used']}, 4x4码表: {frame_stats['blocks_4x4_used']}, 4x2码表: {frame_stats['blocks_4x2_used']}) - 大小: {len(frame_data)} 字节")
+            
+            # 保存每帧详细统计
+            frame_detail = {
+                'frame_idx': global_frame_idx,
+                'frame_type': 'I' if frame_type == 0 else 'P',
+                'gop_idx': gop_idx,
+                'frame_size': len(frame_data),
+                'blocks_8x8_used': frame_stats['blocks_8x8_used'],
+                'blocks_8x4_used': frame_stats['blocks_8x4_used'],
+                'blocks_4x4_used': frame_stats['blocks_4x4_used'],
+                'blocks_4x2_used': frame_stats['blocks_4x2_used']
+            }
+            if frame_type == 1 and 'zone_stats' in frame_stats:
+                frame_detail['zone_stats'] = frame_stats['zone_stats']
+            
+            total_stats['frame_detailed_stats'].append(frame_detail)
 
     # 移除最后一个多余的偏移
     frame_offsets = frame_offsets[:-1]
+    
+    # 计算平均统计
+    if total_stats['i_frame_stats']['frame_count'] > 0:
+        total_stats['i_frame_stats']['avg_blocks_per_frame'] = (
+            total_stats['i_frame_stats']['total_blocks_encoded'] / total_stats['i_frame_stats']['frame_count']
+        )
+        total_stats['i_frame_stats']['codec_efficiency'] = (
+            total_stats['i_frame_stats']['blocks_8x8_used'] / total_stats['i_frame_stats']['total_blocks_encoded'] * 100
+        )
+        total_stats['i_frame_stats']['avg_frame_size_kb'] = (
+            total_stats['i_frame_stats']['total_frame_size'] / total_stats['i_frame_stats']['frame_count'] / 1024
+        )
+        total_stats['i_frame_stats']['avg_codebook_size_kb'] = (
+            total_stats['i_frame_stats']['total_codebook_size'] / total_stats['i_frame_stats']['frame_count'] / 1024
+        )
+    
+    if total_stats['p_frame_stats']['frame_count'] > 0:
+        total_stats['p_frame_stats']['avg_changed_blocks_per_frame'] = (
+            total_stats['p_frame_stats']['total_changed_blocks'] / total_stats['p_frame_stats']['frame_count']
+        )
+        total_stats['p_frame_stats']['avg_segments_per_frame'] = (
+            total_stats['p_frame_stats']['total_segments'] / total_stats['p_frame_stats']['frame_count']
+        )
+        total_stats['p_frame_stats']['avg_frame_size_kb'] = (
+            total_stats['p_frame_stats']['total_frame_size'] / total_stats['p_frame_stats']['frame_count'] / 1024
+        )
+        if total_stats['p_frame_stats']['total_segments'] > 0:
+            total_stats['p_frame_stats']['segment_efficiency'] = (
+                total_stats['p_frame_stats']['total_changed_blocks'] / total_stats['p_frame_stats']['total_segments']
+            )
+    
+    # 计算zone平均统计
+    for block_type in ['8x8', '8x4', '4x4', '4x2']:
+        zone_data = total_stats['p_frame_stats']['zone_stats'][block_type]
+        if zone_data['zones_used'] > 0:
+            zone_data['avg_segments_per_zone'] = zone_data['segments_total'] / zone_data['zones_used']
+        if zone_data['segments_total'] > 0:
+            zone_data['avg_blocks_per_segment'] = zone_data['blocks_total'] / zone_data['segments_total']
 
     # 写入文件
     write_header(pathlib.Path(args.out).with_suffix(".h"), total_frames, gop_count, gop_size, codebook_size_8x8, codebook_size_8x4, codebook_size_4x4, codebook_size_4x2)
     write_source(pathlib.Path(args.out).with_suffix(".c"), gop_codebooks, encoded_frames, frame_offsets, frame_types, codebook_size_8x8, codebook_size_8x4, codebook_size_4x4, codebook_size_4x2)
 
-    # 详细统计信息
+    print(f"\n📊 帧平均大小统计 (以KB计):")
+    print("="*40)
+    
+    # I帧平均大小统计
+    if total_stats['i_frame_stats']['frame_count'] > 0:
+        i_frame_avg_kb = total_stats['i_frame_stats']['avg_frame_size_kb']
+        i_codebook_avg_kb = total_stats['i_frame_stats']['avg_codebook_size_kb']
+        i_total_avg_kb = i_frame_avg_kb + i_codebook_avg_kb
+        
+        print(f"🎯 I帧平均大小:")
+        print(f"  - 帧内数据: {i_frame_avg_kb:.2f} KB/帧")
+        print(f"  - 码表数据: {i_codebook_avg_kb:.2f} KB/帧")
+        print(f"  - 总大小: {i_total_avg_kb:.2f} KB/帧")
+        print(f"  - 总帧数: {total_stats['i_frame_stats']['frame_count']} 帧")
+        print(f"  - 总帧内数据: {total_stats['i_frame_stats']['total_frame_size']/1024:.1f} KB")
+        print(f"  - 总码表数据: {total_stats['i_frame_stats']['total_codebook_size']/1024:.1f} KB")
+        print(f"  - 总I帧数据: {(total_stats['i_frame_stats']['total_frame_size'] + total_stats['i_frame_stats']['total_codebook_size'])/1024:.1f} KB")
+    else:
+        print("🎯 I帧平均大小: 无I帧数据")
+    
+    # P帧平均大小统计
+    if total_stats['p_frame_stats']['frame_count'] > 0:
+        p_frame_avg_kb = total_stats['p_frame_stats']['avg_frame_size_kb']
+        
+        print(f"\n🚀 P帧平均大小:")
+        print(f"  - 帧数据: {p_frame_avg_kb:.2f} KB/帧")
+        print(f"  - 总帧数: {total_stats['p_frame_stats']['frame_count']} 帧")
+        print(f"  - 总帧数据: {total_stats['p_frame_stats']['total_frame_size']/1024:.1f} KB")
+        
+        # P帧各级码块平均大小
+        print(f"  - 各级码块平均大小:")
+        total_block_size = sum(total_stats['p_frame_stats']['block_type_sizes'].values())
+        for block_type, size in total_stats['p_frame_stats']['block_type_sizes'].items():
+            avg_size_per_frame = size / total_stats['p_frame_stats']['frame_count'] / 1024
+            percentage = size / total_block_size * 100 if total_block_size > 0 else 0
+            print(f"    - {block_type}: {avg_size_per_frame:.3f} KB/帧 ({percentage:.1f}%)")
+    else:
+        print("🚀 P帧平均大小: 无P帧数据")
+    
+    # I帧与P帧大小对比
+    if total_stats['i_frame_stats']['frame_count'] > 0 and total_stats['p_frame_stats']['frame_count'] > 0:
+        i_total_avg_kb = total_stats['i_frame_stats']['avg_frame_size_kb'] + total_stats['i_frame_stats']['avg_codebook_size_kb']
+        p_avg_kb = total_stats['p_frame_stats']['avg_frame_size_kb']
+        size_ratio = i_total_avg_kb / p_avg_kb if p_avg_kb > 0 else 0
+        
+        print(f"\n📈 I帧与P帧大小对比:")
+        print(f"  - I帧平均大小: {i_total_avg_kb:.2f} KB/帧 (含码表)")
+        print(f"  - P帧平均大小: {p_avg_kb:.2f} KB/帧")
+        print(f"  - 大小比例: {size_ratio:.1f}:1 (I帧:P帧)")
+        print(f"  - P帧压缩效率: {100/size_ratio:.1f}% (相对I帧)")
+    
+    print("="*40)
+    
+    # 继续原有的详细统计信息
     print("\n" + "="*60)
-    print("📊 编码统计信息")
+    print("📊 详细编码统计信息")
     print("="*60)
     
     # 基本信息
@@ -457,20 +649,106 @@ def main():
     total_possible_4x4_blocks = total_possible_8x4_blocks * 2  # 每个8x4块最多拆分为2个4x4块
     total_possible_4x2_blocks = total_possible_4x4_blocks * 2  # 每个4x4块最多拆分为2个4x2块
     
-    print(f"I帧统计:")
+    print(f"\n🎯 I帧详细统计 ({total_stats['i_frame_stats']['frame_count']} 帧):")
     print(f"  - 8x8码表使用: {total_stats['i_frame_stats']['blocks_8x8_used']:,} 个8x8块")
     print(f"  - 8x4码表使用: {total_stats['i_frame_stats']['blocks_8x4_used']:,} 个8x4块")
     print(f"  - 4x4码表使用: {total_stats['i_frame_stats']['blocks_4x4_used']:,} 个4x4块")
     print(f"  - 4x2码表使用: {total_stats['i_frame_stats']['blocks_4x2_used']:,} 个4x2块")
+    print(f"  - 总编码块数: {total_stats['i_frame_stats']['total_blocks_encoded']:,}")
+    print(f"  - 平均每帧编码块数: {total_stats['i_frame_stats']['avg_blocks_per_frame']:.1f}")
+    print(f"  - 8x8码表效率: {total_stats['i_frame_stats']['codec_efficiency']:.1f}% (越高越好)")
+    print(f"  📊 I帧大小统计:")
+    print(f"    - 总帧内数据大小: {total_stats['i_frame_stats']['total_frame_size']:,} 字节 ({total_stats['i_frame_stats']['total_frame_size']/1024:.1f} KB)")
+    print(f"    - 平均帧内数据大小: {total_stats['i_frame_stats']['avg_frame_size_kb']:.2f} KB/帧")
+    print(f"    - 总码表数据大小: {total_stats['i_frame_stats']['total_codebook_size']:,} 字节 ({total_stats['i_frame_stats']['total_codebook_size']/1024:.1f} KB)")
+    print(f"    - 平均码表数据大小: {total_stats['i_frame_stats']['avg_codebook_size_kb']:.2f} KB/帧")
+    print(f"    - 平均I帧总大小: {total_stats['i_frame_stats']['avg_frame_size_kb'] + total_stats['i_frame_stats']['avg_codebook_size_kb']:.2f} KB/帧 (帧内+码表)")
     if total_8x8_blocks > 0:
         i_8x8_ratio = total_stats['i_frame_stats']['blocks_8x8_used'] / total_8x8_blocks * 100
         print(f"  - I帧中8x8码表覆盖率: {i_8x8_ratio:.1f}%")
     
-    print(f"P帧统计:")
+    print(f"\n🚀 P帧详细统计 ({total_stats['p_frame_stats']['frame_count']} 帧):")
     print(f"  - 8x8码表使用: {total_stats['p_frame_stats']['blocks_8x8_used']:,} 个8x8块")
     print(f"  - 8x4码表使用: {total_stats['p_frame_stats']['blocks_8x4_used']:,} 个8x4块")
     print(f"  - 4x4码表使用: {total_stats['p_frame_stats']['blocks_4x4_used']:,} 个4x4块")
     print(f"  - 4x2码表使用: {total_stats['p_frame_stats']['blocks_4x2_used']:,} 个4x2块")
+    print(f"  - 总变化块数: {total_stats['p_frame_stats']['total_changed_blocks']:,}")
+    print(f"  - 总编码段数: {total_stats['p_frame_stats']['total_segments']:,}")
+    print(f"  - 平均每帧变化块数: {total_stats['p_frame_stats']['avg_changed_blocks_per_frame']:.1f}")
+    print(f"  - 平均每帧编码段数: {total_stats['p_frame_stats']['avg_segments_per_frame']:.1f}")
+    print(f"  - 段编码效率: {total_stats['p_frame_stats']['segment_efficiency']:.1f} 块/段 (越高越好)")
+    print(f"  📊 P帧大小统计:")
+    print(f"    - 总帧大小: {total_stats['p_frame_stats']['total_frame_size']:,} 字节 ({total_stats['p_frame_stats']['total_frame_size']/1024:.1f} KB)")
+    print(f"    - 平均帧大小: {total_stats['p_frame_stats']['avg_frame_size_kb']:.2f} KB/帧")
+    print(f"    - 各级码块空间占用:")
+    total_block_size = sum(total_stats['p_frame_stats']['block_type_sizes'].values())
+    if total_block_size > 0:
+        for block_type, size in total_stats['p_frame_stats']['block_type_sizes'].items():
+            percentage = size / total_block_size * 100 if total_block_size > 0 else 0
+            avg_size_per_frame = size / total_stats['p_frame_stats']['frame_count'] / 1024 if total_stats['p_frame_stats']['frame_count'] > 0 else 0
+            print(f"      - {block_type}码表: {size:,} 字节 ({percentage:.1f}%, {avg_size_per_frame:.3f} KB/帧)")
+    
+    # P帧与I帧大小对比
+    if total_stats['i_frame_stats']['frame_count'] > 0 and total_stats['p_frame_stats']['frame_count'] > 0:
+        i_total_avg = total_stats['i_frame_stats']['avg_frame_size_kb'] + total_stats['i_frame_stats']['avg_codebook_size_kb']
+        p_avg = total_stats['p_frame_stats']['avg_frame_size_kb']
+        compression_ratio = i_total_avg / p_avg if p_avg > 0 else 0
+        print(f"    - P帧相对I帧压缩比: {compression_ratio:.1f}:1 (I帧: {i_total_avg:.2f} KB, P帧: {p_avg:.2f} KB)")
+    
+    # P帧变化率分析
+    if p_frame_count > 0:
+        total_possible_p_blocks = p_frame_count * BLOCKS_8x8_PER_FRAME
+        p_change_rate = total_stats['p_frame_stats']['total_changed_blocks'] / total_possible_p_blocks * 100
+        print(f"  - P帧总体变化率: {p_change_rate:.1f}% ({total_stats['p_frame_stats']['total_changed_blocks']:,}/{total_possible_p_blocks:,})")
+    
+    print(f"\n🗺️ Zone编码效率统计:")
+    for block_type in ['8x8', '8x4', '4x4', '4x2']:
+        zone_data = total_stats['p_frame_stats']['zone_stats'][block_type]
+        if zone_data['blocks_total'] > 0:
+            print(f"  {block_type}码表:")
+            print(f"    - 使用的zone数: {zone_data['zones_used']}")
+            print(f"    - 编码段总数: {zone_data['segments_total']}")
+            print(f"    - 变化块总数: {zone_data['blocks_total']}")
+            print(f"    - 平均每zone段数: {zone_data['avg_segments_per_zone']:.1f}")
+            print(f"    - 平均每段块数: {zone_data['avg_blocks_per_segment']:.1f}")
+            
+            # 计算zone利用率
+            if block_type == "8x8":
+                max_zones = ZONES_8x8_COUNT
+            elif block_type == "8x4":
+                max_zones = ZONES_8x4_COUNT
+            elif block_type == "4x4":
+                max_zones = ZONES_4x4_COUNT
+            elif block_type == "4x2":
+                max_zones = ZONES_4x2_COUNT
+            
+            zone_usage_rate = zone_data['zones_used'] / (max_zones * total_stats['p_frame_stats']['frame_count']) * 100
+            print(f"    - Zone利用率: {zone_usage_rate:.1f}% ({zone_data['zones_used']}/{max_zones * total_stats['p_frame_stats']['frame_count']})")
+    
+    print(f"\n📊 码表利用率分析:")
+    print("I帧码表利用率 (相对于码表大小):")
+    if total_stats['i_frame_stats']['frame_count'] > 0:
+        i_8x8_per_frame = total_stats['i_frame_stats']['blocks_8x8_used'] / total_stats['i_frame_stats']['frame_count']
+        i_8x4_per_frame = total_stats['i_frame_stats']['blocks_8x4_used'] / total_stats['i_frame_stats']['frame_count']
+        i_4x4_per_frame = total_stats['i_frame_stats']['blocks_4x4_used'] / total_stats['i_frame_stats']['frame_count']
+        i_4x2_per_frame = total_stats['i_frame_stats']['blocks_4x2_used'] / total_stats['i_frame_stats']['frame_count']
+        
+        print(f"  - 8x8码表: {i_8x8_per_frame:.1f} 个/帧 (码表大小: {codebook_size_8x8}, 利用率: {i_8x8_per_frame/codebook_size_8x8*100:.1f}%)")
+        print(f"  - 8x4码表: {i_8x4_per_frame:.1f} 个/帧 (码表大小: {codebook_size_8x4}, 利用率: {i_8x4_per_frame/codebook_size_8x4*100:.1f}%)")
+        print(f"  - 4x4码表: {i_4x4_per_frame:.1f} 个/帧 (码表大小: {codebook_size_4x4}, 利用率: {i_4x4_per_frame/codebook_size_4x4*100:.1f}%)")
+        print(f"  - 4x2码表: {i_4x2_per_frame:.1f} 个/帧 (码表大小: {codebook_size_4x2}, 利用率: {i_4x2_per_frame/codebook_size_4x2*100:.1f}%)")
+    
+    print("P帧码表利用率 (相对于码表大小):")
+    if total_stats['p_frame_stats']['frame_count'] > 0:
+        p_8x8_per_frame = total_stats['p_frame_stats']['blocks_8x8_used'] / total_stats['p_frame_stats']['frame_count']
+        p_8x4_per_frame = total_stats['p_frame_stats']['blocks_8x4_used'] / total_stats['p_frame_stats']['frame_count']
+        p_4x4_per_frame = total_stats['p_frame_stats']['blocks_4x4_used'] / total_stats['p_frame_stats']['frame_count']
+        p_4x2_per_frame = total_stats['p_frame_stats']['blocks_4x2_used'] / total_stats['p_frame_stats']['frame_count']
+        
+        print(f"  - 8x8码表: {p_8x8_per_frame:.1f} 个/帧 (码表大小: {codebook_size_8x8}, 利用率: {p_8x8_per_frame/codebook_size_8x8*100:.1f}%)")
+        print(f"  - 8x4码表: {p_8x4_per_frame:.1f} 个/帧 (码表大小: {codebook_size_8x4}, 利用率: {p_8x4_per_frame/codebook_size_8x4*100:.1f}%)")
+        print(f"  - 4x4码表: {p_4x4_per_frame:.1f} 个/帧 (码表大小: {codebook_size_4x4}, 利用率: {p_4x4_per_frame/codebook_size_4x4*100:.1f}%)")
+        print(f"  - 4x2码表: {p_4x2_per_frame:.1f} 个/帧 (码表大小: {codebook_size_4x2}, 利用率: {p_4x2_per_frame/codebook_size_4x2*100:.1f}%)")
     
     # 计算各部分大小
     # 1. 码表大小
@@ -1304,12 +1582,15 @@ def encode_p_frame_multi_level_separate(
         total_stats['blocks_4x2_used'] += 1
     
     # 5. 组装最终帧数据（使用zone优化编码）
-    frame_data = encode_blocks_with_zone_optimization([
+    frame_data, zone_combined_stats = encode_blocks_with_zone_optimization([
         blocks_to_encode_8x8,
         final_blocks_8x4, 
         final_blocks_4x4,
         final_blocks_4x2
     ])
+    
+    # 合并统计信息
+    total_stats.update(zone_combined_stats)
     
     return frame_data, total_stats
 
@@ -1322,7 +1603,7 @@ def encode_zone_bitmap_and_data(changed_blocks_dict, block_type):
         block_type: "8x8", "8x4", "4x4", "4x2"
     
     Returns:
-        list: 编码后的数据
+        tuple: (编码后的数据, zone统计信息)
     """
     if block_type == "8x8":
         zones_count = ZONES_8x8_COUNT
@@ -1339,6 +1620,24 @@ def encode_zone_bitmap_and_data(changed_blocks_dict, block_type):
     else:
         raise ValueError(f"未知块类型: {block_type}")
     
+    # 统计信息
+    zone_stats = {
+        'zones_used': 0,
+        'segments_total': 0,
+        'blocks_total': len(changed_blocks_dict),
+        'avg_segments_per_zone': 0.0,
+        'avg_blocks_per_segment': 0.0
+    }
+    
+    if not changed_blocks_dict:
+        # 没有变化的块
+        if block_type in ["8x8", "8x4"]:
+            return [0], zone_stats  # u8 bitmap
+        elif block_type == "4x4":
+            return [0, 0], zone_stats  # u16 bitmap
+        elif block_type == "4x2":
+            return [0, 0, 0, 0], zone_stats  # u32 bitmap
+    
     # 1. 按zone分组变化的块
     zones_data = {}
     for block_pos, codeword_idx in changed_blocks_dict.items():
@@ -1347,6 +1646,8 @@ def encode_zone_bitmap_and_data(changed_blocks_dict, block_type):
         if zone_id not in zones_data:
             zones_data[zone_id] = []
         zones_data[zone_id].append((zone_offset, codeword_idx))
+    
+    zone_stats['zones_used'] = len(zones_data)
     
     # 2. 生成bitmap
     bitmap = 0
@@ -1367,6 +1668,7 @@ def encode_zone_bitmap_and_data(changed_blocks_dict, block_type):
         ])
     
     # 4. 对每个有变化的zone编码数据
+    total_segments = 0
     for zone_id in sorted(zones_data.keys()):
         if zone_id >= zones_count:
             continue
@@ -1395,6 +1697,8 @@ def encode_zone_bitmap_and_data(changed_blocks_dict, block_type):
         if current_segment is not None:
             segments.append(current_segment)
         
+        total_segments += len(segments)
+        
         # 编码连续段数量
         encoded_data.append(len(segments) & 0xFF)
         
@@ -1405,7 +1709,13 @@ def encode_zone_bitmap_and_data(changed_blocks_dict, block_type):
             encoded_data.append(count & 0xFF)        # 连续块数量
             encoded_data.extend(codewords)           # 码表项序列
     
-    return encoded_data
+    zone_stats['segments_total'] = total_segments
+    if zone_stats['zones_used'] > 0:
+        zone_stats['avg_segments_per_zone'] = total_segments / zone_stats['zones_used']
+    if total_segments > 0:
+        zone_stats['avg_blocks_per_segment'] = zone_stats['blocks_total'] / total_segments
+    
+    return encoded_data, zone_stats
 
 def encode_blocks_with_zone_optimization(blocks_lists):
     """
@@ -1416,11 +1726,12 @@ def encode_blocks_with_zone_optimization(blocks_lists):
                      每个都是[(block_pos, codeword_idx), ...] 列表
     
     Returns:
-        list: 编码后的数据
+        tuple: (编码后的数据, 综合统计信息)
     """
     blocks_8x8, blocks_8x4, blocks_4x4, blocks_4x2 = blocks_lists
     
     frame_data = []
+    zone_stats = {}
     
     # 对每种块类型进行zone编码
     block_types = ["8x8", "8x4", "4x4", "4x2"]
@@ -1434,16 +1745,33 @@ def encode_blocks_with_zone_optimization(blocks_lists):
                 frame_data.extend([0, 0])  # u16 bitmap
             elif block_type == "4x2":
                 frame_data.extend([0, 0, 0, 0])  # u32 bitmap
+            
+            # 空统计
+            zone_stats[block_type] = {
+                'zones_used': 0, 'segments_total': 0, 'blocks_total': 0,
+                'avg_segments_per_zone': 0.0, 'avg_blocks_per_segment': 0.0
+            }
             continue
         
         # 转换为字典格式
         changed_blocks_dict = {pos: idx for pos, idx in blocks}
         
         # 使用zone编码
-        zone_data = encode_zone_bitmap_and_data(changed_blocks_dict, block_type)
+        zone_data, zone_stat = encode_zone_bitmap_and_data(changed_blocks_dict, block_type)
         frame_data.extend(zone_data)
+        zone_stats[block_type] = zone_stat
     
-    return frame_data
+    # 计算总统计
+    total_changed_blocks = sum(len(blocks) for blocks in blocks_lists)
+    total_segments = sum(stats['segments_total'] for stats in zone_stats.values())
+    
+    combined_stats = {
+        'total_changed_blocks': total_changed_blocks,
+        'total_segments': total_segments,
+        'zone_stats': zone_stats
+    }
+    
+    return frame_data, combined_stats
 
 if __name__ == "__main__":
     main()

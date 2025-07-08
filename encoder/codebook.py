@@ -137,6 +137,11 @@ def generate_codebook_8x4_max_coverage(blocks_8x4: np.ndarray, radius: float = 1
         return np.zeros((n_neighbors, 96), dtype=np.uint8)
     X = blocks_8x4.astype(np.float32)
     # print("构建稀疏相似度矩阵...")
+    # 检查数据集大小，如果太小则调整码表大小
+    if len(X) < n_neighbors:
+        print(f"⚠️  8x4数据集太小 ({len(X)} < {n_neighbors})，调整码表大小为 {len(X)}")
+        n_neighbors = len(X)
+    
     S = build_sparse_similarity(X, radius=radius, n_neighbors=n_neighbors)
     density = 100 * S.nnz / (len(X) ** 2)
     # print(f"稀疏矩阵密度: {density:.4f}% (nnz={S.nnz:,})")
@@ -183,6 +188,12 @@ def generate_codebook_4x4_max_coverage(blocks_4x4: np.ndarray, radius: float = 8
     # print(f"为4x4块生成最大覆盖码表...块数: {len(blocks_4x4)}")
     if len(blocks_4x4) == 0:
         return np.zeros((n_neighbors, 48), dtype=np.uint8)
+    
+    # 检查数据集大小，如果太小则调整码表大小
+    if len(blocks_4x4) < n_neighbors:
+        print(f"⚠️  4x4数据集太小 ({len(blocks_4x4)} < {n_neighbors})，调整码表大小为 {len(blocks_4x4)}")
+        n_neighbors = len(blocks_4x4)
+    
     X = blocks_4x4.astype(np.float32)
     # print("构建稀疏相似度矩阵...")
     S = build_sparse_similarity(X, radius=radius, n_neighbors=n_neighbors)
@@ -383,6 +394,11 @@ def generate_codebook_8x8_max_coverage(blocks_8x8: np.ndarray, radius: float = 1
     if len(blocks_8x8) == 0:
         return np.zeros((n_neighbors, 192), dtype=np.uint8)  # 8x8块有192个值
     
+    # 检查数据集大小，如果太小则调整码表大小
+    if len(blocks_8x8) < n_neighbors:
+        print(f"⚠️  8x8数据集太小 ({len(blocks_8x8)} < {n_neighbors})，调整码表大小为 {len(blocks_8x8)}")
+        n_neighbors = len(blocks_8x8)
+    
     X = blocks_8x8.astype(np.float32)
     # print("构建稀疏相似度矩阵...")
     S = build_sparse_similarity(X, radius=radius, n_neighbors=n_neighbors)
@@ -410,6 +426,11 @@ def generate_codebook_4x2_max_coverage(blocks_4x2: np.ndarray, radius: float = f
     if len(blocks_4x2) == 0:
         return np.zeros((n_neighbors, 24), dtype=np.uint8)  # 4x2块有24个值
     
+    # 检查数据集大小，如果太小则调整码表大小
+    if len(blocks_4x2) < n_neighbors:
+        print(f"⚠️  4x2数据集太小 ({len(blocks_4x2)} < {n_neighbors})，调整码表大小为 {len(blocks_4x2)}")
+        n_neighbors = len(blocks_4x2)
+    
     X = blocks_4x2.astype(np.float32)
     
     # 如果块数量过大，进行预采样以提高性能
@@ -420,6 +441,11 @@ def generate_codebook_4x2_max_coverage(blocks_4x2: np.ndarray, radius: float = f
         np.random.seed(42)  # 固定随机种子保证可重复性
         sample_indices = np.random.choice(len(X), max_samples_for_coverage, replace=False)
         X_sampled = X[sample_indices]
+        
+        # 重新检查采样后的数据集大小
+        if len(X_sampled) < n_neighbors:
+            print(f"⚠️  采样后4x2数据集太小 ({len(X_sampled)} < {n_neighbors})，调整码表大小为 {len(X_sampled)}")
+            n_neighbors = len(X_sampled)
         
         # print("构建稀疏相似度矩阵...")
         S = build_sparse_similarity(X_sampled, radius=radius, n_neighbors=n_neighbors)
