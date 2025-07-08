@@ -14,6 +14,11 @@ constexpr int PIXELS_PER_FRAME = SCREEN_WIDTH * SCREEN_HEIGHT;
 
 IWRAM_CODE int decode_8x4_recursive(const u8* data, int data_idx, u16* dst, int dst_stride);
 
+// 从 u8 数组中读取 u32 值（小端序）
+IWRAM_CODE inline u32 read_u32_from_u8(const u8* data, int idx) {
+    return data[idx] | (data[idx + 1] << 8) | (data[idx + 2] << 16) | (data[idx + 3] << 24);
+}
+
 // 从 u8 数组中读取 u16 值（小端序）
 IWRAM_CODE inline u16 read_u16_from_u8(const u8* data, int idx) {
     return data[idx] | (data[idx + 1] << 8);
@@ -358,6 +363,105 @@ IWRAM_CODE void decode_p_frame_multi_level(const u8* frame_data, u16* dst)
     }
 }
 
+IWRAM_CODE int decode_zone_bitmap_and_data(const u8* data, int data_idx, u16* dst, 
+                                          int block_type_id, const u32* offset_table)
+{
+    int original_data_idx = data_idx;
+    
+    // 1. 读取bitmap
+    u32 bitmap = 0;
+    int zones_count = 0;
+    
+    switch (block_type_id) {
+        case 0: // 8x8
+            zones_count = VIDEO_ZONES_8x8_COUNT;
+            bitmap = data[data_idx];
+            data_idx += 1;
+            break;
+        case 1: // 8x4
+            zones_count = VIDEO_ZONES_8x4_COUNT;
+            bitmap = data[data_idx];
+            data_idx += 1;
+            break;
+        case 2: // 4x4
+            zones_count = VIDEO_ZONES_4x4_COUNT;
+            bitmap = read_u16_from_u8(data, data_idx);
+            data_idx += 2;
+            break;
+        case 3: // 4x2
+            zones_count = VIDEO_ZONES_4x2_COUNT;
+            bitmap = read_u32_from_u8(data, data_idx);
+            data_idx += 4;
+            break;
+    }
+    
+    // 2. 处理每个活跃的zone
+    for (int zone_id = 0; zone_id < zones_count; zone_id++) {
+        if (!(bitmap & (1 << zone_id))) {
+            continue; // 此zone没有变化
+        }
+        
+        // 读取此zone的段数量
+        u8 segment_count = data[data_idx++];
+        
+        // 处理每个段
+        for (int seg = 0; seg < segment_count; seg++) {
+            u8 zone_offset = data[data_idx++];  // zone内偏移
+            u8 run_length = data[data_idx++];   // 连续块数量
+            
+            // 解码连续的块
+            for (int i = 0; i < run_length; i++) {
+                u8 codeword_idx = data[data_idx++]; // 码表索引
+                
+                // 计算全局块位置
+                int global_block_pos = zone_id * VIDEO_BLOCKS_PER_ZONE + zone_offset + i;
+                
+                // 获取目标像素位置
+                u16* block_dst = dst + offset_table[global_block_pos];
+                
+                // 根据块类型解码
+                switch (block_type_id) {
+                    case 0: // 8x8
+                        decode_8x8_block_from_bgr555_buffer(codeword_idx, block_dst, SCREEN_WIDTH);
+                        break;
+                    case 1: // 8x4
+                        decode_8x4_block_from_bgr555_buffer(codeword_idx, block_dst, SCREEN_WIDTH);
+                        break;
+                    case 2: // 4x4
+                        decode_4x4_block_from_bgr555_buffer(codeword_idx, block_dst, SCREEN_WIDTH);
+                        break;
+                    case 3: // 4x2
+                        decode_4x2_block_from_bgr555_buffer(codeword_idx, block_dst, SCREEN_WIDTH);
+                        break;
+                }
+            }
+        }
+    }
+    
+    return data_idx - original_data_idx; // 返回消耗的字节数
+}
+
+IWRAM_CODE void decode_p_frame_zone_optimization(const u8* frame_data, u16* dst)
+{
+    // P帧zone编码格式：
+    // [8x8 zone数据] + [8x4 zone数据] + [4x4 zone数据] + [4x2 zone数据]
+    // 每个zone数据格式：bitmap + 每个活跃zone的段数据
+    
+    int data_idx = 0;
+    
+    // 1. 解码8x8块 (block_type_id = 0)
+    data_idx += decode_zone_bitmap_and_data(frame_data, data_idx, dst, 0, block_8x8_offset_table);
+    
+    // 2. 解码8x4块 (block_type_id = 1)
+    data_idx += decode_zone_bitmap_and_data(frame_data, data_idx, dst, 1, block_8x4_offset_table);
+    
+    // 3. 解码4x4块 (block_type_id = 2)
+    data_idx += decode_zone_bitmap_and_data(frame_data, data_idx, dst, 2, block_4x4_offset_table);
+    
+    // 4. 解码4x2块 (block_type_id = 3)
+    data_idx += decode_zone_bitmap_and_data(frame_data, data_idx, dst, 3, block_4x2_offset_table);
+}
+
 IWRAM_CODE void decode_p_frame_multi_level_separate(const u8* frame_data, u16* dst)
 {
     // P帧新连续块格式：每种块类型的格式为：
@@ -499,8 +603,8 @@ int main()
             // I帧：完全重绘
             decode_i_frame_multi_level(frame_data, ewramBuffer);
         } else {
-            // P帧：增量更新（使用新的分层解码）
-            decode_p_frame_multi_level_separate(frame_data, ewramBuffer);
+            // P帧：增量更新（使用zone优化解码）
+            decode_p_frame_zone_optimization(frame_data, ewramBuffer);
         }
 
         // 复制到VRAM

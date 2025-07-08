@@ -52,6 +52,21 @@ BLOCKS_4x2_PER_FRAME = (WIDTH // BLOCK_4x2_W) * (HEIGHT // BLOCK_4x2_H)  # 60 * 
 # 特殊标记 - 统一使用0xFF作为分裂标志
 MARKER_SPLIT = 0xFF  # 统一分裂标志，表示需要分裂到下一级
 
+# Zone配置 - 每240个块为一个zone
+BLOCKS_PER_ZONE = 240
+
+# Zone数量和bitmap类型
+ZONES_8x8_COUNT = (BLOCKS_8x8_PER_FRAME + BLOCKS_PER_ZONE - 1) // BLOCKS_PER_ZONE  # 3个zone
+ZONES_8x4_COUNT = (BLOCKS_8x4_PER_FRAME + BLOCKS_PER_ZONE - 1) // BLOCKS_PER_ZONE  # 5个zone  
+ZONES_4x4_COUNT = (BLOCKS_4x4_PER_FRAME + BLOCKS_PER_ZONE - 1) // BLOCKS_PER_ZONE  # 10个zone
+ZONES_4x2_COUNT = (BLOCKS_4x2_PER_FRAME + BLOCKS_PER_ZONE - 1) // BLOCKS_PER_ZONE  # 20个zone
+
+# Zone像素高度（zone在屏幕上占据的像素高度）
+ZONE_8x8_PIXEL_HEIGHT = BLOCKS_PER_ZONE * PIXELS_PER_8x8_BLOCK // (WIDTH // BLOCK_8x8_W)  # 240*64/30 = 512像素
+ZONE_8x4_PIXEL_HEIGHT = BLOCKS_PER_ZONE * PIXELS_PER_8x4_BLOCK // (WIDTH // BLOCK_8x4_W)  # 240*32/30 = 256像素
+ZONE_4x4_PIXEL_HEIGHT = BLOCKS_PER_ZONE * PIXELS_PER_4x4_BLOCK // (WIDTH // BLOCK_4x4_W)  # 240*16/60 = 64像素
+ZONE_4x2_PIXEL_HEIGHT = BLOCKS_PER_ZONE * PIXELS_PER_4x2_BLOCK // (WIDTH // BLOCK_4x2_W)  # 240*8/60 = 32像素
+
 # IP帧编码参数
 GOP_SIZE = 30  # GOP大小，每30帧一个I帧
 I_FRAME_WEIGHT = 3  # I帧块的权重（用于K-means训练）
@@ -87,6 +102,17 @@ def write_header(path_h: pathlib.Path, total_frames: int, gop_count: int, gop_si
             #define VIDEO_GOP_SIZE        {gop_size}
             #define VIDEO_GOP_COUNT       {gop_count}
             #define VIDEO_MARKER_SPLIT    0xFF
+            
+            // Zone编码相关常量
+            #define VIDEO_BLOCKS_PER_ZONE   {BLOCKS_PER_ZONE}
+            #define VIDEO_ZONES_8x8_COUNT   {ZONES_8x8_COUNT}
+            #define VIDEO_ZONES_8x4_COUNT   {ZONES_8x4_COUNT}
+            #define VIDEO_ZONES_4x4_COUNT   {ZONES_4x4_COUNT}
+            #define VIDEO_ZONES_4x2_COUNT   {ZONES_4x2_COUNT}
+            #define VIDEO_ZONE_8x8_PIXEL_HEIGHT {ZONE_8x8_PIXEL_HEIGHT}
+            #define VIDEO_ZONE_8x4_PIXEL_HEIGHT {ZONE_8x4_PIXEL_HEIGHT}
+            #define VIDEO_ZONE_4x4_PIXEL_HEIGHT {ZONE_4x4_PIXEL_HEIGHT}
+            #define VIDEO_ZONE_4x2_PIXEL_HEIGHT {ZONE_4x2_PIXEL_HEIGHT}
 
             /* 每个GOP的8x8码表：GOP_COUNT * CODEBOOK_SIZE_8x8 * BLOCK_SIZE_8x8 个uint16 */
             extern const unsigned short video_codebooks_8x8[VIDEO_GOP_COUNT][VIDEO_CODEBOOK_SIZE_8x8][VIDEO_BLOCK_SIZE_8x8];
@@ -1277,22 +1303,147 @@ def encode_p_frame_multi_level_separate(
         final_blocks_4x2.append((block_pos_4x2, best_idx))
         total_stats['blocks_4x2_used'] += 1
     
-    # 5. 组装最终帧数据
-    frame_data = []
-    
-    # 8x8块数据（使用连续块编码）
-    frame_data.extend(encode_blocks_with_run_length(blocks_to_encode_8x8))
-    
-    # 8x4块数据（使用连续块编码）
-    frame_data.extend(encode_blocks_with_run_length(final_blocks_8x4))
-    
-    # 4x4块数据（使用连续块编码）
-    frame_data.extend(encode_blocks_with_run_length(final_blocks_4x4))
-    
-    # 4x2块数据（使用连续块编码）
-    frame_data.extend(encode_blocks_with_run_length(final_blocks_4x2))
+    # 5. 组装最终帧数据（使用zone优化编码）
+    frame_data = encode_blocks_with_zone_optimization([
+        blocks_to_encode_8x8,
+        final_blocks_8x4, 
+        final_blocks_4x4,
+        final_blocks_4x2
+    ])
     
     return frame_data, total_stats
+
+def encode_zone_bitmap_and_data(changed_blocks_dict, block_type):
+    """
+    基于zone的编码：bitmap + 每个zone的连续段数据
+    
+    Args:
+        changed_blocks_dict: {block_pos: codeword_idx} 字典
+        block_type: "8x8", "8x4", "4x4", "4x2"
+    
+    Returns:
+        list: 编码后的数据
+    """
+    if block_type == "8x8":
+        zones_count = ZONES_8x8_COUNT
+        bitmap_bytes = 1  # u8
+    elif block_type == "8x4":
+        zones_count = ZONES_8x4_COUNT
+        bitmap_bytes = 1  # u8
+    elif block_type == "4x4":
+        zones_count = ZONES_4x4_COUNT
+        bitmap_bytes = 2  # u16
+    elif block_type == "4x2":
+        zones_count = ZONES_4x2_COUNT
+        bitmap_bytes = 4  # u32
+    else:
+        raise ValueError(f"未知块类型: {block_type}")
+    
+    # 1. 按zone分组变化的块
+    zones_data = {}
+    for block_pos, codeword_idx in changed_blocks_dict.items():
+        zone_id = block_pos // BLOCKS_PER_ZONE
+        zone_offset = block_pos % BLOCKS_PER_ZONE
+        if zone_id not in zones_data:
+            zones_data[zone_id] = []
+        zones_data[zone_id].append((zone_offset, codeword_idx))
+    
+    # 2. 生成bitmap
+    bitmap = 0
+    for zone_id in zones_data.keys():
+        if zone_id < zones_count:  # 防止越界
+            bitmap |= (1 << zone_id)
+    
+    # 3. 编码bitmap
+    encoded_data = []
+    if bitmap_bytes == 1:
+        encoded_data.append(bitmap & 0xFF)
+    elif bitmap_bytes == 2:
+        encoded_data.extend([(bitmap >> 0) & 0xFF, (bitmap >> 8) & 0xFF])
+    elif bitmap_bytes == 4:
+        encoded_data.extend([
+            (bitmap >> 0) & 0xFF, (bitmap >> 8) & 0xFF,
+            (bitmap >> 16) & 0xFF, (bitmap >> 24) & 0xFF
+        ])
+    
+    # 4. 对每个有变化的zone编码数据
+    for zone_id in sorted(zones_data.keys()):
+        if zone_id >= zones_count:
+            continue
+            
+        zone_blocks = zones_data[zone_id]
+        zone_blocks.sort(key=lambda x: x[0])  # 按zone内偏移排序
+        
+        # 生成连续段
+        segments = []
+        current_segment = None
+        
+        for zone_offset, codeword_idx in zone_blocks:
+            if current_segment is None:
+                current_segment = [zone_offset, zone_offset, [codeword_idx]]
+            else:
+                if zone_offset == current_segment[1] + 1:
+                    # 连续
+                    current_segment[1] = zone_offset
+                    current_segment[2].append(codeword_idx)
+                else:
+                    # 不连续，保存当前段，开始新段
+                    segments.append(current_segment)
+                    current_segment = [zone_offset, zone_offset, [codeword_idx]]
+        
+        # 保存最后一个段
+        if current_segment is not None:
+            segments.append(current_segment)
+        
+        # 编码连续段数量
+        encoded_data.append(len(segments) & 0xFF)
+        
+        # 编码每个段
+        for start_offset, end_offset, codewords in segments:
+            count = end_offset - start_offset + 1
+            encoded_data.append(start_offset & 0xFF)  # zone内起始偏移
+            encoded_data.append(count & 0xFF)        # 连续块数量
+            encoded_data.extend(codewords)           # 码表项序列
+    
+    return encoded_data
+
+def encode_blocks_with_zone_optimization(blocks_lists):
+    """
+    使用zone优化编码所有级别的块
+    
+    Args:
+        blocks_lists: [blocks_8x8, blocks_8x4, blocks_4x4, blocks_4x2]
+                     每个都是[(block_pos, codeword_idx), ...] 列表
+    
+    Returns:
+        list: 编码后的数据
+    """
+    blocks_8x8, blocks_8x4, blocks_4x4, blocks_4x2 = blocks_lists
+    
+    frame_data = []
+    
+    # 对每种块类型进行zone编码
+    block_types = ["8x8", "8x4", "4x4", "4x2"]
+    
+    for i, (blocks, block_type) in enumerate(zip(blocks_lists, block_types)):
+        if not blocks:
+            # 该级别没有块需要编码
+            if block_type in ["8x8", "8x4"]:
+                frame_data.append(0)  # u8 bitmap
+            elif block_type == "4x4":
+                frame_data.extend([0, 0])  # u16 bitmap
+            elif block_type == "4x2":
+                frame_data.extend([0, 0, 0, 0])  # u32 bitmap
+            continue
+        
+        # 转换为字典格式
+        changed_blocks_dict = {pos: idx for pos, idx in blocks}
+        
+        # 使用zone编码
+        zone_data = encode_zone_bitmap_and_data(changed_blocks_dict, block_type)
+        frame_data.extend(zone_data)
+    
+    return frame_data
 
 if __name__ == "__main__":
     main()
