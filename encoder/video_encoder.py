@@ -349,6 +349,43 @@ def find_changed_blocks(current_blocks, previous_blocks, threshold):
     else:
         return np.zeros(0, dtype=np.int32)
 
+@jit(nopython=True, cache=True)
+def find_consecutive_segments(indices):
+    """
+    将块索引列表组织为连续段
+    输入：排序后的块索引数组
+    输出：段列表，每个段是 (起始位置, 块数量) 的元组
+    """
+    if len(indices) == 0:
+        return np.zeros((0, 2), dtype=np.int32)
+    
+    # 预分配最大可能的段数组
+    max_segments = len(indices)
+    segments = np.zeros((max_segments, 2), dtype=np.int32)
+    segment_count = 0
+    
+    current_start = indices[0]
+    current_count = 1
+    
+    for i in range(1, len(indices)):
+        if indices[i] == indices[i-1] + 1:  # 连续
+            current_count += 1
+        else:  # 不连续，结束当前段
+            segments[segment_count, 0] = current_start
+            segments[segment_count, 1] = current_count
+            segment_count += 1
+            
+            current_start = indices[i]
+            current_count = 1
+    
+    # 添加最后一个段
+    segments[segment_count, 0] = current_start
+    segments[segment_count, 1] = current_count
+    segment_count += 1
+    
+    # 返回实际大小的数组
+    return segments[:segment_count].copy()
+
 def main():
     pa = argparse.ArgumentParser(description="Encode to GBA IP-Frame with Codebook")
     pa.add_argument("input")
@@ -529,24 +566,42 @@ def main():
     max_changed_blocks = 0
     min_changed_blocks = float('inf')
     p_frames_with_changes = 0
+    total_segments = 0
+    max_segments = 0
     
     for i, (frame_data, frame_type) in enumerate(zip(encoded_frames, frame_types)):
         if frame_type == 1:  # P帧
-            changed_count = frame_data[0] if len(frame_data) > 0 else 0
-            if changed_count > 0:
+            segment_count = frame_data[0] if len(frame_data) > 0 else 0
+            if segment_count > 0:
+                # 计算这一帧的总变化块数
+                changed_count = 0
+                data_offset = 1
+                for seg in range(segment_count):
+                    seg_start = frame_data[data_offset]     # 段起始位置（未使用）
+                    seg_count = frame_data[data_offset + 1] # 段块数量
+                    changed_count += seg_count
+                    data_offset += 2 + seg_count  # 跳过起始位置、块数量和所有码字
+                
                 p_frames_with_changes += 1
                 total_changed_blocks += changed_count
                 max_changed_blocks = max(max_changed_blocks, changed_count)
                 min_changed_blocks = min(min_changed_blocks, changed_count)
+                
+                total_segments += segment_count
+                max_segments = max(max_segments, segment_count)
     
     if p_frames_with_changes > 0:
         avg_changed_blocks = total_changed_blocks / p_frames_with_changes
+        avg_segments = total_segments / p_frames_with_changes
         print(f"\n🔄 P帧变化分析:")
         print(f"有变化的P帧: {p_frames_with_changes}/{p_frame_count} ({p_frames_with_changes/p_frame_count*100:.1f}%)")
         print(f"平均变化块数: {avg_changed_blocks:.1f}")
         print(f"最大变化块数: {max_changed_blocks}")
         print(f"最小变化块数: {min_changed_blocks if min_changed_blocks != float('inf') else 0}")
         print(f"平均变化率: {avg_changed_blocks/BLOCKS_PER_FRAME*100:.1f}%")
+        print(f"平均连续段数: {avg_segments:.1f}")
+        print(f"最大连续段数: {max_segments}")
+        print(f"压缩效率: 平均每段 {avg_changed_blocks/avg_segments:.1f} 块")
     
     print(f"\n参数设置: I帧权重={i_frame_weight}, 差异阈值={diff_threshold}, 并行进程数={processes}")
     print("="*60)
@@ -596,13 +651,26 @@ def process_single_gop(gop_data):
             changed_indices = find_changed_blocks(frame_blocks, previous_blocks, diff_threshold)
             
             if len(changed_indices) > 0:
-                changed_blocks = frame_blocks[changed_indices]
-                block_indices = encode_frame_with_codebook(changed_blocks, gop_codebook)
+                # 对变化的块索引进行排序（连续段算法需要排序）
+                sorted_indices = np.sort(changed_indices)
+                changed_blocks = frame_blocks[sorted_indices]
+                block_codes = encode_frame_with_codebook(changed_blocks, gop_codebook)
                 
-                # P帧格式: [块数量, 位置1, 码字1, 位置2, 码字2, ...]
-                frame_data = [len(changed_indices)]
-                for pos, code in zip(changed_indices, block_indices):
-                    frame_data.extend([pos, code])
+                # 找到连续段
+                segments = find_consecutive_segments(sorted_indices)
+                
+                # P帧新格式: [段数量, 段1_起始位置, 段1_块数量, 段1_码字1, 段1_码字2, ..., 段2_起始位置, ...]
+                frame_data = [len(segments)]
+                
+                code_idx = 0
+                for seg_start, seg_count in segments:
+                    frame_data.append(seg_start)  # 段起始位置
+                    frame_data.append(seg_count)  # 段块数量
+                    
+                    # 添加这个段的所有码字
+                    for i in range(seg_count):
+                        frame_data.append(block_codes[code_idx])
+                        code_idx += 1
             else:
                 # 无变化的P帧
                 frame_data = [0]

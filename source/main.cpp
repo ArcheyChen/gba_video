@@ -123,18 +123,26 @@ IWRAM_CODE void decode_i_frame(const u16* frame_data, u16* dst)
 
 IWRAM_CODE void decode_p_frame(const u16* frame_data, u16* dst)
 {
-    // P帧格式：[块数量, 位置1, 码字1, 位置2, 码字2, ...]
-    u16 changed_block_count = frame_data[0];
+    // P帧新格式：[段数量, 段1_起始位置, 段1_块数量, 段1_码字1, 段1_码字2, ..., 段2_起始位置, ...]
+    u16 segment_count = frame_data[0];
     const u16* data = frame_data + 1;
     
-    for (int i = 0; i < changed_block_count; i++)
+    u16 data_offset = 0;
+    for (int seg = 0; seg < segment_count; seg++)
     {
-        u16 block_pos = data[i * 2];         // 块位置（线性索引）
-        u16 codeword_idx = data[i * 2 + 1];  // 码字索引
+        u16 seg_start = data[data_offset++];     // 段起始位置
+        u16 seg_count = data[data_offset++];     // 段块数量
         
-        // 使用查找表直接获取目标地址，避免乘除法
-        u16* block_dst = dst + block_offset_table[block_pos];
-        decode_block_from_rgb555_codebook(codeword_idx, block_dst, SCREEN_WIDTH);
+        // 解码这个段的所有块
+        for (int i = 0; i < seg_count; i++)
+        {
+            u16 block_pos = seg_start + i;          // 当前块位置
+            u16 codeword_idx = data[data_offset++];  // 码字索引
+            
+            // 使用查找表直接获取目标地址，避免乘除法
+            u16* block_dst = dst + block_offset_table[block_pos];
+            decode_block_from_rgb555_codebook(codeword_idx, block_dst, SCREEN_WIDTH);
+        }
     }
 }
 
