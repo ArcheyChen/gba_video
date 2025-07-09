@@ -123,17 +123,21 @@ IWRAM_CODE void decode_i_frame(const u16* frame_data, u16* dst)
 
 IWRAM_CODE void decode_p_frame(const u16* frame_data, u16* dst)
 {
-    // P帧新格式：[段数量, 段1_起始位置, 段1_块数量, 段1_码字1, 段1_码字2, ..., 段2_起始位置, ...]
+    // P帧新格式：[段数量, 段数据..., 单块数量, 单块数据...]
     u16 segment_count = frame_data[0];
     
     if (segment_count == 0) {
-        // 无变化的P帧，什么都不做
-        return;
+        // 检查是否有单块数据
+        if (frame_data[1] == 0) {
+            // 完全无变化的P帧，什么都不做
+            return;
+        }
     }
     
     const u16* data = frame_data + 1;
-    
     u16 data_offset = 0;
+    
+    // 处理连续段（长度>=2）
     for (int seg = 0; seg < segment_count; seg++)
     {
         u16 seg_start = data[data_offset++];     // 段起始位置
@@ -149,6 +153,20 @@ IWRAM_CODE void decode_p_frame(const u16* frame_data, u16* dst)
             u16* block_dst = dst + block_offset_table[block_pos];
             decode_block_from_rgb555_codebook(codeword_idx, block_dst, SCREEN_WIDTH);
         }
+    }
+    
+    // 处理单块（长度=1）
+    u16 single_count = data[data_offset++];
+    
+    // 解码所有单块
+    for (int i = 0; i < single_count; i++)
+    {
+        u16 block_pos = data[data_offset++];     // 块位置
+        u16 codeword_idx = data[data_offset++];  // 码字索引
+        
+        // 使用查找表直接获取目标地址
+        u16* block_dst = dst + block_offset_table[block_pos];
+        decode_block_from_rgb555_codebook(codeword_idx, block_dst, SCREEN_WIDTH);
     }
 }
 

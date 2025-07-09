@@ -570,70 +570,148 @@ def main():
     max_segments = 0
     
     # P帧数据结构占用统计
-    p_frame_segment_count_bytes = 0    # 段数量字段占用
-    p_frame_segment_headers_bytes = 0  # 段头(偏移+长度)占用
-    p_frame_codebook_indices_bytes = 0 # 码表索引占用
+    p_frame_segment_count_bytes = 0     # 段数量字段占用
+    p_frame_single_count_bytes = 0      # 单块数量字段占用  
+    p_frame_segment_headers_bytes = 0   # 段头(偏移+长度)占用
+    p_frame_segment_indices_bytes = 0   # 段中码表索引占用
+    p_frame_single_blocks_bytes = 0     # 单块数据(位置+索引)占用
+    
+    total_multi_segments = 0  # 连续段总数(长度>=2)
+    total_single_blocks = 0   # 单块总数(长度=1)
+    max_multi_segments = 0
+    max_single_blocks = 0
     
     for i, (frame_data, frame_type) in enumerate(zip(encoded_frames, frame_types)):
         if frame_type == 1:  # P帧
-            segment_count = frame_data[0] if len(frame_data) > 0 else 0
-            
-            # 统计段数量字段: 每个P帧都有1个u16的段数量
-            p_frame_segment_count_bytes += 2  # u16 = 2字节
-            
-            if segment_count > 0:
-                # 计算这一帧的总变化块数
-                changed_count = 0
-                data_offset = 1
-                for seg in range(segment_count):
-                    seg_start = frame_data[data_offset]     # 段起始位置
-                    seg_count = frame_data[data_offset + 1] # 段块数量
-                    changed_count += seg_count
-                    
-                    # 统计段头部: 每个段有1个u16偏移 + 1个u16长度
-                    p_frame_segment_headers_bytes += 4  # 2 * u16 = 4字节
-                    
-                    # 统计码表索引: seg_count个u16索引
-                    p_frame_codebook_indices_bytes += seg_count * 2  # seg_count * u16
-                    
-                    data_offset += 2 + seg_count  # 跳过起始位置、块数量和所有码字
+            if len(frame_data) >= 2:
+                segment_count = frame_data[0]
                 
-                p_frames_with_changes += 1
-                total_changed_blocks += changed_count
-                max_changed_blocks = max(max_changed_blocks, changed_count)
-                min_changed_blocks = min(min_changed_blocks, changed_count)
+                # 统计段数量和单块数量字段: 每个P帧都有2个u16
+                p_frame_segment_count_bytes += 2  # u16段数量
+                p_frame_single_count_bytes += 2   # u16单块数量
                 
-                total_segments += segment_count
-                max_segments = max(max_segments, segment_count)
+                if segment_count > 0:
+                    # 解析连续段数据
+                    data_offset = 1
+                    segment_changed_count = 0
+                    for seg in range(segment_count):
+                        seg_start = frame_data[data_offset]     # 段起始位置
+                        seg_count = frame_data[data_offset + 1] # 段块数量
+                        segment_changed_count += seg_count
+                        
+                        # 统计段头部: 每个段有1个u16偏移 + 1个u16长度
+                        p_frame_segment_headers_bytes += 4  # 2 * u16 = 4字节
+                        
+                        # 统计段中码表索引: seg_count个u16索引
+                        p_frame_segment_indices_bytes += seg_count * 2  # seg_count * u16
+                        
+                        data_offset += 2 + seg_count  # 跳过起始位置、块数量和所有码字
+                    
+                    total_multi_segments += segment_count
+                    max_multi_segments = max(max_multi_segments, segment_count)
+                    
+                    # 解析单块数据
+                    if data_offset < len(frame_data):
+                        single_count = frame_data[data_offset]
+                        data_offset += 1
+                        
+                        # 统计单块数据: 每个单块有1个u16位置 + 1个u16索引
+                        p_frame_single_blocks_bytes += single_count * 4  # single_count * (2 * u16)
+                        
+                        total_single_blocks += single_count
+                        max_single_blocks = max(max_single_blocks, single_count)
+                        
+                        total_changed_blocks += segment_changed_count + single_count
+                    else:
+                        total_changed_blocks += segment_changed_count
+                    
+                    max_changed_blocks = max(max_changed_blocks, segment_changed_count + single_count if data_offset < len(frame_data) else segment_changed_count)
+                    min_changed_blocks = min(min_changed_blocks, segment_changed_count + single_count if data_offset < len(frame_data) else segment_changed_count)
+                    p_frames_with_changes += 1
+            else:
+                # 老格式或空P帧，尝试兼容解析
+                segment_count = frame_data[0] if len(frame_data) > 0 else 0
+                p_frame_segment_count_bytes += 2  # 假设有段数量字段
+                
+                if segment_count > 0:
+                    # 按老格式解析
+                    changed_count = 0
+                    data_offset = 1
+                    for seg in range(segment_count):
+                        seg_start = frame_data[data_offset]
+                        seg_count = frame_data[data_offset + 1]
+                        changed_count += seg_count
+                        
+                        p_frame_segment_headers_bytes += 4
+                        p_frame_segment_indices_bytes += seg_count * 2
+                        
+                        data_offset += 2 + seg_count
+                    
+                    total_changed_blocks += changed_count
+                    max_changed_blocks = max(max_changed_blocks, changed_count)
+                    min_changed_blocks = min(min_changed_blocks, changed_count)
+                    total_multi_segments += segment_count
+                    max_multi_segments = max(max_multi_segments, segment_count)
+                    p_frames_with_changes += 1
     
     if p_frames_with_changes > 0:
         avg_changed_blocks = total_changed_blocks / p_frames_with_changes
-        avg_segments = total_segments / p_frames_with_changes
+        avg_multi_segments = total_multi_segments / p_frames_with_changes if p_frames_with_changes > 0 else 0
+        avg_single_blocks = total_single_blocks / p_frames_with_changes if p_frames_with_changes > 0 else 0
+        
         print(f"\n🔄 P帧变化分析:")
         print(f"有变化的P帧: {p_frames_with_changes}/{p_frame_count} ({p_frames_with_changes/p_frame_count*100:.1f}%)")
         print(f"平均变化块数: {avg_changed_blocks:.1f}")
         print(f"最大变化块数: {max_changed_blocks}")
         print(f"最小变化块数: {min_changed_blocks if min_changed_blocks != float('inf') else 0}")
         print(f"平均变化率: {avg_changed_blocks/BLOCKS_PER_FRAME*100:.1f}%")
-        print(f"平均连续段数: {avg_segments:.1f}")
-        print(f"最大连续段数: {max_segments}")
-        print(f"压缩效率: 平均每段 {avg_changed_blocks/avg_segments:.1f} 块")
+        
+        print(f"\n📏 段与单块分析:")
+        print(f"总连续段数: {total_multi_segments} (长度≥2)")
+        print(f"总单块数: {total_single_blocks} (长度=1)")
+        print(f"平均连续段数: {avg_multi_segments:.1f}")
+        print(f"平均单块数: {avg_single_blocks:.1f}")
+        print(f"最大连续段数: {max_multi_segments}")
+        print(f"最大单块数: {max_single_blocks}")
+        if avg_multi_segments > 0:
+            print(f"连续段效率: 平均每段 {(total_changed_blocks - total_single_blocks)/total_multi_segments:.1f} 块")
         
         # P帧数据结构占用详细分析
         print(f"\n📊 P帧数据结构占用分析:")
         print(f"段数量字段: {p_frame_segment_count_bytes:,} 字节 ({p_frame_segment_count_bytes/1024:.1f} KB)")
         print(f"  - {p_frame_count} 个P帧 × 2 字节/帧")
+        print(f"单块数量字段: {p_frame_single_count_bytes:,} 字节 ({p_frame_single_count_bytes/1024:.1f} KB)")
+        print(f"  - {p_frame_count} 个P帧 × 2 字节/帧")
         print(f"段头部数据: {p_frame_segment_headers_bytes:,} 字节 ({p_frame_segment_headers_bytes/1024:.1f} KB)")
-        print(f"  - {total_segments} 个段 × 4 字节/段 (偏移2字节 + 长度2字节)")
-        print(f"码表索引数据: {p_frame_codebook_indices_bytes:,} 字节 ({p_frame_codebook_indices_bytes/1024:.1f} KB)")
-        print(f"  - {total_changed_blocks} 个块 × 2 字节/索引")
+        print(f"  - {total_multi_segments} 个段 × 4 字节/段 (偏移2字节 + 长度2字节)")
+        print(f"段码表索引: {p_frame_segment_indices_bytes:,} 字节 ({p_frame_segment_indices_bytes/1024:.1f} KB)")
+        print(f"  - {total_changed_blocks - total_single_blocks} 个段中块 × 2 字节/索引")
+        print(f"单块数据: {p_frame_single_blocks_bytes:,} 字节 ({p_frame_single_blocks_bytes/1024:.1f} KB)")
+        print(f"  - {total_single_blocks} 个单块 × 4 字节/块 (位置2字节 + 索引2字节)")
         
         # P帧内部数据占比
-        total_p_frame_structure_bytes = p_frame_segment_count_bytes + p_frame_segment_headers_bytes + p_frame_codebook_indices_bytes
+        total_p_frame_structure_bytes = (p_frame_segment_count_bytes + p_frame_single_count_bytes + 
+                                       p_frame_segment_headers_bytes + p_frame_segment_indices_bytes + 
+                                       p_frame_single_blocks_bytes)
         print(f"P帧总结构数据: {total_p_frame_structure_bytes:,} 字节 ({total_p_frame_structure_bytes/1024:.1f} KB)")
         print(f"  - 段数量字段占比: {p_frame_segment_count_bytes/total_p_frame_structure_bytes*100:.1f}%")
+        print(f"  - 单块数量字段占比: {p_frame_single_count_bytes/total_p_frame_structure_bytes*100:.1f}%")
         print(f"  - 段头部占比: {p_frame_segment_headers_bytes/total_p_frame_structure_bytes*100:.1f}%")
-        print(f"  - 码表索引占比: {p_frame_codebook_indices_bytes/total_p_frame_structure_bytes*100:.1f}%")
+        print(f"  - 段码表索引占比: {p_frame_segment_indices_bytes/total_p_frame_structure_bytes*100:.1f}%")
+        print(f"  - 单块数据占比: {p_frame_single_blocks_bytes/total_p_frame_structure_bytes*100:.1f}%")
+        
+        # 优化效果分析
+        old_format_bytes = (p_frame_segment_count_bytes + 
+                           (total_multi_segments + total_single_blocks) * 4 +  # 如果所有块都用段格式的头部开销
+                           total_changed_blocks * 2)  # 码表索引
+        new_format_bytes = total_p_frame_structure_bytes
+        saved_bytes = old_format_bytes - new_format_bytes
+        print(f"\n💡 编码优化效果:")
+        print(f"旧格式(全段)估算: {old_format_bytes:,} 字节")
+        print(f"新格式(段+单块): {new_format_bytes:,} 字节")
+        print(f"节省空间: {saved_bytes:,} 字节 ({saved_bytes/old_format_bytes*100:.1f}%)")
+        if total_single_blocks > 0:
+            print(f"单块优化效果: {total_single_blocks} 个单块节省 {total_single_blocks * 2:,} 字节头部开销")
     
     print(f"\n参数设置: I帧权重={i_frame_weight}, 差异阈值={diff_threshold}, 并行进程数={processes}")
     print("="*60)
@@ -704,25 +782,49 @@ def process_single_gop(gop_data):
                 block_codes = encode_frame_with_codebook(changed_blocks, gop_codebook)
                 
                 # 找到连续段
-                segments = find_consecutive_segments(sorted_indices)
+                all_segments = find_consecutive_segments(sorted_indices)
                 
-                # P帧新格式: [段数量, 段1_起始位置, 段1_块数量, 段1_码字1, 段1_码字2, ..., 段2_起始位置, ...]
-                frame_data = [len(segments)]
+                # 分离连续段(长度>=2)和单块(长度=1)
+                multi_segments = []  # 长度>=2的段
+                single_blocks = []   # 长度=1的块
                 
                 code_idx = 0
-                for seg_start, seg_count in segments:
-                    frame_data.append(seg_start)  # 段起始位置
-                    frame_data.append(seg_count)  # 段块数量
-                    
-                    # 添加这个段的所有码字
-                    for i in range(seg_count):
-                        frame_data.append(block_codes[code_idx])
-                        code_idx += 1
+                for seg_start, seg_count in all_segments:
+                    if seg_count >= 2:
+                        # 连续段：保存段信息
+                        multi_segments.append((seg_start, seg_count))
+                    else:
+                        # 单块：保存块位置和码字索引
+                        single_blocks.append((seg_start, block_codes[code_idx]))
+                    code_idx += seg_count
+                
+                # P帧新格式: [段数量, 段数据..., 单块数量, 单块数据...]
+                frame_data = [len(multi_segments)]
+                
+                # 添加连续段数据
+                code_idx = 0
+                for seg_start, seg_count in all_segments:
+                    if seg_count >= 2:
+                        frame_data.append(seg_start)  # 段起始位置
+                        frame_data.append(seg_count)  # 段块数量
                         
-                # print(f"  P帧 {gop_idx * gop_size + frame_idx}: {len(changed_indices)} 个块变化，{len(segments)} 个连续段")
+                        # 添加这个段的所有码字
+                        for i in range(seg_count):
+                            frame_data.append(block_codes[code_idx])
+                            code_idx += 1
+                    else:
+                        code_idx += seg_count  # 跳过单块的码字（已在single_blocks中处理）
+                
+                # 添加单块数据
+                frame_data.append(len(single_blocks))
+                for block_pos, codeword_idx in single_blocks:
+                    frame_data.append(block_pos)      # 块位置
+                    frame_data.append(codeword_idx)   # 码字索引
+                        
+                # print(f"  P帧 {gop_idx * gop_size + frame_idx}: {len(changed_indices)} 个块变化，{len(multi_segments)} 个连续段，{len(single_blocks)} 个单块")
             else:
-                # 无变化的P帧
-                frame_data = [0]
+                # 无变化的P帧: [0段, 0单块]
+                frame_data = [0, 0]
                 # print(f"  P帧 {gop_idx * gop_size + frame_idx}: 无变化")
             
             gop_frame_types.append(1)  # P帧
