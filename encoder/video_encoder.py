@@ -138,13 +138,17 @@ def yuv444_to_yuv9(yuv444_block: np.ndarray) -> np.ndarray:
     """
     return yuv444_to_yuv9_jit(yuv444_block)
 
-def generate_codebook_for_gop(i_frame_blocks: np.ndarray, p_frame_blocks_list: list, i_frame_weight: int = I_FRAME_WEIGHT) -> np.ndarray:
+def generate_codebook_for_gop(i_frame_blocks: np.ndarray, p_frame_blocks_list: list, i_frame_weight: int = I_FRAME_WEIGHT) -> tuple:
     """
-    为一个GOP生成码表，I帧块有额外权重
+    为一个GOP生成码表，I帧块有额外权重，并按使用频率排序
     输入：
     - i_frame_blocks: I帧的所有块 (BLOCKS_PER_FRAME, 48)
     - p_frame_blocks_list: P帧的变化块列表，每个元素是 (frame_idx, changed_blocks)
     - i_frame_weight: I帧块的权重
+    
+    返回：
+    - sorted_codebook: 按使用频率降序排列的码表
+    - frequency_mapping: 原始码表索引到排序后索引的映射
     """
     print(f"为GOP生成码表...I帧块数: {len(i_frame_blocks)}, P帧变化块总数: {sum(len(blocks) for _, blocks in p_frame_blocks_list)}")
     
@@ -180,12 +184,41 @@ def generate_codebook_for_gop(i_frame_blocks: np.ndarray, p_frame_blocks_list: l
     ).fit(train_data)
     
     # 码表就是聚类中心
-    codebook = kmeans.cluster_centers_
+    original_codebook = kmeans.cluster_centers_
     
     # 确保所有值在uint8范围内
-    codebook = np.clip(codebook, 0, 255)
+    original_codebook = np.clip(original_codebook, 0, 255).round().astype(np.uint8)
     
-    return codebook.round().astype(np.uint8)
+    # 计算每个码字的使用频率
+    print("计算码字使用频率...")
+    
+    # 统计所有训练块对应的码字使用次数
+    frequencies = np.zeros(CODEBOOK_SIZE, dtype=np.int32)
+    
+    # 对I帧块进行编码统计 (考虑权重)
+    i_indices = compute_distances_jit(i_frame_blocks, original_codebook.astype(np.float32))
+    for idx in i_indices:
+        frequencies[idx] += i_frame_weight
+    
+    # 对P帧变化块进行编码统计
+    for frame_idx, changed_blocks in p_frame_blocks_list:
+        if len(changed_blocks) > 0:
+            p_indices = compute_distances_jit(changed_blocks, original_codebook.astype(np.float32))
+            for idx in p_indices:
+                frequencies[idx] += 1
+    
+    # 按使用频率降序排序
+    sorted_indices = np.argsort(frequencies)[::-1]  # 降序
+    sorted_codebook = original_codebook[sorted_indices]
+    
+    # 创建原始索引到排序后索引的映射
+    frequency_mapping = np.zeros(CODEBOOK_SIZE, dtype=np.uint16)
+    for new_idx, old_idx in enumerate(sorted_indices):
+        frequency_mapping[old_idx] = new_idx
+    
+    print(f"码表频率排序完成，最高频率: {frequencies[sorted_indices[0]]}, 最低频率: {frequencies[sorted_indices[-1]]}")
+    
+    return sorted_codebook, frequency_mapping
 
 @jit(nopython=True, cache=True, parallel=True)
 def compute_distances_jit(blocks, codebook):
@@ -222,6 +255,16 @@ def encode_frame_with_codebook(blocks: np.ndarray, codebook: np.ndarray) -> np.n
     # 使用JIT加速的距离计算
     indices = compute_distances_jit(blocks, codebook.astype(np.float32))
     return indices
+
+def encode_frame_with_frequency_mapping(blocks: np.ndarray, original_codebook: np.ndarray, frequency_mapping: np.ndarray) -> np.ndarray:
+    """
+    使用原始码表编码，然后映射到频率排序后的索引
+    """
+    # 先用原始码表编码
+    original_indices = compute_distances_jit(blocks, original_codebook.astype(np.float32))
+    # 映射到频率排序后的索引
+    mapped_indices = frequency_mapping[original_indices]
+    return mapped_indices
 
 def write_header(path_h: pathlib.Path, total_frames: int, gop_count: int, gop_size: int):
     guard = "VIDEO_DATA_H"
@@ -569,6 +612,9 @@ def main():
     total_segments = 0
     max_segments = 0
     
+    # 码表段使用统计 (每256个码字为一段)
+    codebook_segment_usage = np.zeros(CODEBOOK_SIZE // 256, dtype=np.int64)
+    
     # P帧数据结构占用统计
     p_frame_segment_count_bytes = 0     # 段数量字段占用
     p_frame_single_count_bytes = 0      # 单块数量字段占用  
@@ -582,7 +628,14 @@ def main():
     max_single_blocks = 0
     
     for i, (frame_data, frame_type) in enumerate(zip(encoded_frames, frame_types)):
-        if frame_type == 1:  # P帧
+        if frame_type == 0:  # I帧
+            # I帧: [块数量, 码字1, 码字2, ..., 码字N]
+            if len(frame_data) > 1:
+                for idx_offset in range(1, len(frame_data)):  # 跳过块数量字段
+                    codeword_idx = frame_data[idx_offset]
+                    segment_idx = codeword_idx // 256
+                    codebook_segment_usage[segment_idx] += 1
+        elif frame_type == 1:  # P帧
             if len(frame_data) >= 2:
                 segment_count = frame_data[0]
                 
@@ -605,6 +658,12 @@ def main():
                         # 统计段中码表索引: seg_count个u16索引
                         p_frame_segment_indices_bytes += seg_count * 2  # seg_count * u16
                         
+                        # 统计码表段使用情况
+                        for idx_offset in range(seg_count):
+                            codeword_idx = frame_data[data_offset + 2 + idx_offset]
+                            segment_idx = codeword_idx // 256
+                            codebook_segment_usage[segment_idx] += 1
+                        
                         data_offset += 2 + seg_count  # 跳过起始位置、块数量和所有码字
                     
                     total_multi_segments += segment_count
@@ -615,13 +674,29 @@ def main():
                         single_count = frame_data[data_offset]
                         data_offset += 1
                         
-                        # 统计单块数据: 每个单块有1个u16位置 + 1个u16索引
-                        p_frame_single_blocks_bytes += single_count * 4  # single_count * (2 * u16)
-                        
-                        total_single_blocks += single_count
-                        max_single_blocks = max(max_single_blocks, single_count)
-                        
-                        total_changed_blocks += segment_changed_count + single_count
+                        # 检查是否有足够的数据
+                        expected_data_length = data_offset + single_count * 2
+                        if expected_data_length <= len(frame_data):
+                            # 统计单块数据: 每个单块有1个u16位置 + 1个u16索引
+                            p_frame_single_blocks_bytes += single_count * 4  # single_count * (2 * u16)
+                            
+                            # 统计单块的码表段使用情况
+                            for idx_offset in range(single_count):
+                                # 单块数据格式：[位置, 索引, 位置, 索引, ...]
+                                # data_offset指向单块数量字段，+1后指向第一个单块的位置
+                                # 每个单块占2个位置：[位置, 索引]
+                                # 所以第idx_offset个单块的索引位置是：data_offset + 1 + idx_offset * 2 + 1
+                                codeword_idx = frame_data[data_offset + idx_offset * 2 + 1]  # 已经+1了，不需要再加
+                                segment_idx = codeword_idx // 256
+                                codebook_segment_usage[segment_idx] += 1
+                            
+                            total_single_blocks += single_count
+                            max_single_blocks = max(max_single_blocks, single_count)
+                            
+                            total_changed_blocks += segment_changed_count + single_count
+                        else:
+                            # 数据不足，按老格式处理
+                            total_changed_blocks += segment_changed_count
                     else:
                         total_changed_blocks += segment_changed_count
                     
@@ -713,6 +788,27 @@ def main():
         if total_single_blocks > 0:
             print(f"单块优化效果: {total_single_blocks} 个单块节省 {total_single_blocks * 2:,} 字节头部开销")
     
+    # 码表段使用统计
+    print(f"\n📊 码表段使用统计 (按256码字分段):")
+    total_codeword_usage = np.sum(codebook_segment_usage)
+    if total_codeword_usage > 0:
+        print(f"总码字使用次数: {total_codeword_usage:,}")
+        for seg_idx in range(len(codebook_segment_usage)):
+            usage_count = codebook_segment_usage[seg_idx]
+            usage_percent = (usage_count / total_codeword_usage) * 100
+            start_idx = seg_idx * 256
+            end_idx = min((seg_idx + 1) * 256 - 1, CODEBOOK_SIZE - 1)
+            print(f"  段{seg_idx} (码字{start_idx:4d}-{end_idx:4d}): {usage_count:8,} 次 ({usage_percent:5.1f}%)")
+        
+        # 计算前几个段的累积占比
+        cumulative = 0
+        for seg_idx in range(min(4, len(codebook_segment_usage))):
+            cumulative += codebook_segment_usage[seg_idx]
+            cumulative_percent = (cumulative / total_codeword_usage) * 100
+            print(f"  前{seg_idx+1}段累积占比: {cumulative_percent:.1f}%")
+    else:
+        print("  未发现码字使用数据")
+    
     print(f"\n参数设置: I帧权重={i_frame_weight}, 差异阈值={diff_threshold}, 并行进程数={processes}")
     print("="*60)
 
@@ -757,7 +853,13 @@ def process_single_gop(gop_data):
             corrected_frames[frame_idx] = reference_blocks.copy()
     
     # 为当前GOP生成码表
-    gop_codebook = generate_codebook_for_gop(i_frame_blocks, p_frame_blocks_list, i_frame_weight)
+    sorted_codebook, frequency_mapping = generate_codebook_for_gop(i_frame_blocks, p_frame_blocks_list, i_frame_weight)
+    
+    # 重新构建原始码表用于编码（因为我们需要用原始码表进行距离计算）
+    original_codebook = np.zeros_like(sorted_codebook)
+    for old_idx in range(CODEBOOK_SIZE):
+        new_idx = frequency_mapping[old_idx]
+        original_codebook[old_idx] = sorted_codebook[new_idx]
     
     # 编码当前GOP的所有帧，使用修正后的帧
     gop_encoded_frames = []
@@ -766,7 +868,7 @@ def process_single_gop(gop_data):
     for frame_idx, frame_blocks in enumerate(corrected_frames):
         if frame_idx == 0:  # I帧
             # I帧编码所有块
-            indices = encode_frame_with_codebook(frame_blocks, gop_codebook)
+            indices = encode_frame_with_frequency_mapping(frame_blocks, original_codebook, frequency_mapping)
             frame_data = [BLOCKS_PER_FRAME] + indices.tolist()  # 前缀块数量
             gop_frame_types.append(0)  # I帧
             print(f"  I帧 {gop_idx * gop_size + frame_idx}: {BLOCKS_PER_FRAME} 个块")
@@ -779,7 +881,7 @@ def process_single_gop(gop_data):
                 # 对变化的块索引进行排序（连续段算法需要排序）
                 sorted_indices = np.sort(changed_indices)
                 changed_blocks = frame_blocks[sorted_indices]
-                block_codes = encode_frame_with_codebook(changed_blocks, gop_codebook)
+                block_codes = encode_frame_with_frequency_mapping(changed_blocks, original_codebook, frequency_mapping)
                 
                 # 找到连续段
                 all_segments = find_consecutive_segments(sorted_indices)
@@ -831,7 +933,7 @@ def process_single_gop(gop_data):
         
         gop_encoded_frames.append(frame_data)
     
-    return gop_idx, gop_codebook, gop_encoded_frames, gop_frame_types
+    return gop_idx, sorted_codebook, gop_encoded_frames, gop_frame_types
 
 if __name__ == "__main__":
     # 设置多进程启动方法（对于跨平台兼容性）
