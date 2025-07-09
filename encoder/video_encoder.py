@@ -569,17 +569,33 @@ def main():
     total_segments = 0
     max_segments = 0
     
+    # P帧数据结构占用统计
+    p_frame_segment_count_bytes = 0    # 段数量字段占用
+    p_frame_segment_headers_bytes = 0  # 段头(偏移+长度)占用
+    p_frame_codebook_indices_bytes = 0 # 码表索引占用
+    
     for i, (frame_data, frame_type) in enumerate(zip(encoded_frames, frame_types)):
         if frame_type == 1:  # P帧
             segment_count = frame_data[0] if len(frame_data) > 0 else 0
+            
+            # 统计段数量字段: 每个P帧都有1个u16的段数量
+            p_frame_segment_count_bytes += 2  # u16 = 2字节
+            
             if segment_count > 0:
                 # 计算这一帧的总变化块数
                 changed_count = 0
                 data_offset = 1
                 for seg in range(segment_count):
-                    seg_start = frame_data[data_offset]     # 段起始位置（未使用）
+                    seg_start = frame_data[data_offset]     # 段起始位置
                     seg_count = frame_data[data_offset + 1] # 段块数量
                     changed_count += seg_count
+                    
+                    # 统计段头部: 每个段有1个u16偏移 + 1个u16长度
+                    p_frame_segment_headers_bytes += 4  # 2 * u16 = 4字节
+                    
+                    # 统计码表索引: seg_count个u16索引
+                    p_frame_codebook_indices_bytes += seg_count * 2  # seg_count * u16
+                    
                     data_offset += 2 + seg_count  # 跳过起始位置、块数量和所有码字
                 
                 p_frames_with_changes += 1
@@ -602,6 +618,22 @@ def main():
         print(f"平均连续段数: {avg_segments:.1f}")
         print(f"最大连续段数: {max_segments}")
         print(f"压缩效率: 平均每段 {avg_changed_blocks/avg_segments:.1f} 块")
+        
+        # P帧数据结构占用详细分析
+        print(f"\n📊 P帧数据结构占用分析:")
+        print(f"段数量字段: {p_frame_segment_count_bytes:,} 字节 ({p_frame_segment_count_bytes/1024:.1f} KB)")
+        print(f"  - {p_frame_count} 个P帧 × 2 字节/帧")
+        print(f"段头部数据: {p_frame_segment_headers_bytes:,} 字节 ({p_frame_segment_headers_bytes/1024:.1f} KB)")
+        print(f"  - {total_segments} 个段 × 4 字节/段 (偏移2字节 + 长度2字节)")
+        print(f"码表索引数据: {p_frame_codebook_indices_bytes:,} 字节 ({p_frame_codebook_indices_bytes/1024:.1f} KB)")
+        print(f"  - {total_changed_blocks} 个块 × 2 字节/索引")
+        
+        # P帧内部数据占比
+        total_p_frame_structure_bytes = p_frame_segment_count_bytes + p_frame_segment_headers_bytes + p_frame_codebook_indices_bytes
+        print(f"P帧总结构数据: {total_p_frame_structure_bytes:,} 字节 ({total_p_frame_structure_bytes/1024:.1f} KB)")
+        print(f"  - 段数量字段占比: {p_frame_segment_count_bytes/total_p_frame_structure_bytes*100:.1f}%")
+        print(f"  - 段头部占比: {p_frame_segment_headers_bytes/total_p_frame_structure_bytes*100:.1f}%")
+        print(f"  - 码表索引占比: {p_frame_codebook_indices_bytes/total_p_frame_structure_bytes*100:.1f}%")
     
     print(f"\n参数设置: I帧权重={i_frame_weight}, 差异阈值={diff_threshold}, 并行进程数={processes}")
     print("="*60)
