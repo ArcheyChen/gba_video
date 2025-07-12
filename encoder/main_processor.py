@@ -71,6 +71,7 @@ def main():
     pa.add_argument("--coverage-radius-8x8", type=float, default=DEFAULT_COVERAGE_RADIUS_8x8, help="8x8块覆盖半径")
     pa.add_argument("--coverage-radius-8x4", type=float, default=DEFAULT_COVERAGE_RADIUS_8x4, help="8x4块覆盖半径")
     pa.add_argument("--coverage-radius-4x4", type=float, default=DEFAULT_COVERAGE_RADIUS_4x4, help="4x4块覆盖半径")
+    pa.add_argument("--coverage-radius-4x2", type=float, default=40.0, help="4x2块覆盖半径")
     pa.add_argument("--out", default="video_data")
     args = pa.parse_args()
 
@@ -85,6 +86,7 @@ def main():
     coverage_radius_8x8 = args.coverage_radius_8x8
     coverage_radius_8x4 = args.coverage_radius_8x4
     coverage_radius_4x4 = args.coverage_radius_4x4
+    coverage_radius_4x2 = args.coverage_radius_4x2
 
     # 验证码表大小不超过255（预留0xFF作为分裂标志）
     if codebook_size_8x8 > 255:
@@ -178,7 +180,7 @@ def main():
         args_tuple = (
             gop_idx, gop_frames, gop_size, i_frame_weight, diff_threshold,
             codebook_size_8x8, codebook_size_8x4, codebook_size_4x4, codebook_size_4x2,
-            coverage_radius_8x8, coverage_radius_8x4, coverage_radius_4x4
+            coverage_radius_8x8, coverage_radius_8x4, coverage_radius_4x4, coverage_radius_4x2
         )
         gop_args.append(args_tuple)
     
