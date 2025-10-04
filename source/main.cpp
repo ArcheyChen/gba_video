@@ -29,8 +29,8 @@ IWRAM_DATA u16 dirty_block_count = 0;  // 当前队列中的块数量
 // YUV555到RGB555的查找表（2^15 = 32K条目 × 2字节 = 64KB）
 EWRAM_DATA static u16 yuv555_to_rgb555_table[32768];
 
-// 块位置到内存偏移的查找表
-EWRAM_DATA static u32 block_offset_table[VIDEO_BLOCKS_PER_FRAME];
+// 块位置到VRAM左上角偏移的查找表（优化：消除乘法）
+EWRAM_DATA static u32 block_vram_offset_table[VIDEO_BLOCKS_PER_FRAME];
 
 // 块位置到X/Y坐标的查找表
 IWRAM_DATA static u8 block_x_table[VIDEO_BLOCKS_PER_FRAME];
@@ -119,12 +119,13 @@ void init_yuv555_to_rgb555_table(){
     }
 }
 
-// 预计算块位置到内存偏移的查找表
-void init_block_offset_table(){
+// 预计算块位置到VRAM左上角偏移的查找表（优化：消除convert中的乘法）
+void init_block_vram_offset_table(){
     int block_pos = 0;
     for (int y = 0; y < SCREEN_HEIGHT; y += 4) {
         for (int x = 0; x < SCREEN_WIDTH; x += 4) {
-            block_offset_table[block_pos] = y * SCREEN_WIDTH + x;
+            // 块左上角在VRAM中的偏移 = y * SCREEN_WIDTH + x
+            block_vram_offset_table[block_pos] = y * SCREEN_WIDTH + x;
             block_pos++;
         }
     }
@@ -276,7 +277,7 @@ IWRAM_CODE void decode_p_frame(const u16* frame_data)
     }
 }
 
-// 遍历变化块队列，现场转换YUV到RGB555并直接写VRAM（无中间缓冲）
+// 遍历变化块队列，现场转换YUV到RGB555并直接写VRAM（优化：批量读取 + 循环展开）
 IWRAM_CODE void convert_yuv_to_rgb555()
 {
     u16* vram = (u16*)VRAM;  // 直接获取VRAM指针
@@ -297,28 +298,35 @@ IWRAM_CODE void convert_yuv_to_rgb555()
         // 直接右移3位得到5位
         u16 cb5 = (cb8 >> 3);  // 5位Cb
         u16 cr5 = (cr8 >> 3);  // 5位Cr
+        // 预计算共享的Cb/Cr部分（所有像素相同）
+        u16 cbcr_bits = (cb5 << 5) | (cr5 << 10);
 
-        // 处理4x4块内的16个像素
+        // 使用预计算的VRAM偏移表（消除乘法）
+        u32 vram_idx = block_vram_offset_table[block_pos];  // 块左上角VRAM偏移
         int base_y = block_y * 4;
         int base_x = block_x * 4;
 
+        // 处理4x4块内的16个像素（优化：每行批量处理4个像素）
         for (int py = 0; py < 4; py++) {
             int y = base_y + py;
-            int vram_idx = y * SCREEN_WIDTH + base_x;
+            // 批量读取Y值：每行4个像素，使用2次u16读取（优化内存访问）
+            u16* y_row = (u16*)&yuv_y_buffer[y][base_x];
+            u16 y_pair0 = y_row[0];  // 读取像素0,1
+            u16 y_pair1 = y_row[1];  // 读取像素2,3
 
-            for (int px = 0; px < 4; px++) {
-                int x = base_x + px;
+            // 提取4个Y值并转换为5位
+            u16 y5_0 = ((y_pair0 & 0xFF) >> 3);        // 像素0
+            u16 y5_1 = (y_pair0 >> (8+3));          // 像素1
+            u16 y5_2 = (y_pair1 & 0xFF) >> 3;        // 像素2
+            u16 y5_3 = (y_pair1 >> (8+3));          // 像素3
 
-                // 获取Y亮度并转换为5位
-                u16 y8 = yuv_y_buffer[y][x];     // 0~255
-                u16 y5 = (y8 >> 3);       // 5位Y
 
-                // 组合YUV555索引：Y(低5位) + Cb(中5位) + Cr(高5位)
-                u16 yuv555 = y5 | (cb5 << 5) | (cr5 << 10);
-
-                // 直接写VRAM（查表得到RGB555）
-                vram[vram_idx++] = yuv555_to_rgb555_table[yuv555];
-            }
+            // 循环展开：直接写入4个像素（减少循环开销）
+            vram[vram_idx + 0] = yuv555_to_rgb555_table[y5_0 | cbcr_bits];
+            vram[vram_idx + 1] = yuv555_to_rgb555_table[y5_1 | cbcr_bits];
+            vram[vram_idx + 2] = yuv555_to_rgb555_table[y5_2 | cbcr_bits];
+            vram[vram_idx + 3] = yuv555_to_rgb555_table[y5_3 | cbcr_bits];
+            vram_idx += SCREEN_WIDTH;  // 移动到下一行
         }
     }
 }
@@ -340,7 +348,7 @@ int main()
     init_clip_table();
     init_clamp_tables();        // 初始化裁剪查找表
     init_yuv555_to_rgb555_table();  // 初始化YUV555到RGB555查找表
-    init_block_offset_table();  // 初始化块位置查找表
+    init_block_vram_offset_table();  // 初始化块VRAM偏移查找表
     init_block_xy_tables();     // 初始化块X/Y坐标查找表
 
     // 初始化YUV缓冲区为0
@@ -379,6 +387,7 @@ int main()
         }
 
         // 转换YUV到RGB555并直接写VRAM（无需DMA拷贝）
+                // VBlankIntrWait();
         convert_yuv_to_rgb555();
 
         frame++;
