@@ -659,13 +659,15 @@ def main():
         encoded_frames.extend(gop_encoded_frames)
         frame_types.extend(gop_frame_types)
     
-    # 重新计算帧偏移（包含哨兵元素，与头文件VIDEO_FRAME_COUNT + 1一致）
+    # 重新计算帧偏移
     frame_offsets = [0]  # 第一帧从0开始
     current_offset = 0
     for frame_data in encoded_frames:
         current_offset += len(frame_data)
         frame_offsets.append(current_offset)
-    # 保留最后一个哨兵元素，用于计算最后一帧的长度
+    
+    # 移除最后一个多余的偏移
+    frame_offsets = frame_offsets[:-1]
 
     # 写入文件
     write_header(pathlib.Path(args.out).with_suffix(".h"), total_frames, gop_count, gop_size)
@@ -1038,12 +1040,12 @@ def process_single_gop(gop_data):
 
             for mean in i_frame_means:
                 y_mean, cb_mean, cr_mean = mean
-                # Cb/Cr: -128~127，转换为0~255存储
+                # Cb: -128~127，加128转换为0~255存储（GBA侧直接使用u8）
                 frame_data.append((int(cb_mean) + 128) & 0xFFFF)
 
             for mean in i_frame_means:
                 y_mean, cb_mean, cr_mean = mean
-                # Cb/Cr: -128~127，转换为0~255存储
+                # Cr: -128~127，加128转换为0~255存储（GBA侧直接使用u8）
                 frame_data.append((int(cr_mean) + 128) & 0xFFFF)
 
             # 添加残差索引
@@ -1104,12 +1106,12 @@ def process_single_gop(gop_data):
                         y_mean, cb_mean, cr_mean = changed_means[idx0 + i]
                         frame_data.append(int(y_mean) & 0xFFFF)
 
-                    # 再写所有Cb均值
+                    # 再写所有Cb均值（加128转换为0~255，GBA侧直接使用u8）
                     for i in range(seg_count):
                         y_mean, cb_mean, cr_mean = changed_means[idx0 + i]
                         frame_data.append((int(cb_mean) + 128) & 0xFFFF)
 
-                    # 再写所有Cr均值
+                    # 再写所有Cr均值（加128转换为0~255，GBA侧直接使用u8）
                     for i in range(seg_count):
                         y_mean, cb_mean, cr_mean = changed_means[idx0 + i]
                         frame_data.append((int(cr_mean) + 128) & 0xFFFF)
@@ -1123,8 +1125,8 @@ def process_single_gop(gop_data):
                 for block_pos, (y_mean, cb_mean, cr_mean), codeword_idx in single_blocks:
                     frame_data.append(block_pos)  # 块位置
                     frame_data.append(int(y_mean) & 0xFFFF)  # Y均值
-                    frame_data.append((int(cb_mean) + 128) & 0xFFFF)  # Cb均值
-                    frame_data.append((int(cr_mean) + 128) & 0xFFFF)  # Cr均值
+                    frame_data.append((int(cb_mean) + 128) & 0xFFFF)  # Cb均值（加128转换为0~255）
+                    frame_data.append((int(cr_mean) + 128) & 0xFFFF)  # Cr均值（加128转换为0~255）
                     frame_data.append(codeword_idx)  # 码字索引
 
                 # print(f"  P帧 {gop_idx * gop_size + frame_idx}: {len(changed_indices)} 个块变化，{len(multi_segments)} 个连续段，{len(single_blocks)} 个单块")

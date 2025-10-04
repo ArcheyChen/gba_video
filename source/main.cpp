@@ -17,14 +17,16 @@ struct YUV_Struct{
     s8 y[16];   // Y 残差 (-128~127) - 4x4块需要16个像素
 } __attribute__((packed));
 
-// YUV9累积缓冲区（当前是绝对值模式，后续改为残差累积）
-// 注意：使用u8/s8存储，第二步改造时需要临时变量进行clamp防止溢出
+// YUV9累积缓冲区（残差编码模式）
 EWRAM_BSS u8 yuv_y_buffer[SCREEN_HEIGHT][SCREEN_WIDTH];    // 37.5 KB - Y全分辨率，0-255
-EWRAM_BSS s8 yuv_cb_buffer[SCREEN_HEIGHT/4][SCREEN_WIDTH/4]; // 2.4 KB - Cb按4x4块，-128~127
-EWRAM_BSS s8 yuv_cr_buffer[SCREEN_HEIGHT/4][SCREEN_WIDTH/4]; // 2.4 KB - Cr按4x4块，-128~127
+EWRAM_BSS u8 yuv_cb_buffer[SCREEN_HEIGHT/4][SCREEN_WIDTH/4]; // 2.4 KB - Cb按4x4块，0-255
+EWRAM_BSS u8 yuv_cr_buffer[SCREEN_HEIGHT/4][SCREEN_WIDTH/4]; // 2.4 KB - Cr按4x4块，0-255
 
 // VRAM输出缓冲
 EWRAM_BSS u16 vram_buffer[PIXELS_PER_FRAME];  // 75 KB - RGB555输出缓冲
+
+// YUV555到RGB555的查找表（2^15 = 32K条目 × 2字节 = 64KB）
+EWRAM_DATA static u16 yuv555_to_rgb555_table[32768];
 
 // 块位置到内存偏移的查找表
 EWRAM_DATA static u32 block_offset_table[VIDEO_BLOCKS_PER_FRAME];
@@ -36,9 +38,17 @@ IWRAM_DATA static u8 block_y_table[VIDEO_BLOCKS_PER_FRAME];
 // 当前GOP索引（用于码表访问）
 static int current_gop_index = 0;
 
-// 裁切查找表
+// YUV到RGB转换的裁切查找表
 IWRAM_DATA static u8 clip_table_raw[1024];
 u8* clip_lookup_table = clip_table_raw + 256;
+
+// 通用u8裁剪表：输入范围 -256~511 → 输出 0~255
+IWRAM_DATA static u8 clamp_to_u8_table_raw[768];
+u8* clamp_to_u8 = clamp_to_u8_table_raw + 256;  // 偏移后可直接用负数索引
+
+// 通用s8裁剪表：输入范围 -256~255 → 输出 -128~127
+IWRAM_DATA static s8 clamp_to_s8_table_raw[512];
+s8* clamp_to_s8 = clamp_to_s8_table_raw + 256;  // 偏移后可直接用负数索引
 
 void init_clip_table(){
     for(int i = -256; i < 1024 - 256; i++){
@@ -50,6 +60,61 @@ void init_clip_table(){
         else
             raw_val = static_cast<u8>(i);
         clip_lookup_table[i] = raw_val >> 3;
+    }
+}
+
+void init_clamp_tables(){
+    // 初始化u8裁剪表：-256~511 → 0~255
+    for(int i = -256; i < 512; i++){
+        if(i < 0)
+            clamp_to_u8[i] = 0;
+        else if(i > 255)
+            clamp_to_u8[i] = 255;
+        else
+            clamp_to_u8[i] = (u8)i;
+    }
+
+    // 初始化s8裁剪表：-256~255 → -128~127
+    for(int i = -256; i < 256; i++){
+        if(i < -128)
+            clamp_to_s8[i] = -128;
+        else if(i > 127)
+            clamp_to_s8[i] = 127;
+        else
+            clamp_to_s8[i] = (s8)i;
+    }
+}
+
+void init_yuv555_to_rgb555_table(){
+    // 遍历所有可能的YUV555组合（5+5+5 = 15位）
+    for(int yuv555 = 0; yuv555 < 32768; yuv555++){
+        // 解包YUV555：Y(5位) + Cb(5位) + Cr(5位)
+        int y5  = (yuv555 >> 0) & 0x1F;   // 低5位：Y
+        int cb5 = (yuv555 >> 5) & 0x1F;   // 中5位：Cb
+        int cr5 = (yuv555 >> 10) & 0x1F;  // 高5位：Cr
+
+        // 扩展到8位（左移3位，相当于 ×8）
+        int y8  = y5 << 3;              // 0~248
+        int cb8 = (cb5 << 3) - 128;     // -128~120
+        int cr8 = (cr5 << 3) - 128;     // -128~120
+
+        // YUV到RGB转换（使用简化系数）
+        int r = y8 + (cr8 << 1);           // Y + 2*Cr
+        int g = y8 - (cb8 >> 1) - cr8;     // Y - Cb/2 - Cr
+        int b = y8 + (cb8 << 1);           // Y + 2*Cb
+
+        // 裁剪到0~255
+        if(r < 0) r = 0; else if(r > 255) r = 255;
+        if(g < 0) g = 0; else if(g > 255) g = 255;
+        if(b < 0) b = 0; else if(b > 255) b = 255;
+
+        // 转换为RGB555（右移3位）
+        int r5 = r >> 3;
+        int g5 = g >> 3;
+        int b5 = b >> 3;
+
+        // 打包为RGB555
+        yuv555_to_rgb555_table[yuv555] = (u16)((r5) | (g5 << 5) | (b5 << 10));
     }
 }
 
@@ -77,7 +142,7 @@ void init_block_xy_tables(){
 }
 
 // 将一个YUV残差块累加到YUV缓冲区（残差模式）
-IWRAM_CODE void apply_residual_to_buffer(u16 codeword_idx, int block_pos, u8 y_mean, s8 cb_mean, s8 cr_mean)
+IWRAM_CODE void apply_residual_to_buffer(u16 codeword_idx, int block_pos, u8 y_mean, u8 cb_mean, u8 cr_mean)
 {
     const YUV_Struct* codebook = (YUV_Struct*)video_codebooks[current_gop_index];
     const YUV_Struct& residual_block = codebook[codeword_idx];
@@ -86,31 +151,21 @@ IWRAM_CODE void apply_residual_to_buffer(u16 codeword_idx, int block_pos, u8 y_m
     int block_x = block_x_table[block_pos];
     int block_y = block_y_table[block_pos];
 
-    // 累加Cb/Cr残差到均值
-    s16 cb_final = cb_mean + residual_block.cb;
-    s16 cr_final = cr_mean + residual_block.cr;
+    // 累加Cb/Cr残差到均值（均值现在是0~255 u8格式）
+    // 残差是-128~127 s8格式，需要先转换为s16计算，再裁剪回u8
+    s16 cb_final = (s16)cb_mean + (s16)residual_block.cb;
+    s16 cr_final = (s16)cr_mean + (s16)residual_block.cr;
 
-    // 裁剪到有效范围
-    if (cb_final < -128) cb_final = -128;
-    if (cb_final > 127) cb_final = 127;
-    if (cr_final < -128) cr_final = -128;
-    if (cr_final > 127) cr_final = 127;
+    yuv_cb_buffer[block_y][block_x] = clamp_to_u8[cb_final];
+    yuv_cr_buffer[block_y][block_x] = clamp_to_u8[cr_final];
 
-    yuv_cb_buffer[block_y][block_x] = (s8)cb_final;
-    yuv_cr_buffer[block_y][block_x] = (s8)cr_final;
-
-    // 累加Y残差到均值（16个像素）
+    // 累加Y残差到均值（16个像素），使用查找表裁剪
     int base_y = block_y * 4;
     int base_x = block_x * 4;
     for (int py = 0; py < 4; py++) {
         for (int px = 0; px < 4; px++) {
-            s16 y_final = (s16)y_mean + (s8)residual_block.y[py * 4 + px];
-
-            // 裁剪到有效范围
-            if (y_final < 0) y_final = 0;
-            if (y_final > 255) y_final = 255;
-
-            yuv_y_buffer[base_y + py][base_x + px] = (u8)y_final;
+            s16 y_final = (s16)y_mean + (s16)residual_block.y[py * 4 + px];
+            yuv_y_buffer[base_y + py][base_x + px] = clamp_to_u8[y_final];
         }
     }
 }
@@ -129,10 +184,10 @@ IWRAM_CODE void decode_i_frame(const u16* frame_data)
 
     for (int block_pos = 0; block_pos < VIDEO_BLOCKS_PER_FRAME; block_pos++)
     {
-        // 获取当前块的均值（Cb/Cr需要减去128偏移）
+        // 获取当前块的均值（Cb/Cr现在直接是0~255 u8格式）
         u8 y_mean = (u8)y_means[block_pos];
-        s8 cb_mean = (s8)((s16)cb_means[block_pos] - 128);  // 先转有符号再减
-        s8 cr_mean = (s8)((s16)cr_means[block_pos] - 128);
+        u8 cb_mean = (u8)cb_means[block_pos];
+        u8 cr_mean = (u8)cr_means[block_pos];
 
         // 获取残差码字索引
         u16 residual_idx = residual_indices[block_pos];
@@ -178,10 +233,10 @@ IWRAM_CODE void decode_p_frame(const u16* frame_data)
             u16 block_pos = seg_start + i;
             u16 residual_idx = data[data_offset++];
 
-            // 获取均值（Cb/Cr需要先转有符号再减128）
+            // 获取均值（Cb/Cr现在直接是0~255 u8格式）
             u8 y_mean = (u8)y_means[i];
-            s8 cb_mean = (s8)((s16)cb_means[i] - 128);
-            s8 cr_mean = (s8)((s16)cr_means[i] - 128);
+            u8 cb_mean = (u8)cb_means[i];
+            u8 cr_mean = (u8)cr_means[i];
 
             // 应用残差到YUV缓冲区
             apply_residual_to_buffer(residual_idx, block_pos, y_mean, cb_mean, cr_mean);
@@ -194,18 +249,18 @@ IWRAM_CODE void decode_p_frame(const u16* frame_data)
     // 解码所有单块
     for (int i = 0; i < single_count; i++)
     {
-        u16 block_pos = data[data_offset++];                    // 块位置
-        u8 y_mean = (u8)data[data_offset++];                    // Y均值
-        s8 cb_mean = (s8)((s16)data[data_offset++] - 128);      // Cb均值（先转有符号再减128）
-        s8 cr_mean = (s8)((s16)data[data_offset++] - 128);      // Cr均值（先转有符号再减128）
-        u16 residual_idx = data[data_offset++];                 // 残差索引
+        u16 block_pos = data[data_offset++];        // 块位置
+        u8 y_mean = (u8)data[data_offset++];        // Y均值
+        u8 cb_mean = (u8)data[data_offset++];       // Cb均值（直接是0~255 u8格式）
+        u8 cr_mean = (u8)data[data_offset++];       // Cr均值（直接是0~255 u8格式）
+        u16 residual_idx = data[data_offset++];     // 残差索引
 
         // 应用残差到YUV缓冲区
         apply_residual_to_buffer(residual_idx, block_pos, y_mean, cb_mean, cr_mean);
     }
 }
 
-// 将整个YUV缓冲区转换为RGB555并写入VRAM缓冲（优化：按4x4块处理）
+// 将整个YUV缓冲区转换为RGB555并写入VRAM缓冲（优化：使用YUV555查找表）
 IWRAM_CODE void convert_yuv_to_rgb555()
 {
     int vram_idx = 0;
@@ -214,12 +269,13 @@ IWRAM_CODE void convert_yuv_to_rgb555()
     for (int block_y = 0; block_y < SCREEN_HEIGHT / 4; block_y++) {
         for (int block_x = 0; block_x < SCREEN_WIDTH / 4; block_x++) {
 
-            // 获取当前块的Cb/Cr，计算色度偏移（每个4x4块只计算一次）
-            s16 cb = yuv_cb_buffer[block_y][block_x];
-            s16 cr = yuv_cr_buffer[block_y][block_x];
-            s16 d_r = cr << 1;           // 2*Cr
-            s16 d_g = -(cb >> 1) - cr;   // -Cb/2 - Cr
-            s16 d_b = cb << 1;           // 2*Cb
+            // 获取当前块的Cb/Cr（现在直接是0~255 u8格式）并转换为5位
+            u16 cb8 = yuv_cb_buffer[block_y][block_x];  // 0~255
+            u16 cr8 = yuv_cr_buffer[block_y][block_x];  // 0~255
+
+            // 直接右移3位得到5位
+            u16 cb5 = (cb8 >> 3);  // 5位Cb
+            u16 cr5 = (cr8 >> 3);  // 5位Cr
 
             // 处理4x4块内的16个像素
             int base_y = block_y * 4;
@@ -232,16 +288,15 @@ IWRAM_CODE void convert_yuv_to_rgb555()
                 for (int px = 0; px < 4; px++) {
                     int x = base_x + px;
 
-                    // 获取Y亮度
-                    s16 luma = yuv_y_buffer[y][x];
+                    // 获取Y亮度并转换为5位
+                    u16 y8 = yuv_y_buffer[y][x];     // 0~255
+                    u16 y5 = (y8 >> 3);       // 5位Y
 
-                    // YUV到RGB转换（色度偏移已预计算）
-                    u8 r = clip_lookup_table[luma + d_r];
-                    u8 g = clip_lookup_table[luma + d_g];
-                    u8 b = clip_lookup_table[luma + d_b];
+                    // 组合YUV555索引：Y(低5位) + Cb(中5位) + Cr(高5位)
+                    u16 yuv555 = y5 | (cb5 << 5) | (cr5 << 10);
 
-                    // 转换为RGB555
-                    vram_buffer[vram_idx++] = (r) | ((g) << 5) | ((b) << 10);
+                    // 直接查表得到RGB555
+                    vram_buffer[vram_idx++] = yuv555_to_rgb555_table[yuv555];
                 }
             }
         }
@@ -263,6 +318,8 @@ int main()
     int frame = 0;
 
     init_clip_table();
+    init_clamp_tables();        // 初始化裁剪查找表
+    init_yuv555_to_rgb555_table();  // 初始化YUV555到RGB555查找表
     init_block_offset_table();  // 初始化块位置查找表
     init_block_xy_tables();     // 初始化块X/Y坐标查找表
 
