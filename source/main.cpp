@@ -18,9 +18,9 @@ struct YUV_Struct{
 } __attribute__((packed));
 
 // YUV9累积缓冲区（残差编码模式）
-EWRAM_BSS u8 yuv_y_buffer[SCREEN_HEIGHT][SCREEN_WIDTH];    // 37.5 KB - Y全分辨率，0-255
-IWRAM_DATA u8 yuv_cb_buffer[SCREEN_HEIGHT/4][SCREEN_WIDTH/4]; // 2.4 KB - Cb按4x4块，0-255
-IWRAM_DATA u8 yuv_cr_buffer[SCREEN_HEIGHT/4][SCREEN_WIDTH/4]; // 2.4 KB - Cr按4x4块，0-255
+EWRAM_BSS u8 yuv_y_buffer[SCREEN_HEIGHT][SCREEN_WIDTH];      // 37.5 KB - Y全分辨率，0-255
+IWRAM_DATA s8 yuv_cb_buffer[SCREEN_HEIGHT/4][SCREEN_WIDTH/4]; // 2.4 KB - Cb按4x4块，-128~127 (s8格式)
+IWRAM_DATA s8 yuv_cr_buffer[SCREEN_HEIGHT/4][SCREEN_WIDTH/4]; // 2.4 KB - Cr按4x4块，-128~127 (s8格式)
 
 // RGB缓冲区（EWRAM中的双缓冲，用于预转换YUV到RGB555）
 EWRAM_DATA u16 rgb_buffer[SCREEN_HEIGHT][SCREEN_WIDTH];    // 76.8 KB - RGB555格式
@@ -62,24 +62,23 @@ static const u8 bayer_pattern_4x4[4][4] = {
 };
 
 // YUV到RGB555的转换函数（使用裁剪查找表和Bayer抖动）
-IWRAM_CODE inline u16 yuv_to_rgb555(u8 y8, u8 cb8, u8 cr8, int x, int y)
+IWRAM_CODE inline u16 yuv_to_rgb555(u8 y8, s8 cb8, s8 cr8, int x, int y)
 {
     // 获取Bayer抖动值（已预先除以31）
     u8 dither = bayer_pattern_4x4[y][x];
 
-    // 移除Cb/Cr的128偏移
-    s16 cb = cb8 - 128;
-    s16 cr = cr8 - 128;
-
+    // 直接使用s8格式的Cb/Cr，无需偏移处理
     // YUV到RGB转换的差分值
-    s16 d_r = cr << 1;           // 2*Cr
-    s16 d_g = -(cb >> 1) - cr;   // -Cb/2 - Cr
-    s16 d_b = cb << 1;           // 2*Cb
+    s16 cb_val = (s16)cb8;
+    s16 cr_val = (s16)cr8;
+    s16 d_r = cr_val << 1;           // 2*Cr
+    s16 d_g = -(cb_val >> 1) - cr_val;   // -Cb/2 - Cr
+    s16 d_b = cb_val << 1;           // 2*Cb
 
     // 使用裁剪查找表进行RGB555转换
-    u16 r = clip_lookup_table[dither + y8 + d_r];
-    u16 g = clip_lookup_table[dither + y8 + d_g];
-    u16 b = clip_lookup_table[dither + y8 + d_b];
+    u16 r = clip_lookup_table[dither + (s16)y8 + d_r];
+    u16 g = clip_lookup_table[dither + (s16)y8 + d_g];
+    u16 b = clip_lookup_table[dither + (s16)y8 + d_b];
 
     // 组合为RGB555
     return (r) | ((g) << 5) | ((b) << 10);
@@ -155,19 +154,16 @@ IWRAM_CODE void apply_residual_to_buffer(u16 codeword_idx, int block_pos, u8 y_m
     int base_x = block_x_table[block_pos];  // 直接是像素X坐标
     int base_y = block_y_table[block_pos];  // 直接是像素Y坐标
 
-    // 累加Cb/Cr残差到均值（均值现在是0~255 u8格式）
-    // 残差是-128~127 s8格式，需要先转换为s16计算，再裁剪回u8
+    // 累加Cb/Cr残差到均值（统一s8格式）
+    // 均值和残差都是s8格式，直接相加得到s16结果
     s16 cb_final = (s16)cb_mean + (s16)residual_block.cb;
     s16 cr_final = (s16)cr_mean + (s16)residual_block.cr;
 
-    u8 cb_final_u8 = clamp_to_u8[cb_final];
-    u8 cr_final_u8 = clamp_to_u8[cr_final];
-
-    // 注意：YUV缓冲区是按像素存储，Cb/Cr缓冲区是按块存储
+    // 裁剪到s8范围并存储到Cb/Cr缓冲区
     int block_grid_x = base_x / 4;  // 转换回块网格坐标
     int block_grid_y = base_y / 4;
-    yuv_cb_buffer[block_grid_y][block_grid_x] = cb_final_u8;
-    yuv_cr_buffer[block_grid_y][block_grid_x] = cr_final_u8;
+    yuv_cb_buffer[block_grid_y][block_grid_x] = (s8)cb_final;
+    yuv_cr_buffer[block_grid_y][block_grid_x] = (s8)cr_final;
     for (int py = 0; py < 4; py++) {
         int y = base_y + py;
         for (int px = 0; px < 4; px++) {
@@ -176,7 +172,7 @@ IWRAM_CODE void apply_residual_to_buffer(u16 codeword_idx, int block_pos, u8 y_m
             u8 y_final_u8 = clamp_to_u8[y_final];
 
             // 使用公式转换YUV到RGB555并写入RGB缓冲区（带Bayer抖动）
-            rgb_buffer[y][x] = yuv_to_rgb555(y_final_u8, cb_final_u8, cr_final_u8, px, py);
+            rgb_buffer[y][x] = yuv_to_rgb555(y_final_u8, (s8)cb_final, (s8)cr_final, px, py);
 
             // 同时更新YUV缓冲区（保留用于P帧比较）
             yuv_y_buffer[y][x] = y_final_u8;

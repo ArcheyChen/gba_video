@@ -1040,13 +1040,13 @@ def process_single_gop(gop_data):
 
             for mean in i_frame_means:
                 y_mean, cb_mean, cr_mean = mean
-                # Cb: -128~127，加128转换为0~255存储（GBA侧直接使用u8）
-                frame_data.append((int(cb_mean) + 128) & 0xFFFF)
+                # Cb: -128~127，直接存储为s8格式（使用有符号数强制转换）
+                frame_data.append(int(np.int8(cb_mean)) & 0xFFFF)
 
             for mean in i_frame_means:
                 y_mean, cb_mean, cr_mean = mean
-                # Cr: -128~127，加128转换为0~255存储（GBA侧直接使用u8）
-                frame_data.append((int(cr_mean) + 128) & 0xFFFF)
+                # Cr: -128~127，直接存储为s8格式（使用有符号数强制转换）
+                frame_data.append(int(np.int8(cr_mean)) & 0xFFFF)
 
             # 添加残差索引
             frame_data.extend(residual_indices.tolist())
@@ -1106,15 +1106,15 @@ def process_single_gop(gop_data):
                         y_mean, cb_mean, cr_mean = changed_means[idx0 + i]
                         frame_data.append(int(y_mean) & 0xFFFF)
 
-                    # 再写所有Cb均值（加128转换为0~255，GBA侧直接使用u8）
+                    # 再写所有Cb均值（s8格式存储）
                     for i in range(seg_count):
                         y_mean, cb_mean, cr_mean = changed_means[idx0 + i]
-                        frame_data.append((int(cb_mean) + 128) & 0xFFFF)
+                        frame_data.append(int(np.int8(cb_mean)) & 0xFFFF)
 
-                    # 再写所有Cr均值（加128转换为0~255，GBA侧直接使用u8）
+                    # 再写所有Cr均值（s8格式存储）
                     for i in range(seg_count):
                         y_mean, cb_mean, cr_mean = changed_means[idx0 + i]
-                        frame_data.append((int(cr_mean) + 128) & 0xFFFF)
+                        frame_data.append(int(np.int8(cr_mean)) & 0xFFFF)
 
                     # 最后写所有码字索引
                     for i in range(seg_count):
@@ -1125,8 +1125,8 @@ def process_single_gop(gop_data):
                 for block_pos, (y_mean, cb_mean, cr_mean), codeword_idx in single_blocks:
                     frame_data.append(block_pos)  # 块位置
                     frame_data.append(int(y_mean) & 0xFFFF)  # Y均值
-                    frame_data.append((int(cb_mean) + 128) & 0xFFFF)  # Cb均值（加128转换为0~255）
-                    frame_data.append((int(cr_mean) + 128) & 0xFFFF)  # Cr均值（加128转换为0~255）
+                    frame_data.append(int(np.int8(cb_mean)) & 0xFFFF)  # Cb均值（s8格式）
+                    frame_data.append(int(np.int8(cr_mean)) & 0xFFFF)  # Cr均值（s8格式）
                     frame_data.append(codeword_idx)  # 码字索引
 
                 # print(f"  P帧 {gop_idx * gop_size + frame_idx}: {len(changed_indices)} 个块变化，{len(multi_segments)} 个连续段，{len(single_blocks)} 个单块")
