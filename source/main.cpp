@@ -29,8 +29,6 @@ EWRAM_DATA u16 rgb_buffer[SCREEN_HEIGHT][SCREEN_WIDTH];    // 76.8 KB - RGB555�
 IWRAM_DATA u16 dirty_block_queue[VIDEO_BLOCKS_PER_FRAME];  // 4.8 KB - 最多2400个块索引
 IWRAM_DATA u16 dirty_block_count = 0;  // 当前队列中的块数量
 
-// YUV555到RGB555的查找表（2^15 = 32K条目 × 2字节 = 64KB）
-EWRAM_DATA static u16 yuv555_to_rgb555_table[32768];
 
 // 块位置到VRAM左上角偏移的查找表（优化：消除乘法）
 EWRAM_DATA static u32 block_vram_offset_table[VIDEO_BLOCKS_PER_FRAME];
@@ -54,6 +52,39 @@ u8* clamp_to_u8 = clamp_to_u8_table_raw + 256;  // 偏移后可直接用负数�
 IWRAM_DATA static s8 clamp_to_s8_table_raw[512];
 s8* clamp_to_s8 = clamp_to_s8_table_raw + 256;  // 偏移后可直接用负数索引
 
+// Bayer抖动矩阵 (4x4) - 预先计算好除以31的结果
+// 使用const而不是IWRAM_DATA来避免冲突
+static const u8 bayer_pattern_4x4[4][4] = {
+    {0, 6, 1, 7},   // 15/31=0, 195/31=6, 60/31=1, 240/31=7
+    {4, 2, 5, 3},   // 135/31=4, 75/31=2, 180/31=5, 120/31=3
+    {1, 7, 0, 6},   // 45/31=1, 225/31=7, 30/31=0, 210/31=6
+    {5, 3, 4, 2}    // 165/31=5, 105/31=3, 150/31=4, 90/31=2
+};
+
+// YUV到RGB555的转换函数（使用裁剪查找表和Bayer抖动）
+IWRAM_CODE inline u16 yuv_to_rgb555(u8 y8, u8 cb8, u8 cr8, int x, int y)
+{
+    // 获取Bayer抖动值（已预先除以31）
+    u8 dither = bayer_pattern_4x4[y & 3][x & 3];
+
+    // 移除Cb/Cr的128偏移
+    s16 cb = cb8 - 128;
+    s16 cr = cr8 - 128;
+
+    // YUV到RGB转换的差分值
+    s16 d_r = cr << 1;           // 2*Cr
+    s16 d_g = -(cb >> 1) - cr;   // -Cb/2 - Cr
+    s16 d_b = cb << 1;           // 2*Cb
+
+    // 使用裁剪查找表进行RGB555转换
+    u16 r = clip_lookup_table[dither + y8 + d_r];
+    u16 g = clip_lookup_table[dither + y8 + d_g];
+    u16 b = clip_lookup_table[dither + y8 + d_b];
+
+    // 组合为RGB555
+    return (r) | ((g) << 5) | ((b) << 10);
+}
+
 void init_clip_table(){
     for(int i = -256; i < 1024 - 256; i++){
         u8 raw_val;
@@ -63,7 +94,7 @@ void init_clip_table(){
             raw_val = 255;
         else
             raw_val = static_cast<u8>(i);
-        clip_lookup_table[i] = raw_val >> 3;
+        clip_lookup_table[i] = raw_val >> 3;  // 输出0-31 (5位)
     }
 }
 
@@ -89,38 +120,6 @@ void init_clamp_tables(){
     }
 }
 
-void init_yuv555_to_rgb555_table(){
-    // 遍历所有可能的YUV555组合（5+5+5 = 15位）
-    for(int yuv555 = 0; yuv555 < 32768; yuv555++){
-        // 解包YUV555：Y(5位) + Cb(5位) + Cr(5位)
-        int y5  = (yuv555 >> 0) & 0x1F;   // 低5位：Y
-        int cb5 = (yuv555 >> 5) & 0x1F;   // 中5位：Cb
-        int cr5 = (yuv555 >> 10) & 0x1F;  // 高5位：Cr
-
-        // 扩展到8位（左移3位，相当于 ×8）
-        int y8  = y5 << 3;              // 0~248
-        int cb8 = (cb5 << 3) - 128;     // -128~120
-        int cr8 = (cr5 << 3) - 128;     // -128~120
-
-        // YUV到RGB转换（使用简化系数）
-        int r = y8 + (cr8 << 1);           // Y + 2*Cr
-        int g = y8 - (cb8 >> 1) - cr8;     // Y - Cb/2 - Cr
-        int b = y8 + (cb8 << 1);           // Y + 2*Cb
-
-        // 裁剪到0~255
-        if(r < 0) r = 0; else if(r > 255) r = 255;
-        if(g < 0) g = 0; else if(g > 255) g = 255;
-        if(b < 0) b = 0; else if(b > 255) b = 255;
-
-        // 转换为RGB555（右移3位）
-        int r5 = r >> 3;
-        int g5 = g >> 3;
-        int b5 = b >> 3;
-
-        // 打包为RGB555
-        yuv555_to_rgb555_table[yuv555] = (u16)((r5) | (g5 << 5) | (b5 << 10));
-    }
-}
 
 // 预计算块位置到VRAM左上角偏移的查找表（优化：消除convert中的乘法）
 void init_block_vram_offset_table(){
@@ -167,11 +166,6 @@ IWRAM_CODE void apply_residual_to_buffer(u16 codeword_idx, int block_pos, u8 y_m
     yuv_cb_buffer[block_y][block_x] = cb_final_u8;
     yuv_cr_buffer[block_y][block_x] = cr_final_u8;
 
-    // 转换Cb/Cr为5位格式（用于RGB查找表）
-    u16 cb5 = (cb_final_u8 >> 3);  // 5位Cb
-    u16 cr5 = (cr_final_u8 >> 3);  // 5位Cr
-    u16 cbcr_bits = (cb5 << 5) | (cr5 << 10);
-
     // 累加Y残差到均值（16个像素）并直接转换到RGB555
     int base_y = block_y * 4;
     int base_x = block_x * 4;
@@ -182,9 +176,8 @@ IWRAM_CODE void apply_residual_to_buffer(u16 codeword_idx, int block_pos, u8 y_m
             s16 y_final = (s16)y_mean + (s16)residual_block.y[py * 4 + px];
             u8 y_final_u8 = clamp_to_u8[y_final];
 
-            // 转换YUV到RGB555并写入RGB缓冲区
-            u16 y5 = (y_final_u8 >> 3);  // 5位Y
-            rgb_buffer[y][x] = yuv555_to_rgb555_table[y5 | cbcr_bits];
+            // 使用公式转换YUV到RGB555并写入RGB缓冲区（带Bayer抖动）
+            rgb_buffer[y][x] = yuv_to_rgb555(y_final_u8, cb_final_u8, cr_final_u8, x, y);
 
             // 同时更新YUV缓冲区（保留用于P帧比较）
             yuv_y_buffer[y][x] = y_final_u8;
@@ -345,7 +338,6 @@ int main()
 
     init_clip_table();
     init_clamp_tables();        // 初始化裁剪查找表
-    init_yuv555_to_rgb555_table();  // 初始化YUV555到RGB555查找表
     init_block_vram_offset_table();  // 初始化块VRAM偏移查找表
     init_block_xy_tables();     // 初始化块X/Y坐标查找表
 
