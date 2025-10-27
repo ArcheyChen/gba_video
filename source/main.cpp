@@ -197,8 +197,8 @@ IWRAM_CODE void decode_i_frame(const u16* frame_data)
     const u16* cr_means = frame_data + 1 + block_count * 2;  // Cr均值起始
     const u16* residual_indices = frame_data + 1 + block_count * 3;  // 残差索引起始
 
-    // 清空队列并准备记录全部块
-    dirty_block_count = 0;
+    // I帧优化：直接设置dirty_block_count为全部块数量，跳过逐块添加队列
+    dirty_block_count = VIDEO_BLOCKS_PER_FRAME;
 
     for (int block_pos = 0; block_pos < VIDEO_BLOCKS_PER_FRAME; block_pos++)
     {
@@ -210,11 +210,10 @@ IWRAM_CODE void decode_i_frame(const u16* frame_data)
         // 获取残差码字索引
         u16 residual_idx = residual_indices[block_pos];
 
-        // 应用残差到YUV缓冲区
+        // 应用残差到YUV缓冲区和RGB缓冲区
         apply_residual_to_buffer(residual_idx, block_pos, y_mean, cb_mean, cr_mean);
 
-        // I帧：记录所有块到队列
-        dirty_block_queue[dirty_block_count++] = block_pos;
+        // I帧：无需添加到队列，因为全屏刷新会处理所有块
     }
 }
 
@@ -290,9 +289,41 @@ IWRAM_CODE void decode_p_frame(const u16* frame_data)
     }
 }
 
+// 全屏刷新函数 - ARM优化版本，按行批量处理
+IWRAM_CODE void copy_full_screen_to_vram()
+{
+    u16* vram = (u16*)VRAM;
+
+    // 按行处理，每行使用ARM汇编优化
+    for (int y = 0; y < SCREEN_HEIGHT; y++) {
+        const u32* src_row = (const u32*)(rgb_buffer[y]);
+        u32* dst_row = (u32*)(vram + y * SCREEN_WIDTH);
+
+        // 每行240个像素 = 120个u32 = 15次8像素传输
+        int pixels_left = SCREEN_WIDTH;  // 剩余像素数
+        asm volatile (
+            "1:                                     \n"  // 循环开始
+            "ldmia %0!, {r4, r5, r6, r7}              \n"  // 加载8个像素(4个u32)
+            "stmia %1!, {r4, r5, r6, r7}              \n"  // 存储8个像素
+            "subs %2, %2, #8                        \n"  // 减8个像素
+            "bne 1b                                 \n"  // 循环直到一行拷贝完毕
+            : "+r"(src_row), "+r"(dst_row), "+r"(pixels_left)  // 输出操作数：汇编会修改
+            :                                        // 输入操作数：无
+            : "r4", "r5", "r6", "r7", "memory", "cc"  // 破坏的寄存器
+        );
+    }
+}
+
 // 将RGB缓冲区中的变化块拷贝到VRAM（VBlank期间调用）
 IWRAM_CODE void copy_rgb_buffer_to_vram()
 {
+    // 动态刷新策略：如果变化块超过一半，使用全屏刷新
+    if (dirty_block_count > VIDEO_BLOCKS_PER_FRAME / 2) {
+        copy_full_screen_to_vram();
+        return;
+    }
+
+    // 否则使用块级刷新
     u16* vram = (u16*)VRAM;
 
     // 遍历队列中的所有变化块
