@@ -65,7 +65,7 @@ static const u8 bayer_pattern_4x4[4][4] = {
 IWRAM_CODE inline u16 yuv_to_rgb555(u8 y8, u8 cb8, u8 cr8, int x, int y)
 {
     // 获取Bayer抖动值（已预先除以31）
-    u8 dither = bayer_pattern_4x4[y & 3][x & 3];
+    u8 dither = bayer_pattern_4x4[y][x];
 
     // 移除Cb/Cr的128偏移
     s16 cb = cb8 - 128;
@@ -133,13 +133,13 @@ void init_block_vram_offset_table(){
     }
 }
 
-// 预计算块位置到X/Y坐标的查找表
+// 预计算块位置到X/Y像素坐标的查找表（预乘4）
 void init_block_xy_tables(){
     int block_pos = 0;
     for (int y = 0; y < SCREEN_HEIGHT / 4; y++) {
         for (int x = 0; x < SCREEN_WIDTH / 4; x++) {
-            block_x_table[block_pos] = x;
-            block_y_table[block_pos] = y;
+            block_x_table[block_pos] = x * 4;  // 预乘4：块左上角像素X坐标
+            block_y_table[block_pos] = y * 4;  // 预乘4：块左上角像素Y坐标
             block_pos++;
         }
     }
@@ -151,9 +151,9 @@ IWRAM_CODE void apply_residual_to_buffer(u16 codeword_idx, int block_pos, u8 y_m
     const YUV_Struct* codebook = (YUV_Struct*)video_codebooks[current_gop_index];
     const YUV_Struct& residual_block = codebook[codeword_idx];
 
-    // 使用预计算的查找表获取块的X/Y坐标
-    int block_x = block_x_table[block_pos];
-    int block_y = block_y_table[block_pos];
+    // 使用预计算的查找表获取块的X/Y像素坐标（已预乘4）
+    int base_x = block_x_table[block_pos];  // 直接是像素X坐标
+    int base_y = block_y_table[block_pos];  // 直接是像素Y坐标
 
     // 累加Cb/Cr残差到均值（均值现在是0~255 u8格式）
     // 残差是-128~127 s8格式，需要先转换为s16计算，再裁剪回u8
@@ -163,12 +163,11 @@ IWRAM_CODE void apply_residual_to_buffer(u16 codeword_idx, int block_pos, u8 y_m
     u8 cb_final_u8 = clamp_to_u8[cb_final];
     u8 cr_final_u8 = clamp_to_u8[cr_final];
 
-    yuv_cb_buffer[block_y][block_x] = cb_final_u8;
-    yuv_cr_buffer[block_y][block_x] = cr_final_u8;
-
-    // 累加Y残差到均值（16个像素）并直接转换到RGB555
-    int base_y = block_y * 4;
-    int base_x = block_x * 4;
+    // 注意：YUV缓冲区是按像素存储，Cb/Cr缓冲区是按块存储
+    int block_grid_x = base_x / 4;  // 转换回块网格坐标
+    int block_grid_y = base_y / 4;
+    yuv_cb_buffer[block_grid_y][block_grid_x] = cb_final_u8;
+    yuv_cr_buffer[block_grid_y][block_grid_x] = cr_final_u8;
     for (int py = 0; py < 4; py++) {
         int y = base_y + py;
         for (int px = 0; px < 4; px++) {
@@ -177,7 +176,7 @@ IWRAM_CODE void apply_residual_to_buffer(u16 codeword_idx, int block_pos, u8 y_m
             u8 y_final_u8 = clamp_to_u8[y_final];
 
             // 使用公式转换YUV到RGB555并写入RGB缓冲区（带Bayer抖动）
-            rgb_buffer[y][x] = yuv_to_rgb555(y_final_u8, cb_final_u8, cr_final_u8, x, y);
+            rgb_buffer[y][x] = yuv_to_rgb555(y_final_u8, cb_final_u8, cr_final_u8, px, py);
 
             // 同时更新YUV缓冲区（保留用于P帧比较）
             yuv_y_buffer[y][x] = y_final_u8;
@@ -289,29 +288,30 @@ IWRAM_CODE void decode_p_frame(const u16* frame_data)
     }
 }
 
-// 全屏刷新函数 - ARM优化版本，按行批量处理
+// 全屏刷新函数 - 验证版本，确保像素数正确
 IWRAM_CODE void copy_full_screen_to_vram()
 {
     u16* vram = (u16*)VRAM;
 
-    // 按行处理，每行使用ARM汇编优化
-    for (int y = 0; y < SCREEN_HEIGHT; y++) {
-        const u32* src_row = (const u32*)(rgb_buffer[y]);
-        u32* dst_row = (u32*)(vram + y * SCREEN_WIDTH);
+    // 手动计算验证：240*160 = 38400像素
+    // u32传输：38400/2 = 19200个u32
+    // 每次4个u32：19200/4 = 4800次循环
+    // 每次4个u32 = 8像素
 
-        // 每行240个像素 = 120个u32 = 15次8像素传输
-        int pixels_left = SCREEN_WIDTH;  // 剩余像素数
-        asm volatile (
-            "1:                                     \n"  // 循环开始
-            "ldmia %0!, {r4, r5, r6, r7}              \n"  // 加载8个像素(4个u32)
-            "stmia %1!, {r4, r5, r6, r7}              \n"  // 存储8个像素
-            "subs %2, %2, #8                        \n"  // 减8个像素
-            "bne 1b                                 \n"  // 循环直到一行拷贝完毕
-            : "+r"(src_row), "+r"(dst_row), "+r"(pixels_left)  // 输出操作数：汇编会修改
-            :                                        // 输入操作数：无
-            : "r4", "r5", "r6", "r7", "memory", "cc"  // 破坏的寄存器
-        );
-    }
+    int loops = (SCREEN_WIDTH * SCREEN_HEIGHT) / 8;  // 总循环次数
+    const u32* src = (const u32*)rgb_buffer;
+    u32* dst = (u32*)vram;
+
+    asm volatile (
+        "1:                                     \n"  // 循环开始
+        "ldmia %0!, {r4, r5, r6, r7}              \n"  // 加载4个u32 = 8像素
+        "stmia %1!, {r4, r5, r6, r7}              \n"  // 存储4个u32 = 8像素
+        "subs %2, %2, #1                        \n"  // 减1次循环
+        "bne 1b                                 \n"  // 循环直到全屏拷贝完毕
+        : "+r"(src), "+r"(dst), "+r"(loops)         // 输出操作数：汇编会修改
+        :                                        // 输入操作数：无
+        : "r4", "r5", "r6", "r7", "memory", "cc"  // 破坏的寄存器
+    );
 }
 
 // 将RGB缓冲区中的变化块拷贝到VRAM（VBlank期间调用）
@@ -323,7 +323,7 @@ IWRAM_CODE void copy_rgb_buffer_to_vram()
         return;
     }
 
-    // 否则使用块级刷新
+    // 否则使用块级刷新 - 展开循环优化
     u16* vram = (u16*)VRAM;
 
     // 遍历队列中的所有变化块
@@ -331,25 +331,29 @@ IWRAM_CODE void copy_rgb_buffer_to_vram()
     {
         u16 block_pos = dirty_block_queue[q];
 
-        // 使用预计算的查找表获取块的X/Y坐标
-        int block_x = block_x_table[block_pos];
-        int block_y = block_y_table[block_pos];
+        // 使用预计算的查找表获取块的X/Y像素坐标（已预乘4）
+        int base_x = block_x_table[block_pos];  // 直接是像素X坐标
+        int base_y = block_y_table[block_pos];  // 直接是像素Y坐标
 
         // 使用预计算的VRAM偏移表（消除乘法）
-        u32 vram_idx = block_vram_offset_table[block_pos];  // 块左上角VRAM偏移
-        int base_y = block_y * 4;
-        int base_x = block_x * 4;
+        u32 vram_offset = block_vram_offset_table[block_pos];  // 块左上角VRAM偏移
 
-        // 直接从RGB缓冲区拷贝4x4块到VRAM（优化：批量内存拷贝）
-        for (int py = 0; py < 4; py++) {
-            int y = base_y + py;
-            // 使用DMA或手动拷贝一行4个像素
-            vram[vram_idx + 0] = rgb_buffer[y][base_x + 0];
-            vram[vram_idx + 1] = rgb_buffer[y][base_x + 1];
-            vram[vram_idx + 2] = rgb_buffer[y][base_x + 2];
-            vram[vram_idx + 3] = rgb_buffer[y][base_x + 3];
-            vram_idx += SCREEN_WIDTH;  // 移动到下一行
-        }
+        // 展开4行循环，每行使用u32批量访问2个像素
+        // 第0行：y=base_y+0
+        *(u32*)(vram + vram_offset + 0 * SCREEN_WIDTH) = *(const u32*)(rgb_buffer[base_y + 0] + base_x + 0);
+        *(u32*)(vram + vram_offset + 0 * SCREEN_WIDTH + 2) = *(const u32*)(rgb_buffer[base_y + 0] + base_x + 2);
+
+        // 第1行：y=base_y+1
+        *(u32*)(vram + vram_offset + 1 * SCREEN_WIDTH) = *(const u32*)(rgb_buffer[base_y + 1] + base_x + 0);
+        *(u32*)(vram + vram_offset + 1 * SCREEN_WIDTH + 2) = *(const u32*)(rgb_buffer[base_y + 1] + base_x + 2);
+
+        // 第2行：y=base_y+2
+        *(u32*)(vram + vram_offset + 2 * SCREEN_WIDTH) = *(const u32*)(rgb_buffer[base_y + 2] + base_x + 0);
+        *(u32*)(vram + vram_offset + 2 * SCREEN_WIDTH + 2) = *(const u32*)(rgb_buffer[base_y + 2] + base_x + 2);
+
+        // 第3行：y=base_y+3
+        *(u32*)(vram + vram_offset + 3 * SCREEN_WIDTH) = *(const u32*)(rgb_buffer[base_y + 3] + base_x + 0);
+        *(u32*)(vram + vram_offset + 3 * SCREEN_WIDTH + 2) = *(const u32*)(rgb_buffer[base_y + 3] + base_x + 2);
     }
 }
 
@@ -415,7 +419,7 @@ int main()
         }
 
         // 等待VBlank并拷贝RGB缓冲区到VRAM
-        VBlankIntrWait();
+        // VBlankIntrWait();
         copy_rgb_buffer_to_vram();
 
         frame++;
