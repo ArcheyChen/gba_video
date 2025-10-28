@@ -81,7 +81,8 @@ void init_yuv555_to_rgb555_table()
                 u16 g5 = g8 >> 3;
                 u16 b5 = b8 >> 3;
 
-                int index = (y5 << 10) | (cb5 << 5) | cr5;
+                int chroma_index = (cb5 << 5) | cr5;  // 色度索引 (0-1023)
+                int index = (chroma_index << 5) | y5;  // 色度高位 + 亮度低位
                 yuv555_to_rgb555_table[index] = r5 | (g5 << 5) | (b5 << 10);
             }
         }
@@ -136,7 +137,7 @@ void init_block_xy_tables(){
 }
 
 // 将一个YUV残差块累加到YUV缓冲区并同时更新RGB缓冲区（残差模式）
-IWRAM_CODE void apply_residual_to_buffer(u16 codeword_idx, int block_pos, u8 y_mean, u8 cb_mean, u8 cr_mean)
+IWRAM_CODE inline void apply_residual_to_buffer(u16 codeword_idx, int block_pos, u8 y_mean, u8 cb_mean, u8 cr_mean)
 {
     const YUV_Struct* codebook = (YUV_Struct*)video_codebooks[current_gop_index];
     const YUV_Struct& residual_block = codebook[codeword_idx];
@@ -163,6 +164,7 @@ IWRAM_CODE void apply_residual_to_buffer(u16 codeword_idx, int block_pos, u8 y_m
     u16 cb5 = static_cast<u16>(((int)cb_store + 128) >> 3);
     u16 cr5 = static_cast<u16>(((int)cr_store + 128) >> 3);
     int chroma_index = (cb5 << 5) | cr5;
+    u16* table = yuv555_to_rgb555_table + (chroma_index << 5); // 色度部分偏移
     for (int py = 0; py < 4; py++) {
         int y = base_y + py;
         for (int px = 0; px < 4; px++) {
@@ -170,10 +172,9 @@ IWRAM_CODE void apply_residual_to_buffer(u16 codeword_idx, int block_pos, u8 y_m
             s16 y_final = (s16)y_mean + (s16)residual_block.y[py * 4 + px];
             u8 y_final_u8 = clamp_to_u8[y_final];
 
-            // 亮度同样压缩到5位后查表
+            // 亮度同样压缩到5位后查表（Y在低位，简化索引计算）
             u16 y5 = static_cast<u16>(y_final_u8 >> 3);
-            int table_index = (y5 << 10) | chroma_index;
-            rgb_buffer[y][x] = yuv555_to_rgb555_table[table_index];
+            rgb_buffer[y][x] = table[y5];
 
             // 同时更新YUV缓冲区（保留用于P帧比较）
             yuv_y_buffer[y][x] = y_final_u8;
