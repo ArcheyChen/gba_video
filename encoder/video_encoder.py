@@ -162,6 +162,40 @@ def calculate_block_mean_yuv9(yuv444_block):
     return np.array([y_mean, cb_mean, cr_mean], dtype=np.int16)
 
 @jit(nopython=True, cache=True)
+def calculate_16x16_block_mean_yuv9(frame_blocks_4x4):
+    """
+    计算16x16块的YUV9均值
+    输入：16x16区域内的4x4块数组 (16个4x4块)
+    输出：YUV9均值 (3字节: Y_mean, Cb_mean, Cr_mean)，Cb/Cr已减去128偏移
+    """
+    # 收集16个4x4块的所有YUV值
+    all_y_values = np.zeros(256, dtype=np.float32)  # 16x16 = 256像素
+    all_cb_values = np.zeros(256, dtype=np.float32)
+    all_cr_values = np.zeros(256, dtype=np.float32)
+
+    idx = 0
+    for block_idx in range(16):
+        yuv444_block = frame_blocks_4x4[block_idx]
+        # 添加每个4x4块的16个Y、16个Cb、16个Cr值
+        for i in range(16):
+            all_y_values[idx] = yuv444_block[i]
+            all_cb_values[idx] = yuv444_block[16 + i]
+            all_cr_values[idx] = yuv444_block[32 + i]
+            idx += 1
+
+    # 计算16x16块的均值
+    y_mean = np.round(np.mean(all_y_values))
+    cb_mean = np.round(np.mean(all_cb_values)) - 128  # 减去128偏移
+    cr_mean = np.round(np.mean(all_cr_values)) - 128
+
+    # 裁剪到有效范围
+    y_mean = max(0, min(255, y_mean))
+    cb_mean = max(-128, min(127, cb_mean))
+    cr_mean = max(-128, min(127, cr_mean))
+
+    return np.array([y_mean, cb_mean, cr_mean], dtype=np.int16)
+
+@jit(nopython=True, cache=True)
 def calculate_residual_yuv9(yuv444_block, y_mean, cb_mean, cr_mean):
     """
     计算YUV444块相对于均值的残差，转换为YUV9格式
@@ -959,15 +993,42 @@ def process_single_gop(gop_data):
     # 第一帧是I帧
     i_frame_blocks = corrected_frames[0]
 
-    # 计算I帧每个块的均值
-    print(f"  计算I帧块均值...")
-    i_frame_means = np.array([calculate_block_mean_yuv9(block) for block in i_frame_blocks])
+    # 计算I帧16x16块的均值
+    print(f"  计算I帧16x16块均值...")
 
-    # 计算I帧每个块的残差
+    # 将4x4组织成16x16块
+    i_frame_16x16_means = []
+    for macro_y in range(0, HEIGHT // 16):  # 0-9
+        for macro_x in range(0, WIDTH // 16):  # 0-14
+            # 收集这个16x16块内的所有4x4块 (4x4=16个块)
+            macro_4x4_blocks = []
+            for block_y in range(0, 4):  # 16x16内的4x4块行
+                for block_x in range(0, 4):  # 16x16内的4x4块列
+                    block_pos = (macro_y * 4 + block_y) * (WIDTH // 4) + (macro_x * 4 + block_x)
+                    macro_4x4_blocks.append(i_frame_blocks[block_pos])
+
+            # 计算16x16块的均值
+            mean_16x16 = calculate_16x16_block_mean_yuv9(np.array(macro_4x4_blocks))
+            i_frame_16x16_means.append(mean_16x16)
+
+    i_frame_means = np.array(i_frame_16x16_means)
+
+    # 为每个4x4残差块分配对应的16x16均值
+    i_frame_4x4_means_for_residuals = []
+    for block_pos in range(len(i_frame_blocks)):
+        # 计算这个4x4块对应的16x16块位置
+        block_y = block_pos // (WIDTH // 4)
+        block_x = block_pos % (WIDTH // 4)
+        macro_16x16_y = block_y // 4
+        macro_16x16_x = block_x // 4
+        macro_16x16_pos = macro_16x16_y * (WIDTH // 16) + macro_16x16_x
+        i_frame_4x4_means_for_residuals.append(i_frame_means[macro_16x16_pos])
+
+    # 计算I帧每个块的残差（使用16x16均值）
     print(f"  计算I帧残差...")
     i_frame_residuals = []
     for i, block in enumerate(i_frame_blocks):
-        y_mean, cb_mean, cr_mean = i_frame_means[i]
+        y_mean, cb_mean, cr_mean = i_frame_4x4_means_for_residuals[i]
         residual = calculate_residual_yuv9(block, y_mean, cb_mean, cr_mean)
         i_frame_residuals.append(residual)
     i_frame_residuals = np.array(i_frame_residuals)
@@ -1026,14 +1087,15 @@ def process_single_gop(gop_data):
 
     for frame_idx, frame_blocks in enumerate(corrected_frames):
         if frame_idx == 0:  # I帧
-            # I帧格式：[块数量, Y均值×2400, Cb均值×2400, Cr均值×2400, 残差索引×2400]
+            # I帧新格式：[16x16块数量, Y均值×150, Cb均值×150, Cr均值×150, 残差索引×2400]
             # 编码残差索引
             residual_indices = encode_residuals_with_frequency_mapping(i_frame_residuals, original_codebook, frequency_mapping)
 
             # 构建I帧数据
-            frame_data = [BLOCKS_PER_FRAME]
+            blocks_per_16x16 = (HEIGHT // 16) * (WIDTH // 16)  # 10*15 = 150
+            frame_data = [blocks_per_16x16]
 
-            # 添加所有块的均值（分开存储Y, Cb, Cr）
+            # 添加所有16x16块的均值（分开存储Y, Cb, Cr）
             for mean in i_frame_means:
                 y_mean, cb_mean, cr_mean = mean
                 frame_data.append(int(y_mean) & 0xFFFF)  # Y: 0-255
@@ -1048,11 +1110,12 @@ def process_single_gop(gop_data):
                 # Cr: -128~127，直接存储为s8格式（使用有符号数强制转换）
                 frame_data.append(int(np.int8(cr_mean)) & 0xFFFF)
 
-            # 添加残差索引
+            # 添加残差索引（保持2400个4x4块的索引）
             frame_data.extend(residual_indices.tolist())
 
             gop_frame_types.append(0)  # I帧
-            print(f"  I帧 {gop_idx * gop_size + frame_idx}: {BLOCKS_PER_FRAME} 个块, {len(frame_data)} u16")
+            blocks_per_16x16 = (HEIGHT // 16) * (WIDTH // 16)
+            print(f"  I帧 {gop_idx * gop_size + frame_idx}: {blocks_per_16x16} 个16x16块, {len(frame_data)} u16")
         else:  # P帧
             # P帧只编码变化的块（基于修正后的帧比较）
             reference_blocks = corrected_frames[frame_idx - 1]

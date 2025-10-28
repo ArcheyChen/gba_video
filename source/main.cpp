@@ -43,6 +43,9 @@ static int current_gop_index = 0;
 // YUV555 → RGB555查表（32 * 32 * 32 = 32768项）
 EWRAM_DATA static u16 yuv555_to_rgb555_table[32 * 32 * 32];
 
+// GOP码表缓存（2048个码表条目，约36KB）
+EWRAM_DATA static YUV_Struct gop_codebook_cache[2048];
+
 // 通用u8裁剪表：输入范围 -256~511 → 输出 0~255
 IWRAM_DATA static u8 clamp_to_u8_table_raw[768];
 u8* clamp_to_u8 = clamp_to_u8_table_raw + 256;  // 偏移后可直接用负数索引
@@ -111,6 +114,38 @@ void init_clamp_tables(){
     }
 }
 
+// 加载指定GOP的码表到EWRAM缓存中
+void load_gop_codebook(int gop_index)
+{
+    const YUV_Struct* rom_codebook = (YUV_Struct*)video_codebooks[gop_index];
+
+    // 使用汇编指令批量拷贝2048个码表条目（每个18字节，共36KB）
+    // 源：ROM中的码表，目标：EWRAM缓存
+    const u32* src = (const u32*)rom_codebook;
+    u32* dst = (u32*)gop_codebook_cache;
+    u32 transfer_count = (sizeof(YUV_Struct) * 2048) / 4;  // 按u32计数
+
+    // 使用ldmia/stmia批量拷贝（每次8个u32 = 32字节）
+    u32 loops = transfer_count / 8;
+    u32 remainder = transfer_count % 8;
+
+    asm volatile (
+        "1:                                     \n"  // 主循环开始
+        "ldmia %0!, {r4, r5, r6, r7, r8, r9, r10, r11}  \n"  // 加载8个u32 = 32字节
+        "stmia %1!, {r4, r5, r6, r7, r8, r9, r10, r11}  \n"  // 存储8个u32 = 32字节
+        "subs %2, %2, #1                        \n"  // 减1次循环
+        "bne 1b                                 \n"  // 循环直到主拷贝完毕
+        : "+r"(src), "+r"(dst), "+r"(loops)         // 输出操作数：汇编会修改
+        :                                        // 输入操作数：无
+        : "r4", "r5", "r6", "r7", "r8", "r9", "r10", "r11", "memory", "cc"  // 破坏的寄存器
+    );
+
+    // 处理剩余不足8个u32的部分
+    for (u32 i = 0; i < remainder; i++) {
+        dst[i] = src[i];
+    }
+}
+
 
 // 预计算块位置到VRAM左上角偏移的查找表（优化：消除convert中的乘法）
 void init_block_vram_offset_table(){
@@ -139,8 +174,8 @@ void init_block_xy_tables(){
 // 将一个YUV残差块累加到YUV缓冲区并同时更新RGB缓冲区（残差模式）
 IWRAM_CODE inline void apply_residual_to_buffer(u16 codeword_idx, int block_pos, u8 y_mean, u8 cb_mean, u8 cr_mean)
 {
-    const YUV_Struct* codebook = (YUV_Struct*)video_codebooks[current_gop_index];
-    const YUV_Struct& residual_block = codebook[codeword_idx];
+    // 使用EWRAM缓存的码表（比从ROM读取更快）
+    const YUV_Struct& residual_block = gop_codebook_cache[codeword_idx];
 
     // 使用预计算的查找表获取块的X/Y像素坐标（已预乘4）
     int base_x = block_x_table[block_pos];  // 直接是像素X坐标
@@ -185,24 +220,31 @@ IWRAM_CODE inline void apply_residual_to_buffer(u16 codeword_idx, int block_pos,
 
 IWRAM_CODE void decode_i_frame(const u16* frame_data)
 {
-    // I帧新格式：[块数量, Y均值×2400, Cb均值×2400, Cr均值×2400, 残差索引×2400]
-    u16 block_count = frame_data[0];
+    // I帧新格式：[16x16块数量, Y均值×150, Cb均值×150, Cr均值×150, 残差索引×2400]
+    u16 macro_block_count = frame_data[0];  // 150个16x16块
 
-    // 解析均值数据
-    const u16* y_means = frame_data + 1;                    // Y均值起始
-    const u16* cb_means = frame_data + 1 + block_count;      // Cb均值起始
-    const u16* cr_means = frame_data + 1 + block_count * 2;  // Cr均值起始
-    const u16* residual_indices = frame_data + 1 + block_count * 3;  // 残差索引起始
+    // 解析均值数据（16x16块）
+    const u16* macro_y_means = frame_data + 1;                           // Y均值起始
+    const u16* macro_cb_means = frame_data + 1 + macro_block_count;         // Cb均值起始
+    const u16* macro_cr_means = frame_data + 1 + macro_block_count * 2;     // Cr均值起始
+    const u16* residual_indices = frame_data + 1 + macro_block_count * 3;   // 残差索引起始
 
     // I帧优化：直接设置dirty_block_count为全部块数量，跳过逐块添加队列
     dirty_block_count = VIDEO_BLOCKS_PER_FRAME;
 
     for (int block_pos = 0; block_pos < VIDEO_BLOCKS_PER_FRAME; block_pos++)
     {
-        // 获取当前块的均值（Cb/Cr现在直接是0~255 u8格式）
-        u8 y_mean = (u8)y_means[block_pos];
-        u8 cb_mean = (u8)cb_means[block_pos];
-        u8 cr_mean = (u8)cr_means[block_pos];
+        // 计算当前4x4块对应的16x16块位置
+        int block_y = block_pos / (SCREEN_WIDTH / 4);
+        int block_x = block_pos % (SCREEN_WIDTH / 4);
+        int macro_block_y = block_y / 4;
+        int macro_block_x = block_x / 4;
+        int macro_block_pos = macro_block_y * (SCREEN_WIDTH / 16) + macro_block_x;
+
+        // 获取对应的16x16块均值
+        u8 y_mean = (u8)macro_y_means[macro_block_pos];
+        s8 cb_mean = (s8)macro_cb_means[macro_block_pos];
+        s8 cr_mean = (s8)macro_cr_means[macro_block_pos];
 
         // 获取残差码字索引
         u16 residual_idx = residual_indices[block_pos];
@@ -374,6 +416,10 @@ int main()
     init_block_vram_offset_table();  // 初始化块VRAM偏移查找表
     init_block_xy_tables();     // 初始化块X/Y坐标查找表
 
+    // 初始化第一个GOP的码表到EWRAM缓存
+    current_gop_index = -1;  // 强制首次加载
+    load_gop_codebook(0);
+
     // 初始化YUV缓冲区为0
     for (int y = 0; y < SCREEN_HEIGHT; y++) {
         for (int x = 0; x < SCREEN_WIDTH; x++) {
@@ -400,6 +446,8 @@ int main()
         int required_gop = frame / VIDEO_GOP_SIZE;
         if (required_gop != current_gop_index) {
             current_gop_index = required_gop;
+            // 加载新GOP的码表到EWRAM缓存
+            load_gop_codebook(current_gop_index);
         }
 
         // 获取当前帧的数据
